@@ -1,0 +1,18 @@
+# NEXUS USB Event Detection Rules
+# Catch USB device events for M.I.T.E.L. integration
+
+# USB storage devices
+SUBSYSTEM=="block", ENV{ID_SERIAL}!="", ACTION=="add", RUN+="/usr/bin/logger 'NEXUS: USB storage added %k'"
+SUBSYSTEM=="block", ENV{ID_SERIAL}!="", ACTION=="remove", RUN+="/usr/bin/logger 'NEXUS: USB storage removed %k'"
+
+# USB devices in general
+SUBSYSTEM=="usb", ACTION=="add", RUN+="/usr/bin/logger 'NEXUS: USB device added %k'"
+SUBSYSTEM=="usb", ACTION=="remove", RUN+="/usr/bin/logger 'NEXUS: USB device removed %k'"
+
+# USB mass storage specifically
+SUBSYSTEM=="scsi", KERNEL=="sd[a-z][0-9]*", ACTION=="add", RUN+="/usr/bin/logger 'NEXUS: USB mass storage added %k'"
+SUBSYSTEM=="scsi", KERNEL=="sd[a-z][0-9]*", ACTION=="remove", RUN+="/usr/bin/logger 'NEXUS: USB mass storage removed %k'"
+
+# Notify NEXUS container
+SUBSYSTEM=="block", ENV{ID_SERIAL}!="", ACTION=="add", RUN+="/bin/touch /tmp/nexus_usb_add"
+SUBSYSTEM=="block", ENV{ID_SERIAL}!="", ACTION=="remove", RUN+="/bin/touch /tmp/nexus_usb_remove"

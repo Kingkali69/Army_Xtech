@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NEXUS Container Engine
+Comment=Launch NEXUS Container with M.I.T.E.L. USB Detection
+Exec=gnome-terminal -- /home/kali/Desktop/MITEL/Mitel-main/launch_nexus_engine.sh
+Icon=applications-system
+Terminal=false
+Categories=System;Security;
+StartupNotify=true

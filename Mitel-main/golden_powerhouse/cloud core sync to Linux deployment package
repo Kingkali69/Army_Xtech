@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""
+G.Legion Cybersecurity Framework - Main Engine Launcher
+KK&GDevOps - Production Ready Modular Security Engine
+
+This launcher initializes and manages all G.Legion subsystems with proper
+configuration management, logging, and graceful shutdown capabilities.
+"""
+
+import asyncio
+import argparse
+import logging
+import logging.handlers
+import os
+import signal
+import sys
+import yaml
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+import json
+
+# G.Legion subsystem imports
+from subsystem_scaffolds import (
+    EventBusSubsystem,
+    SessionControlSubsystem,
+    AuthSubsystem,
+    SecuritySubsystem,
+    AOSubsystem,
+    SPSubsystem
+)
+
+
+class GLegionEngine:
+    """
+    G.Legion Cybersecurity Framework Main Engine
+    Manages all subsystems with proper lifecycle and health monitoring.
+    """
+    
+    def __init__(self, config_path: str = "config/engine_config.yaml"):
+        self.config_path = config_path
+        self.config: Dict[str, Any] = {}
+        self.logger = None
+        self.subsystems: Dict[str, Any] = {}
+        self.running = False
+        self.shutdown_event = asyncio.Event()
+        
+        # Subsystem initialization order (dependencies matter)
+        self.subsystem_classes = {
+            'event_bus': EventBusSubsystem,
+            'security': SecuritySubsystem,
+            'auth': AuthSubsystem,
+            'session_control': SessionControlSubsystem,
+            'ao': AOSubsystem,
+            'sp': SPSubsystem
+        }
+        
+        # Signal handlers for graceful shutdown
+        for sig in [signal.SIGTERM, signal.SIGINT]:
+            signal.signal(sig, self._signal_handler)
+    
+    def _signal_handler(self, signum: int, frame):
+        """Handle shutdown signals gracefully."""
+        if self.logger:
+            self.logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        else:
+            print(f"Received signal {signum}, initiating shutdown...")
+        
+        self.shutdown_event.set()
+    
+    def _setup_logging(self):
+        """Configure logging with file and console handlers."""
+        # Create logs directory if it doesn't exist
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        
+        # Configure logging
+        log_level = self.config.get('logging', {}).get('level', 'INFO').upper()
+        log_file = self.config.get('logging', {}).get('file', 'logs/engine.log')
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        # Setup root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(getattr(logging, log_level))
+        
+        # Clear any existing handlers
+        root_logger.handlers.clear()
+        
+        # File handler with rotation
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+        
+        # Create engine logger
+        self.logger = logging.getLogger('GLegion.Engine')
+        self.logger.info("Logging system initialized")
+    
+    def load_config(self) -> bool:
+        """Load configuration from YAML file."""
+        try:
+            config_file = Path(self.config_path)
+            
+            if not config_file.exists():
+                # Create default configuration if it doesn't exist
+                self._create_default_config(config_file)
+                print(f"Created default configuration at {self.config_path}")
+            
+            with open(config_file, 'r') as f:
+                self.config = yaml.safe_load(f)
+            
+            if not self.config:
+                self.config = {}
+            
+            return True
+            
+        except Exception as e:
+            error_msg = f"Failed to load configuration from {self.config_path}: {e}"
+            if self.logger:
+                self.logger.error(error_msg)
+            else:
+                print(f"ERROR: {error_msg}")
+            return False
+    
+    def _create_default_config(self, config_file: Path):
+        """Create a default configuration file."""
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        default_config = {
+            'engine': {
+                'name': 'G.Legion',
+                'version': '2.0.0',
+                'description': 'Modular Cybersecurity Framework',
+                'max_workers': 4,
+                'startup_timeout': 30
+            },
+            'logging': {
+                'level': 'INFO',
+                'file': 'logs/engine.log',
+                'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            },
+            'subsystems': {
+                'event_bus': {
+                    'enabled': True,
+                    'max_events': 10000,
+                    'worker_threads': 2
+                },
+                'security': {
+                    'enabled': True,
+                    'threat_detection': True,
+                    'auto_response': True
+                },
+                'auth': {
+                    'enabled': True,
+                    'session_timeout': 3600,
+                    'max_attempts': 5
+                },
+                'session_control': {
+                    'enabled': True,
+                    'cleanup_interval': 300,
+                    'anomaly_detection': True
+                },
+                'ao': {
+                    'enabled': True,
+                    'automation_level': 'medium',
+                    'response_time': 5
+                },
+                'sp': {
+                    'enabled': True,
+                    'sync_interval': 60,
+                    'redundancy': True
+                }
+            },
+            'network': {
+                'bind_address': '127.0.0.1',
+                'api_port': 8443,
+                'management_port': 8444,
+                'tls_enabled': True
+            },
+            'security': {
+                'encryption_key_size': 256,
+                'session_encryption': True,
+                'audit_logging': True,
+                'threat_intelligence': True
+            }
+        }
+        
+        with open(config_file, 'w') as f:
+            yaml.dump(default_config, f, default_flow_style=False, indent=2)
+    
+    async def initialize_subsystems(self) -> bool:
+        """Initialize all enabled subsystems."""
+        self.logger.info("Initializing G.Legion subsystems...")
+        
+        enabled_subsystems = self.config.get('subsystems', {})
+        
+        for subsystem_name, subsystem_class in self.subsystem_classes.items():
+            try:
+                # Check if subsystem is enabled
+                subsystem_config = enabled_subsystems.get(subsystem_name, {})
+                if not subsystem_config.get('enabled', True):
+                    self.logger.info(f"Subsystem {subsystem_name} is disabled, skipping...")
+                    continue
+                
+                self.logger.info(f"Initializing subsystem: {subsystem_name}")
+                
+                # Create subsystem instance
+                subsystem = subsystem_class(config=subsystem_config)
+                
+                # Initialize the subsystem
+                if hasattr(subsystem, 'initialize'):
+                    success = await subsystem.initialize()
+                    if not success:
+                        self.logger.error(f"Failed to initialize subsystem: {subsystem_name}")
+                        return False
+                
+                # Store the subsystem
+                self.subsystems[subsystem_name] = subsystem
+                self.logger.info(f"Subsystem {subsystem_name} initialized successfully")
+                
+            except Exception as e:
+                self.logger.error(f"Exception initializing subsystem {subsystem_name}: {e}")
+                return False
+        
+        self.logger.info(f"Successfully initialized {len(self.subsystems)} subsystems")
+        return True
+    
+    async def start_subsystems(self) -> bool:
+        """Start all initialized subsystems."""
+        self.logger.info("Starting G.Legion subsystems...")
+        
+        for subsystem_name, subsystem in self.subsystems.items():
+            try:
+                self.logger.info(f"Starting subsystem: {subsystem_name}")
+                
+                # Start the subsystem
+                if hasattr(subsystem, 'start'):
+                    success = await subsystem.start()
+                    if not success:
+                        self.logger.error(f"Failed to start subsystem: {subsystem_name}")
+                        return False
+                
+                self.logger.info(f"Subsystem {subsystem_name} started successfully")
+                
+            except Exception as e:
+                self.logger.error(f"Exception starting subsystem {subsystem_name}: {e}")
+                return False
+        
+        self.logger.info("All subsystems started successfully")
+        return True
+    
+    async def stop_subsystems(self):
+        """Stop all subsystems gracefully."""
+        self.logger.info("Stopping G.Legion subsystems...")
+        
+        # Stop subsystems in reverse order
+        for subsystem_name in reversed(list(self.subsystems.keys())):
+            subsystem = self.subsystems[subsystem_name]
+            try:
+                self.logger.info(f"Stopping subsystem: {subsystem_name}")
+                
+                if hasattr(subsystem, 'stop'):
+                    await subsystem.stop()
+                
+                self.logger.info(f"Subsystem {subsystem_name} stopped successfully")
+                
+            except Exception as e:
+                self.logger.error(f"Exception stopping subsystem {subsystem_name}: {e}")
+        
+        self.subsystems.clear()
+        self.logger.info("All subsystems stopped")
+    
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Get health status of all subsystems."""
+        health_status = {
+            'engine': {
+                'status': 'running' if self.running else 'stopped',
+                'timestamp': datetime.utcnow().isoformat(),
+                'uptime': 'N/A',  # Could calculate actual uptime
+                'subsystems_count': len(self.subsystems)
+            },
+            'subsystems': {}
+        }
+        
+        for subsystem_name, subsystem in self.subsystems.items():
+            try:
+                if hasattr(subsystem, 'health_check'):
+                    subsystem_health = await subsystem.health_check()
+                    health_status['subsystems'][subsystem_name] = subsystem_health
+                else:
+                    health_status['subsystems'][subsystem_name] = {
+                        'status': 'unknown',
+                        'message': 'No health check method available'
+                    }
+            except Exception as e:
+                health_status['subsystems'][subsystem_name] = {
+                    'status': 'error',
+                    'message': str(e)
+                }
+        
+        return health_status
+    
+    async def run(self) -> bool:
+        """Main engine run loop."""
+        try:
+            # Load configuration
+            if not self.load_config():
+                return False
+            
+            # Setup logging
+            self._setup_logging()
+            
+            self.logger.info("=" * 60)
+            self.logger.info("G.Legion Cybersecurity Framework Starting")
+            self.logger.info(f"Version: {self.config.get('engine', {}).get('version', 'Unknown')}")
+            self.logger.info("=" * 60)
+            
+            # Initialize subsystems
+            if not await self.initialize_subsystems():
+                self.logger.error("Subsystem initialization failed")
+                return False
+            
+            # Start subsystems
+            if not await self.start_subsystems():
+                self.logger.error("Subsystem startup failed")
+                await self.stop_subsystems()
+                return False
+            
+            self.running = True
+            self.logger.info("G.Legion Engine started successfully")
+            self.logger.info("Engine is now running. Press Ctrl+C to shutdown gracefully.")
+            
+            # Main event loop - wait for shutdown signal
+            await self.shutdown_event.wait()
+            
+            self.logger.info("Shutdown signal received, stopping engine...")
+            
+        except Exception as e:
+            self.logger.error(f"Critical engine error: {e}")
+            return False
+        
+        finally:
+            self.running = False
+            await self.stop_subsystems()
+            self.logger.info("G.Legion Engine stopped")
+        
+        return True
+    
+    async def status(self):
+        """Print engine and subsystem status."""
+        if not self.load_config():
+            print("Failed to load configuration")
+            return
+        
+        self._setup_logging()
+        
+        print("\n" + "=" * 60)
+        print("G.Legion Engine Status")
+        print("=" * 60)
+        
+        # Load and initialize subsystems for status check
+        if not await self.initialize_subsystems():
+            print("Failed to initialize subsystems for status check")
+            return
+        
+        # Get health status
+        health_status = await self.get_health_status()
+        
+        # Print engine status
+        engine_status = health_status['engine']
+        print(f"Engine Status: {engine_status['status']}")
+        print(f"Timestamp: {engine_status['timestamp']}")
+        print(f"Subsystems: {engine_status['subsystems_count']}")
+        print()
+        
+        # Print subsystem status
+        print("Subsystem Health Status:")
+        print("-" * 40)
+        
+        for subsystem_name, subsystem_health in health_status['subsystems'].items():
+            status = subsystem_health.get('status', 'unknown')
+            message = subsystem_health.get('message', '')
+            
+            # Color coding for status
+            if status == 'healthy':
+                status_display = f"✓ {status}"
+            elif status == 'error':
+                status_display = f"✗ {status}"
+            else:
+                status_display = f"? {status}"
+            
+            print(f"{subsystem_name:20} {status_display:15} {message}")
+        
+        print("\n" + "=" * 60)
+        
+        # Stop subsystems after status check
+        await self.stop_subsystems()
+    
+    async def shutdown(self):
+        """Send shutdown signal to running engine."""
+        print("Sending shutdown signal to G.Legion Engine...")
+        
+        # This is a simplified shutdown - in a real implementation,
+        # you might use IPC, signals, or API calls to communicate with the running process
+        try:
+            import psutil
+            
+            # Find running G.Legion processes
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['cmdline'] and 'main.py' in ' '.join(proc.info['cmdline']):
+                        if '--start' in proc.info['cmdline']:
+                            print(f"Found G.Legion process (PID: {proc.info['pid']})")
+                            proc.terminate()
+                            print("Shutdown signal sent")
+                            return
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            print("No running G.Legion process found")
+            
+        except ImportError:
+            print("psutil not available for process management")
+            print("Please use Ctrl+C on the running process or system signals")
+
+
+def setup_argument_parser() -> argparse.ArgumentParser:
+    """Setup command line argument parser."""
+    parser = argparse.ArgumentParser(
+        description="G.Legion Cybersecurity Framework",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --start                 # Start the engine
+  python main.py --status                # Check status
+  python main.py --stop                  # Stop the engine
+  python main.py --config custom.yaml   # Use custom config
+        """
+    )
+    
+    parser.add_argument(
+        '--start',
+        action='store_true',
+        help='Start the G.Legion engine'
+    )
+    
+    parser.add_argument(
+        '--status',
+        action='store_true',
+        help='Show health status of all subsystems'
+    )
+    
+    parser.add_argument(
+        '--stop',
+        action='store_true',
+        help='Send shutdown signal to running engine'
+    )
+    
+    parser.add_argument(
+        '--config',
+        default='config/engine_config.yaml',
+        help='Path to configuration file (default: config/engine_config.yaml)'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Override log level from configuration'
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='G.Legion Framework v2.0.0'
+    )
+    
+    return parser
+
+
+async def main():
+    """Main async entry point."""
+    parser = setup_argument_parser()
+    args = parser.parse_args()
+    
+    # Check that at least one action is specified
+    if not any([args.start, args.status, args.stop]):
+        parser.print_help()
+        return 1
+    
+    # Create engine instance
+    engine = GLegionEngine(config_path=args.config)
+    
+    try:
+        if args.start:
+            # Start the engine
+            success = await engine.run()
+            return 0 if success else 1
+            
+        elif args.status:
+            # Show status
+            await engine.status()
+            return 0
+            
+        elif args.stop:
+            # Stop the engine
+            await engine.shutdown()
+            return 0
+    
+    except KeyboardInterrupt:
+        print("\nOperation interrupted by user")
+        return 1
+    
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return 1
+
+
+def main_sync():
+    """Synchronous main entry point for the script."""
+    try:
+        return asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutdown interrupted")
+        return 1
+    except Exception as e:
+        print(f"Failed to run async main: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main_sync())

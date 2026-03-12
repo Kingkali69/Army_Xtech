@@ -1,0 +1,45 @@
+Microsoft Windows [Version 10.0.19045.6332]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Users\KingKaliGhost>cd %UserProfile%\Downloads\cloudcore_sync2
+The system cannot find the path specified.
+
+C:\Users\KingKaliGhost>cd %UserProfile%\Desktop\cloudcore_sync2
+
+C:\Users\KingKaliGhost\Desktop\cloudcore_sync2>python launcher
+python: can't open file 'C:\\Users\\KingKaliGhost\\Desktop\\cloudcore_sync2\\launcher': [Errno 2] No such file or directory
+
+C:\Users\KingKaliGhost\Desktop\cloudcore_sync2>cd %UserProfile%\Desktop
+
+C:\Users\KingKaliGhost\Desktop>python "Complete Standalone Ghost Engine.py"
+2025-09-11 09:26:39,452 - GhostEngine - INFO - Ghost Engine initializing on windows
+2025-09-11 09:26:39,453 - GhostEngine - INFO - Node ID: ghost-93078b88
+2025-09-11 09:26:39,453 - GhostEngine - INFO - Initializing Ghost Engine subsystems...
+2025-09-11 09:26:39,453 - Ghost.EB-SUB - INFO - EB-SUB initializing...
+2025-09-11 09:26:39,453 - Ghost.EB-SUB - INFO - Event Bus ready for inter-subsystem communication
+2025-09-11 09:26:39,453 - Ghost.AUTH-SUB - INFO - AUTH-SUB initializing...
+2025-09-11 09:26:39,453 - Ghost.AUTH-SUB - INFO - Authentication subsystem ready
+2025-09-11 09:26:39,453 - GhostEngine - INFO - AUTH-SUB initialized successfully
+2025-09-11 09:26:39,453 - Ghost.SEC-SUB - INFO - SEC-SUB initializing...
+2025-09-11 09:26:39,453 - Ghost.SEC-SUB - INFO - Security subsystem initialized - AI threat detection active
+2025-09-11 09:26:39,453 - GhostEngine - INFO - SEC-SUB initialized successfully
+2025-09-11 09:26:39,454 - Ghost.SC-SUB - INFO - SC-SUB initializing...
+2025-09-11 09:26:39,454 - Ghost.SC-SUB - INFO - Session control subsystem ready
+2025-09-11 09:26:39,454 - GhostEngine - INFO - SC-SUB initialized successfully
+2025-09-11 09:26:39,454 - Ghost.AO-SUB - INFO - AO-SUB initializing...
+2025-09-11 09:26:39,454 - Ghost.AO-SUB - INFO - API orchestration subsystem ready
+2025-09-11 09:26:39,454 - GhostEngine - INFO - AO-SUB initialized successfully
+2025-09-11 09:26:39,454 - Ghost.SP-SUB - INFO - SP-SUB initializing...
+2025-09-11 09:26:39,454 - Ghost.SP-SUB - INFO - Synchronization protocol subsystem ready
+2025-09-11 09:26:39,454 - GhostEngine - INFO - SP-SUB initialized successfully
+2025-09-11 09:26:39,454 - GhostEngine - INFO - Ghost Engine initialized with 6 subsystems
+2025-09-11 09:26:39,454 - GhostEngine - INFO - Starting Ghost Engine...
+2025-09-11 09:26:39,454 - Ghost.EB-SUB - INFO - EB-SUB started
+2025-09-11 09:26:39,454 - Ghost.AUTH-SUB - INFO - AUTH-SUB started
+2025-09-11 09:26:39,454 - Ghost.SEC-SUB - INFO - SEC-SUB started
+2025-09-11 09:26:39,454 - Ghost.SC-SUB - INFO - SC-SUB started
+2025-09-11 09:26:39,454 - Ghost.AO-SUB - INFO - AO-SUB started
+2025-09-11 09:26:39,454 - Ghost.SP-SUB - INFO - SP-SUB started
+2025-09-11 09:26:39,454 - GhostEngine - INFO - Ghost Engine started successfully
+2025-09-11 09:26:41,461 - Ghost.SC-SUB - INFO - Session created: 1fb21050...
+

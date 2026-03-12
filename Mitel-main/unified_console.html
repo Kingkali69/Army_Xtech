@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OMNI Unified Console</title>
+    <meta charset="utf-8">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Courier New', monospace; 
+            background: #0a0a0a; 
+            color: #e0e0e0; 
+            overflow: hidden;
+        }
+        
+        .header {
+            background: #1a1a1a;
+            padding: 15px 20px;
+            border-bottom: 2px solid #2a2a2a;
+        }
+        
+        .header h1 {
+            color: #46d946;
+            font-size: 20px;
+            margin-bottom: 10px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .tab {
+            background: #2a2a2a;
+            border: none;
+            color: #888;
+            padding: 10px 20px;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            border-top: 3px solid transparent;
+        }
+        
+        .tab:hover {
+            background: #3a3a3a;
+            color: #aaa;
+        }
+        
+        .tab.active {
+            background: #0a0a0a;
+            color: #46d946;
+            border-top-color: #46d946;
+        }
+        
+        .content {
+            height: calc(100vh - 100px);
+            overflow: hidden;
+        }
+        
+        .panel {
+            display: none;
+            height: 100%;
+        }
+        
+        .panel.active {
+            display: block;
+        }
+        
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        
+        .status-bar {
+            background: #1a1a1a;
+            padding: 5px 20px;
+            font-size: 11px;
+            color: #888;
+            border-top: 1px solid #2a2a2a;
+        }
+        
+        .status-ok { color: #46d946; }
+        .status-warn { color: #ffaa00; }
+        .status-error { color: #ff4444; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>OMNI UNIFIED CONSOLE</h1>
+        <div class="tabs">
+            <button class="tab active" onclick="showPanel('omni')">OMNI Infrastructure</button>
+            <button class="tab" onclick="showPanel('mitel')">M.I.T.E.L. Security</button>
+            <button class="tab" onclick="showPanel('nexus')">NEXUS AI</button>
+        </div>
+    </div>
+    
+    <div class="content">
+        <div id="omni-panel" class="panel active">
+            <iframe src="/omni_original"></iframe>
+        </div>
+        <div id="mitel-panel" class="panel">
+            <iframe src="/mitel"></iframe>
+        </div>
+        <div id="nexus-panel" class="panel">
+            <iframe src="http://192.168.1.161:8889"></iframe>
+        </div>
+    </div>
+    
+    <div class="status-bar">
+        <span class="status-ok">●</span> OMNI Core Running | 
+        <span class="status-ok">●</span> Web Console Active | 
+        <span class="status-ok">●</span> NEXUS AI (Linux) | 
+        <span id="mesh-status" class="status-warn">⚠</span> Mesh: <span id="mesh-text">Checking...</span>
+    </div>
+    
+    <script>
+        function showPanel(name) {
+            // Hide all panels
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            
+            // Show selected panel
+            document.getElementById(name + '-panel').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        // Check mesh status
+        setInterval(() => {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    const meshStatus = document.getElementById('mesh-status');
+                    const meshText = document.getElementById('mesh-text');
+                    
+                    if (data.nodes && data.nodes > 1) {
+                        meshStatus.className = 'status-ok';
+                        meshText.textContent = data.nodes + ' nodes connected';
+                    } else {
+                        meshStatus.className = 'status-warn';
+                        meshText.textContent = 'Single node (mesh discovery active)';
+                    }
+                })
+                .catch(e => {
+                    document.getElementById('mesh-status').className = 'status-error';
+                    document.getElementById('mesh-text').textContent = 'Error';
+                });
+        }, 3000);
+    </script>
+</body>
+</html>

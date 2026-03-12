@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# main.py
+# G.Legion Framework - CLI Launcher & Management Interface
+
+import asyncio
+import argparse
+import sys
+import os
+import json
+import signal
+import logging
+from pathlib import Path
+from typing import Dict, Any
+
+# Import engine core
+try:
+    from engine_core import EngineCore
+except ImportError:
+    print("❌ ERROR: engine_core.py not found!")
+    print("   Make sure you have engine_core.py in the same directory")
+    sys.exit(1)
+
+class GLegionCLI:
+    """G.Legion Framework Command Line Interface"""
+    
+    def __init__(self):
+        self.engine = None
+        self.logger = logging.getLogger("G.Legion.CLI")
+        
+    def setup_logging(self, log_level: str = "INFO", log_file: str = None):
+        """Setup logging configuration"""
+        # Create logs directory if it doesn't exist
+        if log_file:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        
+        handlers = [logging.StreamHandler(sys.stdout)]
+        if log_file:
+            handlers.append(logging.FileHandler(log_file))
+        
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=handlers
+        )
+        
+        # Reduce noise from some loggers
+        logging.getLogger('asyncio').setLevel(logging.WARNING)
+    
+    async def start_engine(self, config_path: str = "config/engine_config.yaml", daemon: bool = False):
+        """Start the G.Legion engine"""
+        try:
+            print("🚀 Starting G.Legion Framework...")
+            print(f"   Config: {config_path}")
+            print(f"   Mode: {'Daemon' if daemon else 'Interactive'}")
+            print()
+            
+            # Create and initialize engine
+            self.engine = EngineCore(config_path)
+            await self.engine.initialize()
+            
+            print("✅ Engine initialized successfully")
+            
+            # Start the engine
+            await self.engine.start()
+            
+            print("✅ Engine started successfully")
+            print(f"   Node ID: {self.engine.node_id}")
+            print(f"   Subsystems: {len(self.engine.subsystems)}")
+            print()
+            
+            # Show status
+            await self.show_status()
+            print()
+            
+            if daemon:
+                print("🔄 Running in daemon mode (Ctrl+C to stop)...")
+            else:
+                print("🔄 Running in interactive mode...")
+                print("   Commands: status, restart <subsystem>, stop, quit")
+            
+            # Run engine
+            if daemon:
+                await self.engine.run()
+            else:
+                await self._interactive_mode()
+                
+        except KeyboardInterrupt:
+            print("\n🛑 Received interrupt signal")
+        except Exception as e:
+            print(f"❌ Engine startup failed: {e}")
+            self.logger.error(f"Engine startup failed: {e}", exc_info=True)
+            return False
+        finally:
+            if self.engine:
+                print("🛑 Stopping engine...")
+                await self.engine.stop()
+                print("✅ Engine stopped")
+        
+        return True
+    
+    async def _interactive_mode(self):
+        """Run in interactive mode with command prompt"""
+        import aioconsole
+        
+        print("Type 'help' for available commands")
+        
+        while self.engine and self.engine.running:
+            try:
+                command = await aioconsole.ainput("G.Legion> ")
+                command = command.strip().lower()
+                
+                if not command:
+                    continue
+                
+                if command in ['quit', 'exit', 'q']:
+                    break
+                elif command == 'help':
+                    await self._show_help()
+                elif command == 'status':
+                    await self.show_status()
+                elif command.startswith('restart '):
+                    subsystem = command.split(' ', 1)[1]
+                    await self._restart_subsystem(subsystem)
+                elif command == 'stop':
+                    break
+                else:
+                    print(f"❓ Unknown command: {command}")
+                    print("   Type 'help' for available commands")
+                
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as e:
+                print(f"❌ Command error: {e}")
+    
+    async def _show_help(self):
+        """Show available commands"""
+        help_text = """
+📋 Available Commands:
+   status              - Show engine and subsystem status
+   restart <subsystem> - Restart a specific subsystem
+   stop                - Stop the engine
+   quit/exit/q         - Quit the application
+   help                - Show this help message
+
+📊 Subsystem Names:
+   sp_sub    - Synchronization Protocol (SP-SUB)
+   sc_sub    - Session Control (SC-SUB)
+   eb_sub    - Event Bus (EB-SUB)
+   auth_sub  - Authentication (AUTH-SUB)
+   sec_sub   - Security (SEC-SUB)
+   ao_sub    - Advanced Operations (AO-SUB)
+"""
+        print(help_text)
+    
+    async def _restart_subsystem(self, subsystem_name: str):
+        """Restart a specific subsystem"""
+        if not self.engine:
+            print("❌ Engine not running")
+            return
+        
+        if subsystem_name not in self.engine.subsystems:
+            print(f"❌ Subsystem '{subsystem_name}' not found")
+            available = ', '.join(self.engine.subsystems.keys())
+            print(f"   Available: {available}")
+            return
+        
+        print(f"🔄 Restarting {subsystem_name}...")
+        
+        success = await self.engine.restart_subsystem(subsystem_name)
+        if success:
+            print(f"✅ {subsystem_name} restarted successfully")
+        else:
+            print(f"❌ Failed to restart {subsystem_name}")
+    
+    async def show_status(self):
+        """Show engine status"""
+        if not self.engine:
+            print("❌ Engine not initialized")
+            return
+        
+        status = self.engine.get_status()
+        
+        print("📊 G.Legion Engine Status")
+        print("=" * 50)
+        print(f"Node ID:     {status['node_id']}")
+        print(f"Running:     {'✅ Yes' if status['running'] else '❌ No'}")
+        print(f"Uptime:      {status['uptime']:.1f} seconds")
+        
+        if status['last_health_check']:
+            print(f"Last Check:  {status['last_health_check']}")
+        
+        print()
+        print("🧩 Subsystems:")
+        
+        for name, info in status['subsystems'].items():
+            state = info['state']
+            available = info['available']
+            
+            # Status emoji
+            if state == 'running':
+                emoji = "✅"
+            elif state == 'ready':
+                emoji = "🟡"
+            elif state == 'error':
+                emoji = "❌"
+            elif state == 'stopped':
+                emoji = "⏹️"
+            else:
+                emoji = "⚪"
+            
+            avail_text = "Available" if available else "Not Available"
+            print(f"   {name.upper():<8} {emoji} {state:<12} ({avail_text})")
+        
+        print()
+        print("📈 Metrics:")
+        metrics = status['metrics']
+        print(f"   Events:   {metrics['total_events']}")
+        print(f"   Errors:   {metrics['errors']}")
+        print(f"   Restarts: {metrics['subsystem_restarts']}")
+    
+    async def stop_engine(self, config_path: str = "config/engine_config.yaml"):
+        """Stop a running engine (for external control)"""
+        print("🛑 Stopping G.Legion engine...")
+        
+        # This is a simplified version - in production you'd use IPC/signals
+        # For now, this is mainly for the CLI interface
+        print("✅ Stop command sent")
+    
+    async def show_config(self, config_path: str = "config/engine_config.yaml"):
+        """Show current configuration"""
+        try:
+            if not Path(config_path).exists():
+                print(f"❌ Config file not found: {config_path}")
+                return
+            
+            import yaml
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            print(f"📋 Configuration from {config_path}")
+            print("=" * 50)
+            print(yaml.dump(config, default_flow_style=False))
+            
+        except Exception as e:
+            print(f"❌ Failed to load config: {e}")
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="G.Legion Framework - Ghost Mesh Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py start                    # Start in interactive mode
+  python main.py start --daemon           # Start in daemon mode
+  python main.py start --config custom.yaml
+  python main.py status                   # Show status
+  python main.py config                   # Show configuration
+  python main.py stop                     # Stop engine
+
+Environment Variables:
+  LOG_LEVEL         Set logging level (DEBUG, INFO, WARNING, ERROR)
+  ENGINE_CONFIG     Default config file path
+"""
+    )
+    
+    # Global options
+    parser.add_argument(
+        '--config', '-c',
+        default=os.environ.get('ENGINE_CONFIG', 'config/engine_config.yaml'),
+        help='Configuration file path'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default=os.environ.get('LOG_LEVEL', 'INFO'),
+        help='Logging level'
+    )
+    
+    parser.add_argument(
+        '--log-file',
+        help='Log file path (default: console only)'
+    )
+    
+    # Subcommands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Start command
+    start_parser = subparsers.add_parser('start', help='Start the engine')
+    start_parser.add_argument(
+        '--daemon', '-d',
+        action='store_true',
+        help='Run in daemon mode (no interactive prompt)'
+    )
+    
+    # Status command
+    subparsers.add_parser('status', help='Show engine status')
+    
+    # Stop command
+    subparsers.add_parser('stop', help='Stop the engine')
+    
+    # Config command
+    subparsers.add_parser('config', help='Show configuration')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Create CLI instance
+    cli = GLegionCLI()
+    
+    # Setup logging
+    cli.setup_logging(args.log_level, args.log_file)
+    
+    # Handle commands
+    if args.command == 'start' or not args.command:
+        # Default to start if no command given
+        success = asyncio.run(cli.start_engine(args.config, args.daemon))
+        sys.exit(0 if success else 1)
+        
+    elif args.command == 'status':
+        # For status, we'd need to connect to a running instance
+        # For now, just show a message
+        print("📊 Engine status check")
+        print("⚠️  Status checking requires a running engine instance")
+        print("   This feature will be implemented with IPC in future versions")
+        
+    elif args.command == 'stop':
+        asyncio.run(cli.stop_engine(args.config))
+        
+    elif args.command == 'config':
+        asyncio.run(cli.show_config(args.config))
+        
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

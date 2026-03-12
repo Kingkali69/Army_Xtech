@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OMNI Infrastructure Operations Console
+Comment=Launch OMNI Infrastructure Operations Console, Engine, and AI Chat
+Exec=/home/kali/Desktop/rusty/launch_omni_complete.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Network;
+StartupNotify=true

@@ -1,0 +1,50 @@
+                                                                  
+┌──(kali㉿kali)-[/mnt/usb/NanoBox]
+└─$ python3 standalone_ghost_engine.py
+
+2025-09-10 20:42:54,757 - GhostEngine - INFO - Ghost Engine initializing on linux
+2025-09-10 20:42:54,757 - GhostEngine - INFO - Node ID: ghost-1c5adeb7
+2025-09-10 20:42:54,757 - GhostEngine - INFO - Initializing Ghost Engine subsystems...
+2025-09-10 20:42:54,757 - Ghost.EB-SUB - INFO - EB-SUB initializing...
+2025-09-10 20:42:54,757 - Ghost.EB-SUB - INFO - Event Bus ready for inter-subsystem communication
+2025-09-10 20:42:54,757 - Ghost.AUTH-SUB - INFO - AUTH-SUB initializing...
+2025-09-10 20:42:54,757 - Ghost.AUTH-SUB - INFO - Authentication subsystem ready
+2025-09-10 20:42:54,758 - GhostEngine - INFO - AUTH-SUB initialized successfully
+2025-09-10 20:42:54,758 - Ghost.SEC-SUB - INFO - SEC-SUB initializing...
+2025-09-10 20:42:54,758 - Ghost.SEC-SUB - INFO - Security subsystem initialized - AI threat detection active
+2025-09-10 20:42:54,758 - GhostEngine - INFO - SEC-SUB initialized successfully
+2025-09-10 20:42:54,758 - Ghost.SC-SUB - INFO - SC-SUB initializing...
+2025-09-10 20:42:54,758 - Ghost.SC-SUB - INFO - Session control subsystem ready
+2025-09-10 20:42:54,758 - GhostEngine - INFO - SC-SUB initialized successfully
+2025-09-10 20:42:54,758 - Ghost.AO-SUB - INFO - AO-SUB initializing...
+2025-09-10 20:42:54,758 - Ghost.AO-SUB - INFO - API orchestration subsystem ready
+2025-09-10 20:42:54,758 - GhostEngine - INFO - AO-SUB initialized successfully
+2025-09-10 20:42:54,758 - Ghost.SP-SUB - INFO - SP-SUB initializing...
+2025-09-10 20:42:54,758 - Ghost.SP-SUB - INFO - Synchronization protocol subsystem ready
+2025-09-10 20:42:54,758 - GhostEngine - INFO - SP-SUB initialized successfully
+2025-09-10 20:42:54,758 - GhostEngine - INFO - Ghost Engine initialized with 6 subsystems
+2025-09-10 20:42:54,758 - GhostEngine - INFO - Starting Ghost Engine...
+2025-09-10 20:42:54,758 - Ghost.EB-SUB - INFO - EB-SUB started
+2025-09-10 20:42:54,758 - Ghost.AUTH-SUB - INFO - AUTH-SUB started
+2025-09-10 20:42:54,758 - Ghost.SEC-SUB - INFO - SEC-SUB started
+2025-09-10 20:42:54,758 - Ghost.SC-SUB - INFO - SC-SUB started
+2025-09-10 20:42:54,758 - Ghost.AO-SUB - INFO - AO-SUB started
+2025-09-10 20:42:54,758 - Ghost.SP-SUB - INFO - SP-SUB started
+2025-09-10 20:42:54,758 - GhostEngine - INFO - Ghost Engine started successfully
+2025-09-10 20:42:56,760 - Ghost.SC-SUB - INFO - Session created: d35ea7fd...
+^C2025-09-10 20:49:15,549 - GhostEngine - INFO - Received signal 2
+2025-09-10 20:49:16,284 - GhostEngine - INFO - Shutting down Ghost Engine...
+2025-09-10 20:49:16,285 - Ghost.EB-SUB - INFO - EB-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - EB-SUB stopped
+2025-09-10 20:49:16,285 - Ghost.AUTH-SUB - INFO - AUTH-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - AUTH-SUB stopped
+2025-09-10 20:49:16,285 - Ghost.SEC-SUB - INFO - SEC-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - SEC-SUB stopped
+2025-09-10 20:49:16,285 - Ghost.SC-SUB - INFO - SC-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - SC-SUB stopped
+2025-09-10 20:49:16,285 - Ghost.AO-SUB - INFO - AO-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - AO-SUB stopped
+2025-09-10 20:49:16,285 - Ghost.SP-SUB - INFO - SP-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - SP-SUB stopped
+2025-09-10 20:49:16,285 - GhostEngine - INFO - Ghost Engine shutdown complete
+                                                                                 

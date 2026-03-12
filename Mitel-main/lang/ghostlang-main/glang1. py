@@ -1,0 +1,94 @@
+class GhostComms:
+    """Internet-independent communication system for GhostHUD"""
+    
+    def __init__(self):
+        # Comms channels (from highest bandwidth/reliability to lowest)
+        self.channels = {
+            "lan": LANChannel(),              # Your working LAN implementation
+            "tunnel": TunnelChannel(),        # Internet tunnels when available
+            "lora": LoRaChannel(),            # Long-range radio (km range)
+            "audio": AudioToneChannel(),      # Audio frequency encoding
+            "morse": MorseChannel(),          # Visual/audio/RF Morse encoding
+            "sneakernet": SneakernetChannel() # USB "ghost drops" for physical transfer
+        }
+        
+        # AI components from your existing system
+        self.neural_router = NeuralChannelRouter()
+        self.behavioral_analyzer = BehavioralAnalyzer()
+        self.event_bus = AIEventRouter()
+        
+        # New components specific to GhostComms
+        self.channel_monitor = ChannelMonitor()
+        self.message_queue = PrioritizedMessageQueue()
+        self.fallback_orchestrator = FallbackOrchestrator()
+    
+    async def send_message(self, message, priority=MessagePriority.NORMAL, 
+                         target_devices=None):
+        """Send message with automatic channel selection"""
+        
+        # Create GhostLang protocol message
+        protocol_message = await self.create_protocol_message(message, priority)
+        
+        # Get channel availability and quality metrics
+        channel_status = await self.channel_monitor.get_current_status()
+        
+        # Let the neural router determine best channel based on:
+        # - Message priority
+        # - Channel status
+        # - Target devices
+        # - Behavioral context
+        channel_selection = await self.neural_router.select_optimal_channel(
+            protocol_message=protocol_message,
+            channel_status=channel_status,
+            target_devices=target_devices,
+            behavioral_context=await self.behavioral_analyzer.get_current_context()
+        )
+        
+        # Try primary channel
+        primary_channel = channel_selection.primary
+        if await self._try_send(protocol_message, primary_channel):
+            return SendResult(success=True, channel=primary_channel)
+            
+        # If primary fails, use fallback orchestrator to try alternatives
+        fallback_result = await self.fallback_orchestrator.execute_fallback_sequence(
+            protocol_message=protocol_message,
+            fallback_channels=channel_selection.fallbacks,
+            max_attempts=3
+        )
+        
+        return fallback_result
+    
+    async def _try_send(self, protocol_message, channel):
+        """Attempt to send via specified channel"""
+        try:
+            # Adapt message format for specific channel
+            adapted_message = await channel.adapt_message(protocol_message)
+            
+            # Send through channel
+            result = await channel.send(adapted_message)
+            
+            # Log result through event bus
+            await self.event_bus.route_intelligent_event(GhostEvent(
+                event_type="COMMS_MESSAGE_SENT",
+                priority=EventPriority.LOW,
+                source="GHOST_COMMS",
+                payload={
+                    "message_id": protocol_message.header["msg_id"],
+                    "channel": channel.name,
+                    "success": result.success
+                }
+            ))
+            
+            return result.success
+        except Exception as e:
+            # Log failure
+            await self.event_bus.route_intelligent_event(GhostEvent(
+                event_type="COMMS_CHANNEL_ERROR",
+                priority=EventPriority.MEDIUM,
+                source="GHOST_COMMS",
+                payload={
+                    "channel": channel.name,
+                    "error": str(e)
+                }
+            ))
+            return False

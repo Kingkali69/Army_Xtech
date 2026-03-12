@@ -1,0 +1,32 @@
+[Unit]
+Description=CloudCore_Sync_2 Cybersecurity Engine
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=cloudcore
+Group=cloudcore
+ExecStart=/opt/cloudcore_sync_2/venv/bin/python /opt/cloudcore_sync_2/glegion_main_launcher.py --start
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Security Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+SystemCallFilter=@system-service
+
+# Resource Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitMEMLOCK=infinity
+CPUQuota=200%
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

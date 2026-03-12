@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=KILL CPU
+Comment=Kill all OMNI/NEXUS processes to free CPU
+Exec=gnome-terminal -- /home/kali/Desktop/MITEL/Mitel-main/SUPER_KILL.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Utility;
+StartupNotify=true
+Name[en_US]=KILL CPU

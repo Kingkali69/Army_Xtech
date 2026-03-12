@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""
+Standalone Ghost Engine - CloudCore_Sync_2
+Self-contained engine with all subsystems in one file
+No external dependencies beyond Python standard library
+
+KK&GDevOps - Complete working version
+"""
+
+import asyncio
+import json
+import logging
+import os
+import platform
+import signal
+import sys
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum, auto
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Set
+import hashlib
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger("GhostEngine")
+
+class PlatformType(Enum):
+    LINUX = "linux"
+    WINDOWS = "windows" 
+    ANDROID = "android"
+    IOS = "ios"
+    UNKNOWN = "unknown"
+
+class SubsystemState(Enum):
+    UNINITIALIZED = "uninitialized"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    RUNNING = "running"
+    ERROR = "error"
+    STOPPED = "stopped"
+
+class EventPriority(Enum):
+    CRITICAL = 1
+    HIGH = 2
+    MEDIUM = 3
+    LOW = 4
+
+class ThreatLevel(Enum):
+    MINIMAL = 1
+    LOW = 2
+    MEDIUM = 3
+    HIGH = 4
+    CRITICAL = 5
+
+class AttackVector(Enum):
+    NETWORK_INTRUSION = auto()
+    CREDENTIAL_COMPROMISE = auto()
+    MALWARE_INJECTION = auto()
+    DATA_EXFILTRATION = auto()
+    AI_ADVERSARIAL_ATTACK = auto()
+    QUANTUM_ATTACK = auto()
+
+# Base Classes
+class GhostSubsystem:
+    """Base class for all Ghost Engine subsystems"""
+    def __init__(self, name: str):
+        self.name = name
+        self.event_bus = None
+        self.config = {}
+        self.logger = logging.getLogger(f"Ghost.{name}")
+        self.state = SubsystemState.UNINITIALIZED
+        
+    async def initialize(self):
+        self.state = SubsystemState.INITIALIZING
+        self.logger.info(f"{self.name} initializing...")
+        self.state = SubsystemState.READY
+        
+    async def start(self):
+        self.state = SubsystemState.RUNNING
+        self.logger.info(f"{self.name} started")
+        
+    async def stop(self):
+        self.state = SubsystemState.STOPPED
+        self.logger.info(f"{self.name} stopped")
+        
+    async def get_status(self):
+        return {
+            'name': self.name,
+            'state': self.state.value,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# Event Bus Subsystem
+class EventBusSubsystem(GhostSubsystem):
+    """Event Bus for inter-subsystem communication"""
+    
+    def __init__(self):
+        super().__init__("EB-SUB")
+        self.subscribers = defaultdict(set)
+        self.event_history = deque(maxlen=1000)
+        self.stats = {
+            'events_published': 0,
+            'events_delivered': 0,
+            'errors': 0
+        }
+    
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("Event Bus ready for inter-subsystem communication")
+    
+    def subscribe(self, event_type: str, callback):
+        """Subscribe to event type"""
+        self.subscribers[event_type].add(callback)
+        self.logger.debug(f"New subscriber for {event_type}")
+        return lambda: self.subscribers[event_type].discard(callback)
+    
+    async def publish(self, event_type: str, data: Dict, priority: EventPriority = EventPriority.MEDIUM):
+        """Publish event to subscribers"""
+        try:
+            event = {
+                'type': event_type,
+                'data': data,
+                'priority': priority.value,
+                'timestamp': datetime.now().isoformat(),
+                'id': str(uuid.uuid4())[:8]
+            }
+            
+            self.event_history.append(event)
+            self.stats['events_published'] += 1
+            
+            # Notify subscribers
+            callbacks = self.subscribers.get(event_type, set())
+            for callback in list(callbacks):
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(event)
+                    else:
+                        callback(event)
+                    self.stats['events_delivered'] += 1
+                except Exception as e:
+                    self.logger.error(f"Error in event handler: {e}")
+                    self.stats['errors'] += 1
+            
+            if callbacks:
+                self.logger.debug(f"Published {event_type} to {len(callbacks)} subscribers")
+                
+        except Exception as e:
+            self.logger.error(f"Error publishing event {event_type}: {e}")
+            self.stats['errors'] += 1
+
+# Authentication Subsystem
+class AuthSubsystem(GhostSubsystem):
+    """Authentication and authorization subsystem"""
+    
+    def __init__(self):
+        super().__init__("AUTH-SUB")
+        self.active_sessions = {}
+        self.failed_attempts = defaultdict(int)
+        self.max_attempts = 5
+        self.lockout_duration = 300  # 5 minutes
+        
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("Authentication subsystem ready")
+        
+        # Subscribe to security events
+        if self.event_bus:
+            self.event_bus.subscribe("AUTH_REQUEST", self.handle_auth_request)
+            self.event_bus.subscribe("SESSION_VALIDATE", self.validate_session)
+    
+    async def handle_auth_request(self, event):
+        """Handle authentication request"""
+        data = event['data']
+        username = data.get('username')
+        
+        # Check for lockout
+        if self.failed_attempts[username] >= self.max_attempts:
+            await self.event_bus.publish("AUTH_FAILURE", {
+                'username': username,
+                'reason': 'account_locked',
+                'attempts': self.failed_attempts[username]
+            }, EventPriority.HIGH)
+            return
+        
+        # Simulate authentication
+        success = data.get('password') == 'ghost123'  # Demo password
+        
+        if success:
+            session_id = str(uuid.uuid4())
+            self.active_sessions[session_id] = {
+                'username': username,
+                'created': datetime.now(),
+                'last_activity': datetime.now()
+            }
+            
+            await self.event_bus.publish("AUTH_SUCCESS", {
+                'username': username,
+                'session_id': session_id
+            }, EventPriority.MEDIUM)
+            
+            self.failed_attempts[username] = 0
+            
+        else:
+            self.failed_attempts[username] += 1
+            await self.event_bus.publish("AUTH_FAILURE", {
+                'username': username,
+                'attempts': self.failed_attempts[username]
+            }, EventPriority.HIGH)
+    
+    async def validate_session(self, event):
+        """Validate session token"""
+        session_id = event['data'].get('session_id')
+        valid = session_id in self.active_sessions
+        
+        await self.event_bus.publish("SESSION_VALIDATION", {
+            'session_id': session_id,
+            'valid': valid
+        })
+
+# Security Subsystem  
+class SecuritySubsystem(GhostSubsystem):
+    """AI-powered security and threat detection"""
+    
+    def __init__(self):
+        super().__init__("SEC-SUB")
+        self.active_threats = {}
+        self.threat_history = deque(maxlen=10000)
+        self.security_level = ThreatLevel.LOW
+        
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("Security subsystem initialized - AI threat detection active")
+        
+        # Subscribe to security events
+        if self.event_bus:
+            self.event_bus.subscribe("AUTH_FAILURE", self.analyze_auth_failure)
+            self.event_bus.subscribe("NETWORK_EVENT", self.analyze_network_event)
+            self.event_bus.subscribe("THREAT_DETECTED", self.handle_threat)
+        
+        # Start continuous monitoring
+        asyncio.create_task(self.continuous_monitoring())
+    
+    async def analyze_auth_failure(self, event):
+        """Analyze authentication failures for threats"""
+        data = event['data']
+        attempts = data.get('attempts', 0)
+        
+        if attempts >= 3:
+            threat_id = f"BRUTE_FORCE_{int(time.time())}"
+            threat = {
+                'id': threat_id,
+                'type': AttackVector.CREDENTIAL_COMPROMISE,
+                'level': ThreatLevel.MEDIUM if attempts < 5 else ThreatLevel.HIGH,
+                'source': data.get('username'),
+                'detected': datetime.now(),
+                'details': f"Multiple failed login attempts: {attempts}"
+            }
+            
+            self.active_threats[threat_id] = threat
+            self.threat_history.append(threat)
+            
+            await self.event_bus.publish("SECURITY_ALERT", {
+                'threat_id': threat_id,
+                'type': 'credential_attack',
+                'level': threat['level'].name,
+                'message': f"Potential brute force attack detected: {attempts} failed attempts"
+            }, EventPriority.HIGH)
+            
+            self.logger.warning(f"Threat detected: {threat['details']}")
+    
+    async def analyze_network_event(self, event):
+        """Analyze network events for suspicious activity"""
+        # Simulate network threat detection
+        data = event['data']
+        
+        # Look for suspicious patterns
+        if data.get('port') in [22, 3389, 4444]:  # SSH, RDP, common backdoor ports
+            threat_id = f"NETWORK_SCAN_{int(time.time())}"
+            threat = {
+                'id': threat_id,
+                'type': AttackVector.NETWORK_INTRUSION,
+                'level': ThreatLevel.MEDIUM,
+                'source': data.get('source_ip'),
+                'detected': datetime.now(),
+                'details': f"Suspicious port access: {data.get('port')}"
+            }
+            
+            self.active_threats[threat_id] = threat
+            await self.event_bus.publish("SECURITY_ALERT", {
+                'threat_id': threat_id,
+                'type': 'network_intrusion',
+                'level': threat['level'].name,
+                'message': f"Suspicious network activity on port {data.get('port')}"
+            }, EventPriority.MEDIUM)
+    
+    async def handle_threat(self, event):
+        """Handle detected threats"""
+        threat_data = event['data']
+        self.logger.warning(f"THREAT ALERT: {threat_data}")
+        
+        # Escalate high-level threats
+        if threat_data.get('level') == ThreatLevel.CRITICAL.name:
+            await self.event_bus.publish("EMERGENCY_RESPONSE", {
+                'action': 'lockdown',
+                'reason': 'critical_threat_detected',
+                'threat_id': threat_data.get('threat_id')
+            }, EventPriority.CRITICAL)
+    
+    async def continuous_monitoring(self):
+        """Continuous security monitoring loop"""
+        while self.state == SubsystemState.RUNNING:
+            try:
+                # Simulate AI threat hunting
+                current_time = datetime.now()
+                
+                # Age out old threats
+                expired_threats = []
+                for threat_id, threat in self.active_threats.items():
+                    if (current_time - threat['detected']).total_seconds() > 3600:  # 1 hour
+                        expired_threats.append(threat_id)
+                
+                for threat_id in expired_threats:
+                    del self.active_threats[threat_id]
+                
+                # Update security level based on active threats
+                if len(self.active_threats) > 10:
+                    self.security_level = ThreatLevel.HIGH
+                elif len(self.active_threats) > 5:
+                    self.security_level = ThreatLevel.MEDIUM
+                else:
+                    self.security_level = ThreatLevel.LOW
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+            except Exception as e:
+                self.logger.error(f"Error in security monitoring: {e}")
+                await asyncio.sleep(60)
+
+# Session Control Subsystem
+class SessionControlSubsystem(GhostSubsystem):
+    """Session management and control"""
+    
+    def __init__(self):
+        super().__init__("SC-SUB")
+        self.active_sessions = {}
+        self.session_stats = {
+            'total_created': 0,
+            'total_expired': 0,
+            'active_count': 0
+        }
+        
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("Session control subsystem ready")
+        
+        if self.event_bus:
+            self.event_bus.subscribe("AUTH_SUCCESS", self.create_session)
+            self.event_bus.subscribe("SESSION_END", self.end_session)
+        
+        # Start session cleanup task
+        asyncio.create_task(self.session_cleanup())
+    
+    async def create_session(self, event):
+        """Create new session after successful auth"""
+        data = event['data']
+        session_id = data.get('session_id')
+        
+        session = {
+            'id': session_id,
+            'username': data.get('username'),
+            'created': datetime.now(),
+            'last_activity': datetime.now(),
+            'requests': 0,
+            'data_transferred': 0
+        }
+        
+        self.active_sessions[session_id] = session
+        self.session_stats['total_created'] += 1
+        self.session_stats['active_count'] = len(self.active_sessions)
+        
+        self.logger.info(f"Session created: {session_id[:8]}...")
+    
+    async def end_session(self, event):
+        """End session"""
+        session_id = event['data'].get('session_id')
+        if session_id in self.active_sessions:
+            del self.active_sessions[session_id]
+            self.session_stats['active_count'] = len(self.active_sessions)
+            self.logger.info(f"Session ended: {session_id[:8]}...")
+    
+    async def session_cleanup(self):
+        """Clean up expired sessions"""
+        while self.state == SubsystemState.RUNNING:
+            try:
+                current_time = datetime.now()
+                expired_sessions = []
+                
+                for session_id, session in self.active_sessions.items():
+                    # Sessions expire after 1 hour of inactivity
+                    if (current_time - session['last_activity']).total_seconds() > 3600:
+                        expired_sessions.append(session_id)
+                
+                for session_id in expired_sessions:
+                    del self.active_sessions[session_id]
+                    self.session_stats['total_expired'] += 1
+                    
+                    await self.event_bus.publish("SESSION_EXPIRED", {
+                        'session_id': session_id
+                    })
+                
+                self.session_stats['active_count'] = len(self.active_sessions)
+                await asyncio.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                self.logger.error(f"Error in session cleanup: {e}")
+                await asyncio.sleep(600)
+
+# API Orchestration Subsystem
+class APIOrchestrationSubsystem(GhostSubsystem):
+    """API management and orchestration"""
+    
+    def __init__(self):
+        super().__init__("AO-SUB")
+        self.api_stats = {
+            'total_requests': 0,
+            'total_errors': 0,
+            'avg_response_time': 0
+        }
+        self.rate_limits = defaultdict(lambda: {'count': 0, 'window_start': time.time()})
+        
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("API orchestration subsystem ready")
+        
+        if self.event_bus:
+            self.event_bus.subscribe("API_REQUEST", self.handle_api_request)
+    
+    async def handle_api_request(self, event):
+        """Handle API request"""
+        data = event['data']
+        client_id = data.get('client_id', 'unknown')
+        
+        # Check rate limiting
+        if self.check_rate_limit(client_id):
+            await self.event_bus.publish("API_RESPONSE", {
+                'client_id': client_id,
+                'status': 'success',
+                'response_time': 0.1
+            })
+            self.api_stats['total_requests'] += 1
+        else:
+            await self.event_bus.publish("API_RESPONSE", {
+                'client_id': client_id,
+                'status': 'rate_limited',
+                'message': 'Rate limit exceeded'
+            })
+    
+    def check_rate_limit(self, client_id: str, limit: int = 100) -> bool:
+        """Check if client is within rate limits"""
+        current_time = time.time()
+        client_data = self.rate_limits[client_id]
+        
+        # Reset window if needed (60 second windows)
+        if current_time - client_data['window_start'] > 60:
+            client_data['count'] = 0
+            client_data['window_start'] = current_time
+        
+        if client_data['count'] < limit:
+            client_data['count'] += 1
+            return True
+        
+        return False
+
+# Synchronization Protocol Subsystem
+class SynchronizationSubsystem(GhostSubsystem):
+    """Data synchronization and protocol management"""
+    
+    def __init__(self):
+        super().__init__("SP-SUB")
+        self.sync_queue = deque()
+        self.sync_stats = {
+            'items_synced': 0,
+            'sync_errors': 0,
+            'last_sync': None
+        }
+        
+    async def initialize(self):
+        await super().initialize()
+        self.logger.info("Synchronization protocol subsystem ready")
+        
+        if self.event_bus:
+            self.event_bus.subscribe("SYNC_REQUEST", self.handle_sync_request)
+        
+        # Start sync worker
+        asyncio.create_task(self.sync_worker())
+    
+    async def handle_sync_request(self, event):
+        """Handle synchronization request"""
+        data = event['data']
+        self.sync_queue.append({
+            'id': str(uuid.uuid4()),
+            'data': data,
+            'timestamp': datetime.now(),
+            'priority': data.get('priority', 'normal')
+        })
+    
+    async def sync_worker(self):
+        """Process synchronization queue"""
+        while self.state == SubsystemState.RUNNING:
+            try:
+                if self.sync_queue:
+                    sync_item = self.sync_queue.popleft()
+                    
+                    # Simulate sync operation
+                    await asyncio.sleep(0.1)
+                    
+                    await self.event_bus.publish("SYNC_COMPLETED", {
+                        'sync_id': sync_item['id'],
+                        'status': 'success'
+                    })
+                    
+                    self.sync_stats['items_synced'] += 1
+                    self.sync_stats['last_sync'] = datetime.now()
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                self.logger.error(f"Error in sync worker: {e}")
+                self.sync_stats['sync_errors'] += 1
+                await asyncio.sleep(5)
+
+# Main Ghost Engine
+class GhostEngine:
+    """Main Ghost Engine coordinator"""
+    
+    def __init__(self):
+        self.platform = self._detect_platform()
+        self.node_id = f"ghost-{str(uuid.uuid4())[:8]}"
+        self.subsystems = {}
+        self.running = False
+        self.start_time = None
+        self.shutdown_event = asyncio.Event()
+        
+        logger.info(f"Ghost Engine initializing on {self.platform.value}")
+        logger.info(f"Node ID: {self.node_id}")
+    
+    def _detect_platform(self) -> PlatformType:
+        """Detect current platform"""
+        system = platform.system().lower()
+        
+        if system == 'linux':
+            # Check for Android
+            if os.path.exists('/system/build.prop') or 'android' in os.environ.get('PREFIX', '').lower():
+                return PlatformType.ANDROID
+            return PlatformType.LINUX
+        elif system == 'windows':
+            return PlatformType.WINDOWS
+        elif system == 'darwin':
+            return PlatformType.IOS
+        else:
+            return PlatformType.UNKNOWN
+    
+    async def initialize(self):
+        """Initialize all subsystems"""
+        logger.info("Initializing Ghost Engine subsystems...")
+        
+        # Initialize Event Bus first
+        event_bus = EventBusSubsystem()
+        await event_bus.initialize()
+        self.subsystems['EB-SUB'] = event_bus
+        
+        # Initialize other subsystems
+        subsystems_to_init = [
+            ('AUTH-SUB', AuthSubsystem()),
+            ('SEC-SUB', SecuritySubsystem()),
+            ('SC-SUB', SessionControlSubsystem()),
+            ('AO-SUB', APIOrchestrationSubsystem()),
+            ('SP-SUB', SynchronizationSubsystem())
+        ]
+        
+        for name, subsystem in subsystems_to_init:
+            try:
+                subsystem.event_bus = event_bus
+                await subsystem.initialize()
+                self.subsystems[name] = subsystem
+                logger.info(f"{name} initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize {name}: {e}")
+        
+        logger.info(f"Ghost Engine initialized with {len(self.subsystems)} subsystems")
+    
+    async def start(self):
+        """Start all subsystems"""
+        logger.info("Starting Ghost Engine...")
+        
+        self.start_time = datetime.now()
+        self.running = True
+        
+        # Start all subsystems
+        for name, subsystem in self.subsystems.items():
+            try:
+                await subsystem.start()
+            except Exception as e:
+                logger.error(f"Failed to start {name}: {e}")
+        
+        # Setup signal handlers
+        self._setup_signal_handlers()
+        
+        logger.info("Ghost Engine started successfully")
+        
+        # Start demo events
+        asyncio.create_task(self.demo_events())
+    
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}")
+            asyncio.create_task(self.shutdown())
+        
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+        except Exception as e:
+            logger.warning(f"Could not setup signal handlers: {e}")
+    
+    async def demo_events(self):
+        """Generate demo events for testing"""
+        await asyncio.sleep(2)  # Wait for startup
+        
+        event_bus = self.subsystems.get('EB-SUB')
+        if not event_bus:
+            return
+        
+        # Simulate some authentication attempts
+        await event_bus.publish("AUTH_REQUEST", {
+            'username': 'testuser',
+            'password': 'ghost123'
+        })
+        
+        await asyncio.sleep(1)
+        
+        # Simulate failed auth attempt
+        await event_bus.publish("AUTH_REQUEST", {
+            'username': 'hacker',
+            'password': 'wrongpass'
+        })
+        
+        await asyncio.sleep(1)
+        
+        # Simulate network event
+        await event_bus.publish("NETWORK_EVENT", {
+            'source_ip': '192.168.1.100',
+            'port': 22,
+            'action': 'connection_attempt'
+        })
+        
+        # Simulate sync request
+        await event_bus.publish("SYNC_REQUEST", {
+            'data': {'test': 'sync_data'},
+            'priority': 'high'
+        })
+    
+    async def get_status(self):
+        """Get engine status"""
+        subsystem_status = {}
+        for name, subsystem in self.subsystems.items():
+            try:
+                subsystem_status[name] = await subsystem.get_status()
+            except Exception as e:
+                subsystem_status[name] = {'error': str(e)}
+        
+        return {
+            'engine': {
+                'platform': self.platform.value,
+                'node_id': self.node_id,
+                'running': self.running,
+                'uptime': str(datetime.now() - self.start_time) if self.start_time else None
+            },
+            'subsystems': subsystem_status
+        }
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down Ghost Engine...")
+        
+        self.running = False
+        
+        # Stop all subsystems
+        for name, subsystem in self.subsystems.items():
+            try:
+                await subsystem.stop()
+                logger.info(f"{name} stopped")
+            except Exception as e:
+                logger.error(f"Error stopping {name}: {e}")
+        
+        self.shutdown_event.set()
+        logger.info("Ghost Engine shutdown complete")
+    
+    async def run(self):
+        """Main run loop"""
+        try:
+            await self.initialize()
+            await self.start()
+            
+            # Wait for shutdown
+            await self.shutdown_event.wait()
+            
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+        finally:
+            if self.running:
+                await self.shutdown()
+
+async def main():
+    """Main entry point"""
+    engine = GhostEngine()
+    await engine.run()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutdown requested")
+    except Exception as e:
+        print(f"Fatal error: {e}")

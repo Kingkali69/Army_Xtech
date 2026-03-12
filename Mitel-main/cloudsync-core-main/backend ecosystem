@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""
+SIEM Connector Implementations for KK&G DevOps Cybersecurity Engine
+==================================================================
+Complete production-ready implementations for major SIEM platforms:
+- Splunk Enterprise/Cloud
+- IBM QRadar
+- Microsoft Sentinel
+- Elastic Security
+"""
+
+import asyncio
+import aiohttp
+import json
+import time
+import hmac
+import hashlib
+import base64
+import ssl
+import certifi
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import logging
+import urllib.parse
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+import jwt
+import xml.etree.ElementTree as ET
+
+# Configure secure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [REDACTED] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+class AuthMethod(Enum):
+    """Authentication method types"""
+    API_KEY = "api_key"
+    BASIC_AUTH = "basic_auth"
+    OAUTH2 = "oauth2"
+    CLIENT_CERT = "client_cert"
+    TOKEN = "token"
+    SAML = "saml"
+
+@dataclass
+class RateLimitConfig:
+    """Rate limiting configuration"""
+    requests_per_second: float
+    requests_per_minute: int
+    requests_per_hour: int
+    burst_limit: int
+
+@dataclass
+class RetryConfig:
+    """Retry configuration"""
+    max_retries: int = 3
+    initial_delay: float = 1.0
+    max_delay: float = 60.0
+    exponential_base: float = 2.0
+    jitter: bool = True
+
+class SIEMConnectorBase:
+    """Base class for SIEM connectors with common functionality"""
+    
+    def __init__(self, connection_params: Dict[str, Any]):
+        self.connection_params = connection_params
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.rate_limiter = self._init_rate_limiter()
+        self.retry_config = RetryConfig(**connection_params.get('retry_config', {}))
+        self.logger = self._init_secure_logger()
+        self._last_request_time = 0.0
+        self._request_count_minute = 0
+        self._request_count_hour = 0
+        self._minute_window_start = time.time()
+        self._hour_window_start = time.time()
+        
+    def _init_secure_logger(self) -> logging.Logger:
+        """Initialize secure logger that redacts sensitive information"""
+        logger = logging.getLogger(f"{self.__class__.__name__}")
+        
+        # Custom formatter that redacts sensitive data
+        class RedactingFormatter(logging.Formatter):
+            def format(self, record):
+                msg = super().format(record)
+                # Redact common sensitive patterns
+                sensitive_patterns = [
+                    (r'(?i)(password|pass|pwd|secret|key|token|auth)["\']?\s*[:=]\s*["\']?([^"\'\s,}]+)', r'\1=***REDACTED***'),
+                    (r'(?i)(bearer\s+)([a-zA-Z0-9\-._~+/]+=*)', r'\1***REDACTED***'),
+                    (r'(?i)(authorization:\s*)([^\s,]+)', r'\1***REDACTED***'),
+                ]
+                
+                for pattern, replacement in sensitive_patterns:
+                    import re
+                    msg = re.sub(pattern, replacement, msg)
+                
+                return msg
+        
+        handler = logging.StreamHandler()
+        handler.setFormatter(RedactingFormatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        
+        return logger
+        
+    def _init_rate_limiter(self) -> RateLimitConfig:
+        """Initialize rate limiter from config"""
+        rate_config = self.connection_params.get('rate_limit', {})
+        return RateLimitConfig(
+            requests_per_second=rate_config.get('requests_per_second', 10.0),
+            requests_per_minute=rate_config.get('requests_per_minute', 600),
+            requests_per_hour=rate_config.get('requests_per_hour', 36000),
+            burst_limit=rate_config.get('burst_limit', 50)
+        )
+    
+    async def _check_rate_limit(self):
+        """Enforce rate limiting"""
+        current_time = time.time()
+        
+        # Check per-second rate limit
+        time_since_last = current_time - self._last_request_time
+        min_interval = 1.0 / self.rate_limiter.requests_per_second
+        
+        if time_since_last < min_interval:
+            await asyncio.sleep(min_interval - time_since_last)
+        
+        # Update time windows
+        if current_time - self._minute_window_start >= 60:
+            self._minute_window_start = current_time
+            self._request_count_minute = 0
+            
+        if current_time - self._hour_window_start >= 3600:
+            self._hour_window_start = current_time
+            self._request_count_hour = 0
+        
+        # Check minute and hour limits
+        if self._request_count_minute >= self.rate_limiter.requests_per_minute:
+            sleep_time = 60 - (current_time - self._minute_window_start)
+            if sleep_time > 0:
+                self.logger.warning(f"Rate limit hit - sleeping {sleep_time:.2f}s")
+                await asyncio.sleep(sleep_time)
+                self._minute_window_start = time.time()
+                self._request_count_minute = 0
+        
+        if self._request_count_hour >= self.rate_limiter.requests_per_hour:
+            sleep_time = 3600 - (current_time - self._hour_window_start)
+            if sleep_time > 0:
+                self.logger.warning(f"Hourly rate limit hit - sleeping {sleep_time:.2f}s")
+                await asyncio.sleep(sleep_time)
+                self._hour_window_start = time.time()
+                self._request_count_hour = 0
+        
+        self._last_request_time = time.time()
+        self._request_count_minute += 1
+        self._request_count_hour += 1
+    
+    async def _retry_request(self, request_func, *args, **kwargs):
+        """Execute request with exponential backoff retry"""
+        last_exception = None
+        delay = self.retry_config.initial_delay
+        
+        for attempt in range(self.retry_config.max_retries + 1):
+            try:
+                await self._check_rate_limit()
+                result = await request_func(*args, **kwargs)
+                
+                if attempt > 0:
+                    self.logger.info(f"Request succeeded on attempt {attempt + 1}")
+                
+                return result
+                
+            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+                last_exception = e
+                
+                if attempt == self.retry_config.max_retries:
+                    self.logger.error(f"Request failed after {attempt + 1} attempts: {type(e).__name__}")
+                    break
+                
+                # Calculate jittered delay
+                if self.retry_config.jitter:
+                    import random
+                    jitter_delay = delay * (0.5 + random.random() * 0.5)
+                else:
+                    jitter_delay = delay
+                
+                self.logger.warning(f"Request failed (attempt {attempt + 1}), retrying in {jitter_delay:.2f}s: {type(e).__name__}")
+                await asyncio.sleep(jitter_delay)
+                
+                delay = min(delay * self.retry_config.exponential_base, self.retry_config.max_delay)
+        
+        raise last_exception
+    
+    async def initialize(self):
+        """Initialize connector - override in subclasses"""
+        raise NotImplementedError
+    
+    async def test_connection(self) -> bool:
+        """Test connection to SIEM - override in subclasses"""
+        raise NotImplementedError
+        
+    async def send_event(self, event_data: Dict[str, Any]) -> bool:
+        """Send security event - override in subclasses"""
+        raise NotImplementedError
+        
+    async def query_threat_intel(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence - override in subclasses"""
+        raise NotImplementedError
+    
+    async def close(self):
+        """Clean up resources"""
+        if self.session:
+            await self.session.close()
+
+class SplunkConnector(SIEMConnectorBase):
+    """Splunk Enterprise/Cloud connector with HEC and REST API support"""
+    
+    async def initialize(self):
+        """Initialize Splunk connector"""
+        self.base_url = self.connection_params['base_url'].rstrip('/')
+        self.auth_method = AuthMethod(self.connection_params.get('auth_method', 'token'))
+        self.verify_ssl = self.connection_params.get('verify_ssl', True)
+        
+        # Create SSL context
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        if not self.verify_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+        # Initialize session
+        connector = aiohttp.TCPConnector(ssl=ssl_context, limit=100)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        
+        headers = {
+            'User-Agent': 'KKG-Security-Framework/1.0',
+            'Content-Type': 'application/json'
+        }
+        
+        # Configure authentication
+        if self.auth_method == AuthMethod.TOKEN:
+            headers['Authorization'] = f"Splunk {self.connection_params['token']}"
+        elif self.auth_method == AuthMethod.BASIC_AUTH:
+            import base64
+            credentials = base64.b64encode(
+                f"{self.connection_params['username']}:{self.connection_params['password']}".encode()
+            ).decode()
+            headers['Authorization'] = f"Basic {credentials}"
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        
+        self.hec_url = f"{self.base_url}/services/collector/event"
+        self.rest_url = f"{self.base_url}/services"
+        
+        self.logger.info("Splunk connector initialized")
+    
+    async def test_connection(self) -> bool:
+        """Test connection to Splunk"""
+        try:
+            async def _test():
+                async with self.session.get(f"{self.rest_url}/server/info") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.logger.info(f"Connected to Splunk {data.get('entry', [{}])[0].get('content', {}).get('version', 'unknown')}")
+                        return True
+                    else:
+                        self.logger.error(f"Connection test failed: HTTP {response.status}")
+                        return False
+            
+            return await self._retry_request(_test)
+            
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    async def send_event(self, event_data: Dict[str, Any]) -> bool:
+        """Send event to Splunk via HEC"""
+        try:
+            # Format for Splunk HEC
+            splunk_event = {
+                'time': event_data.get('timestamp', time.time()),
+                'source': event_data.get('source', 'kkg-security'),
+                'sourcetype': event_data.get('sourcetype', 'kkg:security_event'),
+                'index': event_data.get('index', 'security'),
+                'event': event_data
+            }
+            
+            async def _send():
+                async with self.session.post(self.hec_url, json=splunk_event) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if result.get('code') == 0:
+                            return True
+                        else:
+                            self.logger.error(f"HEC error: {result.get('text', 'Unknown error')}")
+                            return False
+                    else:
+                        self.logger.error(f"Send event failed: HTTP {response.status}")
+                        return False
+            
+            return await self._retry_request(_send)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send event: {e}")
+            return False
+    
+    async def query_threat_intel(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence from Splunk"""
+        try:
+            # Build search query
+            indicator_list = ' OR '.join([f'"{indicator}"' for indicator in indicators])
+            search_query = f'search index=threat_intel ({indicator_list}) | head 100'
+            
+            async def _search():
+                # Start search job
+                search_data = {
+                    'search': search_query,
+                    'output_mode': 'json',
+                    'max_count': 100
+                }
+                
+                async with self.session.post(
+                    f"{self.rest_url}/search/jobs", 
+                    data=search_data
+                ) as response:
+                    if response.status != 201:
+                        return {'error': f'Search job creation failed: HTTP {response.status}'}
+                    
+                    # Extract job ID
+                    text = await response.text()
+                    import re
+                    job_match = re.search(r'<sid>([^<]+)</sid>', text)
+                    if not job_match:
+                        return {'error': 'Could not extract job ID'}
+                    
+                    job_id = job_match.group(1)
+                
+                # Wait for job completion
+                for _ in range(30):  # 30 second timeout
+                    async with self.session.get(
+                        f"{self.rest_url}/search/jobs/{job_id}",
+                        params={'output_mode': 'json'}
+                    ) as response:
+                        if response.status == 200:
+                            job_status = await response.json()
+                            entry = job_status.get('entry', [{}])[0]
+                            content = entry.get('content', {})
+                            
+                            if content.get('isDone'):
+                                break
+                    
+                    await asyncio.sleep(1)
+                else:
+                    return {'error': 'Search timeout'}
+                
+                # Get results
+                async with self.session.get(
+                    f"{self.rest_url}/search/jobs/{job_id}/results",
+                    params={'output_mode': 'json', 'count': 100}
+                ) as response:
+                    if response.status == 200:
+                        results = await response.json()
+                        return {
+                            'indicators': indicators,
+                            'results': results.get('results', []),
+                            'total_results': len(results.get('results', []))
+                        }
+                    else:
+                        return {'error': f'Results retrieval failed: HTTP {response.status}'}
+            
+            return await self._retry_request(_search)
+            
+        except Exception as e:
+            self.logger.error(f"Threat intel query failed: {e}")
+            return {'error': str(e)}
+
+class QRadarConnector(SIEMConnectorBase):
+    """IBM QRadar SIEM connector with REST API v14.0+"""
+    
+    async def initialize(self):
+        """Initialize QRadar connector"""
+        self.base_url = self.connection_params['base_url'].rstrip('/')
+        self.api_version = self.connection_params.get('api_version', '14.0')
+        self.verify_ssl = self.connection_params.get('verify_ssl', True)
+        
+        # Create SSL context
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        if not self.verify_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Load client certificate if provided
+        if 'client_cert' in self.connection_params:
+            ssl_context.load_cert_chain(
+                self.connection_params['client_cert'],
+                self.connection_params.get('client_key')
+            )
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context, limit=50)
+        timeout = aiohttp.ClientTimeout(total=60, connect=15)
+        
+        headers = {
+            'SEC': self.connection_params['sec_token'],
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Version': self.api_version
+        }
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        
+        self.api_url = f"{self.base_url}/api"
+        self.logger.info("QRadar connector initialized")
+    
+    async def test_connection(self) -> bool:
+        """Test connection to QRadar"""
+        try:
+            async def _test():
+                async with self.session.get(f"{self.api_url}/system/about") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.logger.info(f"Connected to QRadar {data.get('external_version', 'unknown')}")
+                        return True
+                    else:
+                        self.logger.error(f"Connection test failed: HTTP {response.status}")
+                        return False
+            
+            return await self._retry_request(_test)
+            
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    async def send_event(self, event_data: Dict[str, Any]) -> bool:
+        """Send event to QRadar via custom event API"""
+        try:
+            # Transform to QRadar custom event format
+            qradar_event = {
+                'timestamp': int(event_data.get('timestamp', time.time() * 1000)),
+                'event_category_id': event_data.get('event_category_id', 10000),
+                'magnitude': event_data.get('magnitude', 5),
+                'source_ip': event_data.get('source_ip'),
+                'destination_ip': event_data.get('destination_ip'),
+                'username': event_data.get('username'),
+                'description': event_data.get('description', 'KKG Security Event'),
+                'custom_properties': event_data
+            }
+            
+            # Remove None values
+            qradar_event = {k: v for k, v in qradar_event.items() if v is not None}
+            
+            async def _send():
+                async with self.session.post(
+                    f"{self.api_url}/analytics/custom_actions/actions",
+                    json=qradar_event
+                ) as response:
+                    if response.status in [200, 201]:
+                        return True
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(f"Send event failed: HTTP {response.status} - {error_text}")
+                        return False
+            
+            return await self._retry_request(_send)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send event: {e}")
+            return False
+    
+    async def query_threat_intel(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence from QRadar reference sets"""
+        try:
+            results = {}
+            
+            async def _query_reference_set(ref_set_name: str):
+                """Query a specific reference set"""
+                params = {
+                    'filter': f"value in ('{\"', '\".join(indicators)}')",
+                    'fields': 'value,first_seen,last_seen'
+                }
+                
+                async with self.session.get(
+                    f"{self.api_url}/reference_data/sets/{ref_set_name}",
+                    params=params
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get('data', [])
+                    elif response.status == 404:
+                        return []  # Reference set doesn't exist
+                    else:
+                        self.logger.warning(f"Query failed for {ref_set_name}: HTTP {response.status}")
+                        return []
+            
+            # Query common threat intel reference sets
+            ref_sets = [
+                'malicious_ips',
+                'malicious_domains', 
+                'threat_actors',
+                'malware_hashes',
+                'suspicious_urls'
+            ]
+            
+            async def _query_all():
+                for ref_set in ref_sets:
+                    try:
+                        ref_data = await _query_reference_set(ref_set)
+                        if ref_data:
+                            results[ref_set] = ref_data
+                    except Exception as e:
+                        self.logger.warning(f"Failed to query {ref_set}: {e}")
+                
+                # Also search recent events
+                search_filter = ' OR '.join([f'"{indicator}"' for indicator in indicators])
+                params = {
+                    'filter': f"(sourceip contains '{search_filter}' OR destinationip contains '{search_filter}')",
+                    'limit': 100,
+                    'sort': '-starttime'
+                }
+                
+                try:
+                    async with self.session.get(
+                        f"{self.api_url}/siem/events",
+                        params=params
+                    ) as response:
+                        if response.status == 200:
+                            events = await response.json()
+                            results['recent_events'] = events.get('events', [])
+                except Exception as e:
+                    self.logger.warning(f"Event search failed: {e}")
+                
+                return {
+                    'indicators': indicators,
+                    'results': results,
+                    'total_matches': sum(len(v) if isinstance(v, list) else 0 for v in results.values())
+                }
+            
+            return await self._retry_request(_query_all)
+            
+        except Exception as e:
+            self.logger.error(f"Threat intel query failed: {e}")
+            return {'error': str(e)}
+
+class SentinelConnector(SIEMConnectorBase):
+    """Microsoft Sentinel (Azure Sentinel) connector with Log Analytics API"""
+    
+    def __init__(self, connection_params: Dict[str, Any]):
+        super().__init__(connection_params)
+        self.access_token = None
+        self.token_expires = None
+    
+    async def initialize(self):
+        """Initialize Sentinel connector with OAuth2"""
+        self.tenant_id = self.connection_params['tenant_id']
+        self.client_id = self.connection_params['client_id']
+        self.client_secret = self.connection_params['client_secret']
+        self.workspace_id = self.connection_params['workspace_id']
+        self.resource_group = self.connection_params.get('resource_group')
+        self.subscription_id = self.connection_params.get('subscription_id')
+        
+        # Azure endpoints
+        self.auth_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        self.log_analytics_url = "https://api.loganalytics.io/v1"
+        self.data_collector_url = f"https://{self.workspace_id}.ods.opinsights.azure.com"
+        
+        connector = aiohttp.TCPConnector(limit=50)
+        timeout = aiohttp.ClientTimeout(total=60, connect=15)
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout
+        )
+        
+        # Get initial access token
+        await self._refresh_token()
+        
+        self.logger.info("Sentinel connector initialized")
+    
+    async def _refresh_token(self):
+        """Refresh OAuth2 access token"""
+        try:
+            token_data = {
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'scope': 'https://api.loganalytics.io/.default',
+                'grant_type': 'client_credentials'
+            }
+            
+            async with self.session.post(self.auth_url, data=token_data) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self.access_token = data['access_token']
+                    # Set expiry with 5 minute buffer
+                    self.token_expires = time.time() + data.get('expires_in', 3600) - 300
+                    
+                    # Update session headers
+                    self.session.headers.update({
+                        'Authorization': f"Bearer {self.access_token}",
+                        'Content-Type': 'application/json'
+                    })
+                    
+                    self.logger.info("OAuth2 token refreshed")
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Token refresh failed: HTTP {response.status} - {error_text}")
+                    
+        except Exception as e:
+            self.logger.error(f"Token refresh failed: {e}")
+            raise
+    
+    async def _ensure_valid_token(self):
+        """Ensure we have a valid access token"""
+        if not self.access_token or time.time() >= self.token_expires:
+            await self._refresh_token()
+    
+    async def test_connection(self) -> bool:
+        """Test connection to Sentinel"""
+        try:
+            await self._ensure_valid_token()
+            
+            async def _test():
+                # Test with a simple query
+                query_data = {
+                    'query': 'Heartbeat | limit 1'
+                }
+                
+                async with self.session.post(
+                    f"{self.log_analytics_url}/workspaces/{self.workspace_id}/query",
+                    json=query_data
+                ) as response:
+                    if response.status == 200:
+                        self.logger.info("Connected to Sentinel Log Analytics workspace")
+                        return True
+                    else:
+                        self.logger.error(f"Connection test failed: HTTP {response.status}")
+                        return False
+            
+            return await self._retry_request(_test)
+            
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    async def send_event(self, event_data: Dict[str, Any]) -> bool:
+        """Send event to Sentinel via Data Collector API"""
+        try:
+            await self._ensure_valid_token()
+            
+            # Format for Sentinel custom log
+            log_type = event_data.get('log_type', 'KKGSecurityEvent')
+            sentinel_event = {
+                'TimeGenerated': event_data.get('timestamp', datetime.utcnow().isoformat() + 'Z'),
+                'Computer': event_data.get('hostname', 'unknown'),
+                'EventID': event_data.get('event_id', 0),
+                'Level': event_data.get('severity', 'Informational'),
+                'EventData': json.dumps(event_data)
+            }
+            
+            # Generate signature for Data Collector API
+            def _build_signature(workspace_id: str, shared_key: str, date: str, 
+                               content_length: int, method: str, content_type: str, resource: str):
+                x_headers = f"x-ms-date:{date}"
+                string_to_hash = f"{method}\n{content_length}\n{content_type}\n{x_headers}\n{resource}"
+                
+                import base64
+                import hmac
+                import hashlib
+                
+                bytes_to_hash = string_to_hash.encode('utf-8')
+                decoded_key = base64.b64decode(shared_key)
+                encoded_hash = base64.b64encode(
+                    hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()
+                ).decode()
+                
+                return f"SharedKey {workspace_id}:{encoded_hash}"
+            
+            async def _send():
+                json_data = json.dumps([sentinel_event])
+                body_bytes = json_data.encode('utf-8')
+                
+                rfc1123date = datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+                content_type = 'application/json'
+                resource = f"/api/logs"
+                
+                # Build authorization signature
+                if 'shared_key' in self.connection_params:
+                    signature = _build_signature(
+                        self.workspace_id,
+                        self.connection_params['shared_key'],
+                        rfc1123date,
+                        len(body_bytes),
+                        'POST',
+                        content_type,
+                        resource
+                    )
+                    
+                    headers = {
+                        'Authorization': signature,
+                        'Log-Type': log_type,
+                        'x-ms-date': rfc1123date,
+                        'time-generated-field': 'TimeGenerated'
+                    }
+                else:
+                    # Use AAD authentication
+                    headers = {
+                        'Authorization': f"Bearer {self.access_token}",
+                        'Log-Type': log_type,
+                        'time-generated-field': 'TimeGenerated'
+                    }
+                
+                async with self.session.post(
+                    f"{self.data_collector_url}/api/logs",
+                    data=body_bytes,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        return True
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(f"Send event failed: HTTP {response.status} - {error_text}")
+                        return False
+            
+            return await self._retry_request(_send)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send event: {e}")
+            return False
+    
+    async def query_threat_intel(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence from Sentinel"""
+        try:
+            await self._ensure_valid_token()
+            
+            # Build KQL query for threat hunting
+            indicators_list = "', '".join(indicators)
+            kql_query = f"""
+            let indicators = dynamic(['{indicators_list}']);
+            union
+                (ThreatIntelligenceIndicator
+                | where NetworkIP in (indicators) or DomainName in (indicators) or Url in (indicators)
+                | project TimeGenerated, NetworkIP, DomainName, Url, ThreatType, Description, Confidence
+                | limit 100),
+                (SecurityEvent
+                | where IpAddress in (indicators)
+                | project TimeGenerated, IpAddress, Account, Activity, Computer
+                | limit 50),
+                (DnsEvents  
+                | where Name in (indicators) or ClientIP in (indicators)
+                | project TimeGenerated, Name, ClientIP, QueryType
+                | limit 50)
+            | order by TimeGenerated desc
+            """
+            
+            async def _query():
+                query_data = {
+                    'query': kql_query,
+                    'timespan': 'P7D'  # Last 7 days
+                }
+                
+                async with self.session.post(
+                    f"{self.log_analytics_url}/workspaces/{self.workspace_id}/query",
+                    json=query_data
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'indicators': indicators,
+                            'results': data.get('tables', [{}])[0].get('rows', []),
+                            'columns': data.get('tables', [{}])[0].get('columns', []),
+                            'total_results': len(data.get('tables', [{}])[0].get('rows', []))
+                        }
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(f"Threat intel query failed: HTTP {response.status} - {error_text}")
+                        return {'error': f'Query failed: HTTP {response.status}'}
+            
+            return await self._retry_request(_query)
+            
+        except Exception as e:
+            self.logger.error(f"Threat intel query failed: {e}")
+            return {'error': str(e)}
+
+class ElasticConnector(SIEMConnectorBase):
+    """Elastic Security (Elasticsearch) connector with ECS format support"""
+    
+    async def initialize(self):
+        """Initialize Elastic connector"""
+        self.base_url = self.connection_params['base_url'].rstrip('/')
+        self.auth_method = AuthMethod(self.connection_params.get('auth_method', 'basic_auth'))
+        self.verify_ssl = self.connection_params.get('verify_ssl', True)
+        self.index_pattern = self.connection_params.get('index_pattern', 'security-events-*')
+        
+        # Create SSL context
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        if not self.verify_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Load client certificate if provided
+        if 'client_cert' in self.connection_params:
+            ssl_context.load_cert_chain(
+                self.connection_params['client_cert'],
+                self.connection_params.get('client_key')
+            )
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context, limit=100)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'KKG-Security-Framework/1.0'
+        }
+        
+        # Configure authentication
+        if self.auth_method == AuthMethod.BASIC_AUTH:
+            import base64
+            credentials = base64.b64encode(
+                f"{self.connection_params['username']}:{self.connection_params['password']}".encode()
+            ).decode()
+            headers['Authorization'] = f"Basic {credentials}"
+        elif self.auth_method == AuthMethod.API_KEY:
+            if 'api_key_id' in self.connection_params:
+                # API Key authentication
+                import base64
+                api_key_creds = base64.b64encode(
+                    f"{self.connection_params['api_key_id']}:{self.connection_params['api_key']}".encode()
+                ).decode()
+                headers['Authorization'] = f"ApiKey {api_key_creds}"
+            else:
+                # Bearer token
+                headers['Authorization'] = f"Bearer {self.connection_params['api_key']}"
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        
+        self.logger.info("Elastic connector initialized")
+    
+    async def test_connection(self) -> bool:
+        """Test connection to Elasticsearch"""
+        try:
+            async def _test():
+                async with self.session.get(f"{self.base_url}/") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        version = data.get('version', {}).get('number', 'unknown')
+                        self.logger.info(f"Connected to Elasticsearch {version}")
+                        return True
+                    else:
+                        self.logger.error(f"Connection test failed: HTTP {response.status}")
+                        return False
+            
+            return await self._retry_request(_test)
+            
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    async def send_event(self, event_data: Dict[str, Any]) -> bool:
+        """Send event to Elasticsearch in ECS format"""
+        try:
+            # Transform to ECS (Elastic Common Schema) format
+            ecs_event = {
+                '@timestamp': event_data.get('timestamp', datetime.utcnow().isoformat()),
+                'agent': {
+                    'type': 'kkg-security',
+                    'version': '1.0.0'
+                },
+                'ecs': {
+                    'version': '8.0'
+                },
+                'event': {
+                    'category': [event_data.get('category', 'security')],
+                    'type': [event_data.get('event_type', 'info')],
+                    'kind': 'event',
+                    'severity': self._map_severity_to_ecs(event_data.get('severity', 'medium')),
+                    'id': event_data.get('event_id', str(uuid.uuid4())),
+                    'created': datetime.utcnow().isoformat()
+                },
+                'host': {
+                    'name': event_data.get('hostname', 'unknown'),
+                    'ip': event_data.get('host_ip', [])
+                },
+                'source': {
+                    'ip': event_data.get('source_ip'),
+                    'port': event_data.get('source_port'),
+                    'domain': event_data.get('source_domain')
+                },
+                'destination': {
+                    'ip': event_data.get('destination_ip'),
+                    'port': event_data.get('destination_port'),
+                    'domain': event_data.get('destination_domain')
+                },
+                'user': {
+                    'name': event_data.get('username'),
+                    'id': event_data.get('user_id')
+                },
+                'kkg': {
+                    'original_event': event_data,
+                    'framework_version': '1.0'
+                }
+            }
+            
+            # Remove None values
+            ecs_event = self._remove_none_values(ecs_event)
+            
+            # Generate index name with date
+            index_name = f"security-events-{datetime.utcnow().strftime('%Y.%m.%d')}"
+            
+            async def _send():
+                async with self.session.post(
+                    f"{self.base_url}/{index_name}/_doc",
+                    json=ecs_event
+                ) as response:
+                    if response.status in [200, 201]:
+                        result = await response.json()
+                        if result.get('result') in ['created', 'updated']:
+                            return True
+                        else:
+                            self.logger.error(f"Unexpected result: {result.get('result')}")
+                            return False
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(f"Send event failed: HTTP {response.status} - {error_text}")
+                        return False
+            
+            return await self._retry_request(_send)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send event: {e}")
+            return False
+    
+    async def query_threat_intel(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence from Elasticsearch"""
+        try:
+            # Build Elasticsearch query
+            should_clauses = []
+            
+            for indicator in indicators:
+                # Search across multiple fields for indicators
+                should_clauses.extend([
+                    {'match': {'source.ip': indicator}},
+                    {'match': {'destination.ip': indicator}},
+                    {'match': {'source.domain': indicator}},
+                    {'match': {'destination.domain': indicator}},
+                    {'match': {'url.original': indicator}},
+                    {'match': {'file.hash.sha256': indicator}},
+                    {'match': {'file.hash.md5': indicator}},
+                    {'wildcard': {'*': f"*{indicator}*"}}
+                ])
+            
+            query = {
+                'query': {
+                    'bool': {
+                        'should': should_clauses,
+                        'minimum_should_match': 1,
+                        'filter': [
+                            {
+                                'range': {
+                                    '@timestamp': {
+                                        'gte': 'now-30d'  # Last 30 days
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                },
+                'sort': [
+                    {'@timestamp': {'order': 'desc'}}
+                ],
+                'size': 100,
+                '_source': [
+                    '@timestamp', 'event.*', 'source.*', 'destination.*', 
+                    'user.*', 'host.*', 'threat.*', 'file.*'
+                ]
+            }
+            
+            async def _search():
+                async with self.session.post(
+                    f"{self.base_url}/{self.index_pattern}/_search",
+                    json=query
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        hits = data.get('hits', {})
+                        
+                        # Also search threat intelligence indices
+                        threat_results = await self._search_threat_intel_indices(indicators)
+                        
+                        return {
+                            'indicators': indicators,
+                            'security_events': {
+                                'total': hits.get('total', {}).get('value', 0),
+                                'events': [hit['_source'] for hit in hits.get('hits', [])]
+                            },
+                            'threat_intel': threat_results,
+                            'total_results': hits.get('total', {}).get('value', 0) + len(threat_results)
+                        }
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(f"Search failed: HTTP {response.status} - {error_text}")
+                        return {'error': f'Search failed: HTTP {response.status}'}
+            
+            return await self._retry_request(_search)
+            
+        except Exception as e:
+            self.logger.error(f"Threat intel query failed: {e}")
+            return {'error': str(e)}
+    
+    async def _search_threat_intel_indices(self, indicators: List[str]) -> List[Dict[str, Any]]:
+        """Search dedicated threat intelligence indices"""
+        try:
+            threat_indices = [
+                'threat-intel-*',
+                'iocs-*',
+                'malware-*',
+                'threat-actors-*'
+            ]
+            
+            results = []
+            
+            for index_pattern in threat_indices:
+                query = {
+                    'query': {
+                        'terms': {
+                            'indicator.value': indicators
+                        }
+                    },
+                    'size': 50,
+                    'sort': [{'@timestamp': {'order': 'desc'}}]
+                }
+                
+                try:
+                    async with self.session.post(
+                        f"{self.base_url}/{index_pattern}/_search",
+                        json=query
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            hits = data.get('hits', {}).get('hits', [])
+                            results.extend([hit['_source'] for hit in hits])
+                        elif response.status != 404:  # 404 is OK (index doesn't exist)
+                            self.logger.warning(f"Threat intel search failed for {index_pattern}: HTTP {response.status}")
+                            
+                except Exception as e:
+                    self.logger.warning(f"Error searching {index_pattern}: {e}")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Threat intel index search failed: {e}")
+            return []
+    
+    def _map_severity_to_ecs(self, severity: str) -> int:
+        """Map severity to ECS numeric level"""
+        severity_map = {
+            'low': 2,
+            'medium': 4, 
+            'high': 6,
+            'critical': 8
+        }
+        return severity_map.get(severity.lower(), 4)
+    
+    def _remove_none_values(self, obj):
+        """Recursively remove None values from dictionary"""
+        if isinstance(obj, dict):
+            return {k: self._remove_none_values(v) for k, v in obj.items() if v is not None}
+        elif isinstance(obj, list):
+            return [self._remove_none_values(item) for item in obj if item is not None]
+        else:
+            return obj
+
+# ============================================================================
+# CONNECTOR FACTORY AND REGISTRY
+# ============================================================================
+
+class SIEMConnectorFactory:
+    """Factory for creating SIEM connectors"""
+    
+    _connectors = {
+        'splunk': SplunkConnector,
+        'qradar': QRadarConnector,
+        'sentinel': SentinelConnector,
+        'elastic': ElasticConnector
+    }
+    
+    @classmethod
+    def create_connector(cls, siem_type: str, connection_params: Dict[str, Any]) -> SIEMConnectorBase:
+        """Create a SIEM connector instance"""
+        if siem_type.lower() not in cls._connectors:
+            raise ValueError(f"Unsupported SIEM type: {siem_type}")
+        
+        connector_class = cls._connectors[siem_type.lower()]
+        return connector_class(connection_params)
+    
+    @classmethod
+    def get_supported_siems(cls) -> List[str]:
+        """Get list of supported SIEM types"""
+        return list(cls._connectors.keys())
+
+class SIEMConnectorRegistry:
+    """Registry for managing active SIEM connections"""
+    
+    def __init__(self):
+        self.active_connectors: Dict[str, SIEMConnectorBase] = {}
+        self.connection_status: Dict[str, Dict[str, Any]] = {}
+        self.logger = logging.getLogger(self.__class__.__name__)
+    
+    async def register_connector(self, connector_id: str, siem_type: str, 
+                               connection_params: Dict[str, Any]) -> bool:
+        """Register and initialize a SIEM connector"""
+        try:
+            # Create connector
+            connector = SIEMConnectorFactory.create_connector(siem_type, connection_params)
+            
+            # Initialize
+            await connector.initialize()
+            
+            # Test connection
+            if not await connector.test_connection():
+                await connector.close()
+                return False
+            
+            # Store connector
+            self.active_connectors[connector_id] = connector
+            self.connection_status[connector_id] = {
+                'siem_type': siem_type,
+                'status': 'active',
+                'connected_at': datetime.now(),
+                'last_test': datetime.now(),
+                'events_sent': 0,
+                'queries_executed': 0,
+                'errors': 0
+            }
+            
+            self.logger.info(f"SIEM connector registered successfully: {connector_id} ({siem_type})")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to register SIEM connector {connector_id}: {e}")
+            return False
+    
+    async def unregister_connector(self, connector_id: str):
+        """Unregister and cleanup a SIEM connector"""
+        if connector_id in self.active_connectors:
+            try:
+                await self.active_connectors[connector_id].close()
+            except Exception as e:
+                self.logger.warning(f"Error closing connector {connector_id}: {e}")
+            
+            del self.active_connectors[connector_id]
+            del self.connection_status[connector_id]
+            
+            self.logger.info(f"SIEM connector unregistered: {connector_id}")
+    
+    async def send_event_to_all(self, event_data: Dict[str, Any]) -> Dict[str, bool]:
+        """Send event to all registered connectors"""
+        results = {}
+        
+        for connector_id, connector in self.active_connectors.items():
+            try:
+                success = await connector.send_event(event_data)
+                results[connector_id] = success
+                
+                # Update stats
+                status = self.connection_status[connector_id]
+                if success:
+                    status['events_sent'] += 1
+                else:
+                    status['errors'] += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Error sending event to {connector_id}: {e}")
+                results[connector_id] = False
+                self.connection_status[connector_id]['errors'] += 1
+        
+        return results
+    
+    async def query_threat_intel_from_all(self, indicators: List[str]) -> Dict[str, Any]:
+        """Query threat intelligence from all connectors"""
+        results = {}
+        
+        for connector_id, connector in self.active_connectors.items():
+            try:
+                intel_data = await connector.query_threat_intel(indicators)
+                results[connector_id] = intel_data
+                
+                # Update stats
+                self.connection_status[connector_id]['queries_executed'] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Error querying threat intel from {connector_id}: {e}")
+                results[connector_id] = {'error': str(e)}
+                self.connection_status[connector_id]['errors'] += 1
+        
+        return results
+    
+    async def health_check_all(self) -> Dict[str, bool]:
+        """Perform health check on all connectors"""
+        results = {}
+        
+        for connector_id, connector in self.active_connectors.items():
+            try:
+                is_healthy = await connector.test_connection()
+                results[connector_id] = is_healthy
+                
+                # Update status
+                status = self.connection_status[connector_id]
+                status['last_test'] = datetime.now()
+                if not is_healthy:
+                    status['status'] = 'unhealthy'
+                    status['errors'] += 1
+                else:
+                    status['status'] = 'active'
+                    
+            except Exception as e:
+                self.logger.error(f"Health check failed for {connector_id}: {e}")
+                results[connector_id] = False
+                self.connection_status[connector_id]['status'] = 'error'
+                self.connection_status[connector_id]['errors'] += 1
+        
+        return results
+    
+    def get_connector_status(self, connector_id: str = None) -> Dict[str, Any]:
+        """Get status of specific connector or all connectors"""
+        if connector_id:
+            return self.connection_status.get(connector_id, {})
+        return dict(self.connection_status)
+    
+    async def close_all(self):
+        """Close all active connectors"""
+        for connector_id in list(self.active_connectors.keys()):
+            await self.unregister_connector(connector_id)
+
+# ============================================================================
+# EXAMPLE USAGE AND TESTING
+# ============================================================================
+
+async def example_usage():
+    """Example usage of SIEM connectors"""
+    
+    # Initialize connector registry
+    registry = SIEMConnectorRegistry()
+    
+    # Register Splunk connector
+    splunk_config = {
+        'base_url': 'https://splunk.example.com:8089',
+        'auth_method': 'token',
+        'token': 'your-hec-token-here',
+        'verify_ssl': True,
+        'rate_limit': {
+            'requests_per_second': 10,
+            'requests_per_minute': 600,
+            'requests_per_hour': 36000
+        },
+        'retry_config': {
+            'max_retries': 3,
+            'initial_delay': 1.0,
+            'max_delay': 30.0
+        }
+    }
+    
+    await registry.register_connector('splunk-prod', 'splunk', splunk_config)
+    
+    # Register Elastic connector
+    elastic_config = {
+        'base_url': 'https://elastic.example.com:9200',
+        'auth_method': 'basic_auth',
+        'username': 'elastic',
+        'password': 'your-password-here',
+        'verify_ssl': True,
+        'index_pattern': 'security-events-*'
+    }
+    
+    await registry.register_connector('elastic-prod', 'elastic', elastic_config)
+    
+    # Send a security event
+    event = {
+        'timestamp': datetime.utcnow().isoformat(),
+        'event_id': 'evt_12345',
+        'severity': 'high',
+        'category': 'network',
+        'event_type': 'connection_attempt',
+        'source_ip': '192.168.1.100',
+        'destination_ip': '10.0.0.50',
+        'destination_port': 22,
+        'username': 'admin',
+        'description': 'Suspicious SSH connection attempt'
+    }
+    
+    results = await registry.send_event_to_all(event)
+    print(f"Event sent results: {results}")
+    
+    # Query threat intelligence
+    indicators = ['192.168.1.100', 'malicious.example.com', 'bad-hash-123']
+    intel_results = await registry.query_threat_intel_from_all(indicators)
+    print(f"Threat intel results: {intel_results}")
+    
+    # Health check
+    health_results = await registry.health_check_all()
+    print(f"Health check results: {health_results}")
+    
+    # Get connector status
+    status = registry.get_connector_status()
+    print(f"Connector status: {status}")
+    
+    # Cleanup
+    await registry.close_all()
+
+if __name__ == "__main__":
+    # Run example
+    asyncio.run(example_usage())

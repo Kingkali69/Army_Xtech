@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DIRECT TEST</title>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        button { 
+            background: #0f0; 
+            color: #000; 
+            border: none;
+            padding: 20px 40px; 
+            font-size: 20px; 
+            cursor: pointer; 
+            margin: 10px;
+            font-weight: bold;
+        }
+        #output { margin-top: 20px; padding: 20px; background: #111; }
+    </style>
+</head>
+<body>
+    <h1>DIRECT UNQUARANTINE TEST</h1>
+    <button onclick="testUnquarantine()">CLICK TO UNQUARANTINE</button>
+    <div id="output">Waiting for click...</div>
+
+    <script>
+        function testUnquarantine() {
+            document.getElementById('output').innerHTML = 'SENDING REQUEST...';
+            
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/mitel/device/action', true);
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            
+            xhr.onload = function() {
+                if (xhr.status === 200) {
+                    var result = JSON.parse(xhr.responseText);
+                    document.getElementById('output').innerHTML = 
+                        'SUCCESS!<br>' +
+                        'Status: ' + xhr.status + '<br>' +
+                        'Message: ' + result.message + '<br><br>' +
+                        'REFRESH PAGE TO SEE UPDATED COUNTS';
+                } else {
+                    document.getElementById('output').innerHTML = 
+                        'FAILED!<br>Status: ' + xhr.status;
+                }
+            };
+            
+            xhr.onerror = function() {
+                document.getElementById('output').innerHTML = 'NETWORK ERROR!';
+            };
+            
+            xhr.send(JSON.stringify({
+                device_id: 'b2e72d0cf45c09b2',
+                action: 'unquarantine'
+            }));
+        }
+    </script>
+</body>
+</html>

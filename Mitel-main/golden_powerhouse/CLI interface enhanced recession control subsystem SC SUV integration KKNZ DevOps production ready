@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+G.Legion Cybersecurity Framework - CLI Interface
+Enhanced with Session Control Subsystem (SC-SUB) Integration
+KK&GDevOps - Production Ready
+"""
+
+import asyncio
+import sys
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from enum import Enum
+import argparse
+from tabulate import tabulate
+import shlex
+
+# Framework imports (assume these exist in your project)
+from engine_core import GLegionEngine
+from session_control import SessionControlSubsystem, UserRole, Permission
+
+
+class CLIColors:
+    """ANSI color codes for enhanced CLI output."""
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+class SessionCommandHandler:
+    """Handles all session-related CLI commands for SC-SUB integration."""
+    
+    def __init__(self, engine: GLegionEngine, logger: logging.Logger):
+        self.engine = engine
+        self.logger = logger
+        self.sc_sub = None
+        
+        # Command mappings
+        self.commands = {
+            'create': self.cmd_create_session,
+            'validate': self.cmd_validate_session,
+            'revoke': self.cmd_revoke_session,
+            'status': self.cmd_session_status,
+            'list': self.cmd_list_sessions,
+            'anomalies': self.cmd_show_anomalies,
+            'help': self.cmd_help
+        }
+    
+    def set_sc_sub(self, sc_sub: SessionControlSubsystem):
+        """Set reference to the SessionControl subsystem."""
+        self.sc_sub = sc_sub
+    
+    async def handle_command(self, args: List[str]) -> bool:
+        """Handle session command routing."""
+        if not args:
+            await self.cmd_help()
+            return True
+        
+        command = args[0].lower()
+        
+        if command not in self.commands:
+            print(f"{CLIColors.FAIL}Unknown session command: {command}{CLIColors.ENDC}")
+            print(f"Type 'session help' for available commands.")
+            return True
+        
+        try:
+            # Check if SC-SUB is available
+            if command != 'help' and not self._check_sc_sub():
+                return True
+            
+            # Execute command
+            await self.commands[command](args[1:])
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error executing session command: {str(e)}")
+            print(f"{CLIColors.FAIL}Error: {str(e)}{CLIColors.ENDC}")
+            return True
+    
+    def _check_sc_sub(self) -> bool:
+        """Check if SC-SUB is available and running."""
+        if not self.sc_sub:
+            print(f"{CLIColors.FAIL}Session Control Subsystem not initialized{CLIColors.ENDC}")
+            return False
+        
+        if not self.sc_sub._running:
+            print(f"{CLIColors.FAIL}Session Control Subsystem not running{CLIColors.ENDC}")
+            print("Use 'start sc-sub' to start the subsystem.")
+            return False
+        
+        return True
+    
+    def _parse_user_role(self, role_str: str) -> Optional[UserRole]:
+        """Parse user role from string."""
+        role_mapping = {
+            'guest': UserRole.GUEST,
+            'user': UserRole.USER,
+            'moderator': UserRole.MODERATOR,
+            'admin': UserRole.ADMIN,
+            'super_admin': UserRole.SUPER_ADMIN,
+            'superadmin': UserRole.SUPER_ADMIN
+        }
+        return role_mapping.get(role_str.lower())
+    
+    def _format_session_table(self, sessions: List[Dict]) -> str:
+        """Format sessions as a table."""
+        if not sessions:
+            return "No sessions found."
+        
+        headers = ['Session ID', 'User ID', 'Role', 'Status', 'Created', 'Expires', 'IP Address']
+        rows = []
+        
+        for session in sessions:
+            # Truncate long session IDs for display
+            session_id = session['session_id'][:8] + '...'
+            created = session['created_at'][:19] if 'created_at' in session else 'N/A'
+            expires = session['expires_at'][:19] if 'expires_at' in session else 'N/A'
+            
+            rows.append([
+                session_id,
+                session.get('user_id', 'N/A'),
+                session.get('user_role', 'N/A'),
+                session.get('status', 'N/A'),
+                created,
+                expires,
+                session.get('ip_address', 'N/A')
+            ])
+        
+        return tabulate(rows, headers=headers, tablefmt='grid')
+    
+    async def cmd_create_session(self, args: List[str]):
+        """Create a new session: session create <user_id> <role> [ip_address]"""
+        if len(args) < 2:
+            print(f"{CLIColors.FAIL}Usage: session create <user_id> <role> [ip_address]{CLIColors.ENDC}")
+            print("Roles: guest, user, moderator, admin, super_admin")
+            return
+        
+        user_id = args[0]
+        role_str = args[1]
+        ip_address = args[2] if len(args) > 2 else None
+        
+        # Parse role
+        user_role = self._parse_user_role(role_str)
+        if not user_role:
+            print(f"{CLIColors.FAIL}Invalid role: {role_str}{CLIColors.ENDC}")
+            print("Valid roles: guest, user, moderator, admin, super_admin")
+            return
+        
+        print(f"Creating session for user '{user_id}' with role '{user_role.value}'...")
+        
+        try:
+            session = await self.sc_sub.create_session(
+                user_id=user_id,
+                user_role=user_role,
+                ip_address=ip_address,
+                user_agent="CLI_Interface"
+            )
+            
+            if session:
+                print(f"{CLIColors.OKGREEN}âœ“ Session created successfully{CLIColors.ENDC}")
+                print(f"Session ID: {CLIColors.OKBLUE}{session.session_id}{CLIColors.ENDC}")
+                print(f"Expires: {session.expires_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                
+                # Show permissions
+                permissions = [p.value for p in session.permissions]
+                print(f"Permissions: {', '.join(permissions)}")
+            else:
+                print(f"{CLIColors.FAIL}âœ— Failed to create session{CLIColors.ENDC}")
+                print("Possible reasons: user session limit reached, subsystem error")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error creating session: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_validate_session(self, args: List[str]):
+        """Validate a session: session validate <session_id>"""
+        if not args:
+            print(f"{CLIColors.FAIL}Usage: session validate <session_id>{CLIColors.ENDC}")
+            return
+        
+        session_id = args[0]
+        print(f"Validating session: {session_id}...")
+        
+        try:
+            session = await self.sc_sub.validate_session(session_id)
+            
+            if session:
+                print(f"{CLIColors.OKGREEN}âœ“ Session is valid and active{CLIColors.ENDC}")
+                
+                # Display session details
+                details = {
+                    'Session ID': session.session_id,
+                    'User ID': session.user_id,
+                    'Role': session.user_role.value,
+                    'Status': session.status.value,
+                    'Created': session.created_at.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'Last Activity': session.last_activity.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'Expires': session.expires_at.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'IP Address': session.ip_address or 'N/A',
+                    'Permissions': ', '.join([p.value for p in session.permissions])
+                }
+                
+                for key, value in details.items():
+                    print(f"{key}: {CLIColors.OKBLUE}{value}{CLIColors.ENDC}")
+            else:
+                print(f"{CLIColors.FAIL}âœ— Session is invalid, expired, or revoked{CLIColors.ENDC}")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error validating session: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_revoke_session(self, args: List[str]):
+        """Revoke a session: session revoke <session_id> [reason]"""
+        if not args:
+            print(f"{CLIColors.FAIL}Usage: session revoke <session_id> [reason]{CLIColors.ENDC}")
+            return
+        
+        session_id = args[0]
+        reason = ' '.join(args[1:]) if len(args) > 1 else "manual_cli_revocation"
+        
+        print(f"Revoking session: {session_id}...")
+        
+        try:
+            success = await self.sc_sub.revoke_session(session_id, reason)
+            
+            if success:
+                print(f"{CLIColors.OKGREEN}âœ“ Session revoked successfully{CLIColors.ENDC}")
+                print(f"Reason: {reason}")
+            else:
+                print(f"{CLIColors.FAIL}âœ— Failed to revoke session{CLIColors.ENDC}")
+                print("Session may not exist or already be revoked")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error revoking session: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_session_status(self, args: List[str]):
+        """Show session subsystem status: session status"""
+        try:
+            status = await self.sc_sub.get_status()
+            health = await self.sc_sub.health_check()
+            
+            print(f"{CLIColors.HEADER}=== Session Control Subsystem Status ==={CLIColors.ENDC}")
+            print(f"Subsystem: {CLIColors.OKBLUE}{status['subsystem']}{CLIColors.ENDC}")
+            print(f"Version: {status.get('version', 'N/A')}")
+            print(f"Status: {CLIColors.OKGREEN if health['status'] == 'healthy' else CLIColors.FAIL}{health['status']}{CLIColors.ENDC}")
+            print(f"Running: {CLIColors.OKGREEN if status['running'] else CLIColors.FAIL}{status['running']}{CLIColors.ENDC}")
+            print(f"Last Updated: {status['timestamp']}")
+            
+            # Component status
+            if 'components' in status:
+                print(f"\n{CLIColors.HEADER}Component Status:{CLIColors.ENDC}")
+                for component, comp_status in status['components'].items():
+                    if isinstance(comp_status, dict):
+                        sessions_info = ""
+                        if 'active_sessions' in comp_status:
+                            sessions_info = f" ({comp_status['active_sessions']} active)"
+                        print(f"  {component}: {CLIColors.OKGREEN}active{CLIColors.ENDC}{sessions_info}")
+                    else:
+                        print(f"  {component}: {comp_status}")
+            
+            # Anomaly detection status if available
+            if 'anomaly_detection' in status:
+                ad_status = status['anomaly_detection']
+                print(f"\n{CLIColors.HEADER}Anomaly Detection:{CLIColors.ENDC}")
+                print(f"  Enabled: {CLIColors.OKGREEN if ad_status.get('enabled') else CLIColors.FAIL}{ad_status.get('enabled', False)}{CLIColors.ENDC}")
+                print(f"  Auto-Revoke: {ad_status.get('auto_revoke', False)}")
+                print(f"  User Baselines: {ad_status.get('user_baselines', 0)}")
+                print(f"  Recent Anomalies: {ad_status.get('recent_anomalies', 0)}")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error getting session status: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_list_sessions(self, args: List[str]):
+        """List active sessions: session list [user_id]"""
+        user_id = args[0] if args else None
+        
+        try:
+            sessions = await self.sc_sub.get_active_sessions(user_id)
+            
+            if user_id:
+                print(f"Active sessions for user '{user_id}':")
+            else:
+                print("All active sessions:")
+            
+            if sessions:
+                # Convert session objects to dictionaries for display
+                session_dicts = []
+                for session in sessions:
+                    if hasattr(session, 'to_dict'):
+                        session_dicts.append(session.to_dict())
+                    else:
+                        # Fallback for session objects without to_dict method
+                        session_dicts.append({
+                            'session_id': session.session_id,
+                            'user_id': session.user_id,
+                            'user_role': session.user_role.value,
+                            'status': session.status.value,
+                            'created_at': session.created_at.isoformat(),
+                            'expires_at': session.expires_at.isoformat(),
+                            'ip_address': session.ip_address
+                        })
+                
+                print(f"\n{self._format_session_table(session_dicts)}")
+                print(f"\nTotal: {CLIColors.OKGREEN}{len(sessions)} active session(s){CLIColors.ENDC}")
+            else:
+                print(f"{CLIColors.WARNING}No active sessions found{CLIColors.ENDC}")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error listing sessions: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_show_anomalies(self, args: List[str]):
+        """Show session anomalies: session anomalies [user_id] [hours]"""
+        user_id = None
+        hours = 24  # Default to 24 hours
+        
+        if args:
+            if args[0].isdigit():
+                hours = int(args[0])
+            else:
+                user_id = args[0]
+                if len(args) > 1 and args[1].isdigit():
+                    hours = int(args[1])
+        
+        try:
+            # Check if anomaly detection is available
+            if not hasattr(self.sc_sub, 'session_monitor') or not self.sc_sub.session_monitor:
+                print(f"{CLIColors.FAIL}Anomaly detection not available{CLIColors.ENDC}")
+                return
+            
+            monitor = self.sc_sub.session_monitor
+            
+            if user_id:
+                # Get anomalies for specific user
+                if hasattr(monitor, 'get_user_anomalies'):
+                    anomalies = await monitor.get_user_anomalies(user_id, hours)
+                    print(f"Anomalies for user '{user_id}' (last {hours} hours):")
+                else:
+                    print(f"{CLIColors.FAIL}User-specific anomaly data not available{CLIColors.ENDC}")
+                    return
+            else:
+                # Get overall anomaly summary
+                if hasattr(monitor, 'get_anomaly_summary'):
+                    summary = await monitor.get_anomaly_summary(hours)
+                    print(f"Anomaly Summary (last {hours} hours):")
+                    print(json.dumps(summary, indent=2))
+                    return
+                else:
+                    print(f"{CLIColors.FAIL}Anomaly summary not available{CLIColors.ENDC}")
+                    return
+            
+            if anomalies:
+                print(f"\n{CLIColors.HEADER}Detected Anomalies:{CLIColors.ENDC}")
+                for anomaly in anomalies:
+                    threat_color = CLIColors.FAIL if anomaly.get('threat_level') == 'high' else CLIColors.WARNING
+                    print(f"\n{threat_color}â— {anomaly.get('anomaly_type', 'Unknown')}{CLIColors.ENDC}")
+                    print(f"  Threat Level: {threat_color}{anomaly.get('threat_level', 'unknown')}{CLIColors.ENDC}")
+                    print(f"  Confidence: {anomaly.get('confidence_score', 0):.2f}")
+                    print(f"  Time: {anomaly.get('detected_at', 'N/A')}")
+                    if anomaly.get('details'):
+                        print(f"  Details: {json.dumps(anomaly['details'], indent=4)}")
+            else:
+                print(f"{CLIColors.OKGREEN}No anomalies detected in the last {hours} hours{CLIColors.ENDC}")
+                
+        except Exception as e:
+            print(f"{CLIColors.FAIL}Error retrieving anomalies: {str(e)}{CLIColors.ENDC}")
+    
+    async def cmd_help(self, args: List[str] = None):
+        """Show help for session commands."""
+        help_text = f"""
+{CLIColors.HEADER}Session Control Commands:{CLIColors.ENDC}
+
+{CLIColors.OKBLUE}session create <user_id> <role> [ip_address]{CLIColors.ENDC}
+    Create a new session for a user
+    Roles: guest, user, moderator, admin, super_admin
+
+{CLIColors.OKBLUE}session validate <session_id>{CLIColors.ENDC}
+    Validate if a session is active and show details
+
+{CLIColors.OKBLUE}session revoke <session_id> [reason]{CLIColors.ENDC}
+    Revoke a session with optional reason
+
+{CLIColors.OKBLUE}session status{CLIColors.ENDC}
+    Show Session Control Subsystem status and health
+
+{CLIColors.OKBLUE}session list [user_id]{CLIColors.ENDC}
+    List all active sessions or sessions for specific user
+
+{CLIColors.OKBLUE}session anomalies [user_id] [hours]{CLIColors.ENDC}
+    Show detected session anomalies (if anomaly detection enabled)
+
+{CLIColors.OKBLUE}session help{CLIColors.ENDC}
+    Show this help message
+
+{CLIColors.WARNING}Examples:{CLIColors.ENDC}
+  session create alice admin 192.168.1.100
+  session validate a1b2c3d4-e5f6-7890-abcd-ef1234567890
+  session list alice
+  session anomalies 24
+"""
+        print(help_text)
+
+
+class EnhancedCLI:
+    """Enhanced CLI with SC-SUB integration for G.Legion Framework."""
+    
+    def __init__(self):
+        self.engine = None
+        self.logger = logging.getLogger(__name__)
+        self.session_handler = None
+        self.running = True
+        
+        # Command handlers
+        self.command_handlers = {}
+    
+    async def initialize(self):
+        """Initialize the CLI and engine."""
+        try:
+            print(f"{CLIColors.HEADER}")
+            print("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—")
+            print("â•‘                    G.Legion Framework                       â•‘")
+            print("â•‘                  Cybersecurity Platform                     â•‘")
+            print("â•‘                     KK&GDevOps                              â•‘")
+            print("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+            print(f"{CLIColors.ENDC}")
+            
+            # Initialize engine
+            self.engine = GLegionEngine()
+            await self.engine.initialize()
+            
+            # Initialize session command handler
+            self.session_handler = SessionCommandHandler(self.engine, self.logger)
+            
+            # Register command handlers
+            self.command_handlers = {
+                'session': self.session_handler.handle_command,
+                'help': self.cmd_help,
+                'status': self.cmd_status,
+                'start': self.cmd_start_subsystem,
+                'stop': self.cmd_stop_subsystem,
+                'quit': self.cmd_quit,
+                'exit': self.cmd_quit
+            }
+            
+            print(f"{CLIColors.OKGREEN}âœ“ CLI initialized successfully{CLIColors.ENDC}")
+            return True
+            
+        except Exception as e:
+            print(f"{CLIColors.FAIL}âœ— Failed to initialize CLI: {str(e)}{CLIColors.ENDC}")
+            return False
+    
+    async def start(self):
+        """Start the CLI and all subsystems."""
+        try:
+            # Start the engine and subsystems
+            await self.engine.start()
+            
+            # Get reference to SC-SUB if available
+            sc_sub = self.engine.get_subsystem('SessionControl')
+            if sc_sub and self.session_handler:
+                self.session_handler.set_sc_sub(sc_sub)
+               

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>M.I.T.E.L. DEMO - SIMPLE</title>
+    <style>
+        body { background: #0a0a0a; color: #e0e0e0; font-family: monospace; padding: 20px; }
+        h1 { color: #46d946; }
+        .device { background: #252525; padding: 15px; margin: 10px 0; border-left: 4px solid #ff4444; }
+        .device.trusted { border-left-color: #46d946; }
+        .quarantined { color: #ff4444; font-weight: bold; }
+        .trusted-badge { color: #46d946; font-weight: bold; }
+        button { 
+            background: #3a3a3a; 
+            border: 2px solid #46d946; 
+            color: #46d946; 
+            padding: 10px 20px; 
+            font-size: 14px; 
+            cursor: pointer; 
+            margin: 5px;
+            font-family: monospace;
+        }
+        button:hover { background: #4a4a4a; }
+        #stats { font-size: 20px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>M.I.T.E.L. ZERO-TRUST DEMO</h1>
+    <div id="stats">Loading...</div>
+    <div id="devices">Loading devices...</div>
+
+    <script>
+        let devices = [];
+        
+        function unquarantine(deviceId) {
+            fetch('http://localhost:8888/api/mitel/device/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: deviceId, action: 'unquarantine' })
+            })
+            .then(r => r.json())
+            .then(result => {
+                alert(result.success ? 'UNQUARANTINED!' : 'FAILED: ' + result.error);
+                loadDevices();
+            })
+            .catch(e => alert('ERROR: ' + e));
+        }
+        
+        function loadDevices() {
+            fetch('http://localhost:8888/api/mitel/devices')
+                .then(r => r.json())
+                .then(data => {
+                    devices = data.devices || [];
+                    
+                    document.getElementById('stats').innerHTML = 
+                        'QUARANTINED: ' + (data.quarantined || 0) + ' | ' +
+                        'TRUSTED: ' + (data.trusted || 0);
+                    
+                    let html = '';
+                    devices.forEach((d, i) => {
+                        const status = d.trust_status === 'quarantined' ? 
+                            '<span class="quarantined">QUARANTINED</span>' : 
+                            '<span class="trusted-badge">TRUSTED</span>';
+                        
+                        const btn = d.trust_status === 'quarantined' ? 
+                            '<button onclick="unquarantine(\'' + d.device_id + '\')">UNQUARANTINE</button>' : 
+                            '';
+                        
+                        html += '<div class="device ' + d.trust_status + '">' +
+                                status + ' - ' + d.name + '<br>' +
+                                'ID: ' + d.device_id.substring(0, 16) + '...<br>' +
+                                btn +
+                                '</div>';
+                    });
+                    
+                    document.getElementById('devices').innerHTML = html || 'No devices';
+                })
+                .catch(e => {
+                    document.getElementById('devices').innerHTML = 'ERROR: ' + e;
+                });
+        }
+        
+        loadDevices();
+        setInterval(loadDevices, 3000);
+    </script>
+</body>
+</html>

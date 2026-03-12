@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>M.I.T.E.L. DEMO</title>
+    <meta charset="UTF-8">
+    <style>
+        body { background: #0a0a0a; color: #e0e0e0; font-family: monospace; padding: 20px; margin: 0; }
+        h1 { color: #46d946; margin-bottom: 10px; }
+        .subtitle { color: #888; font-size: 12px; margin-bottom: 20px; }
+        #stats { font-size: 24px; margin: 20px 0; padding: 20px; background: #1a1a1a; }
+        .stat { display: inline-block; margin-right: 30px; }
+        .stat-label { color: #888; font-size: 12px; }
+        .stat-value { font-size: 32px; font-weight: bold; }
+        .quarantined { color: #ff4444; }
+        .trusted { color: #46d946; }
+        .device { 
+            background: #252525; 
+            padding: 15px; 
+            margin: 10px 0; 
+            border-left: 4px solid #888;
+        }
+        .device.quarantined-device { border-left-color: #ff4444; background: #2a1a1a; }
+        .device.trusted-device { border-left-color: #46d946; }
+        .device-name { font-size: 14px; font-weight: bold; margin-bottom: 5px; }
+        .device-id { color: #888; font-size: 11px; margin-bottom: 10px; }
+        button { 
+            background: #3a3a3a; 
+            border: 2px solid #46d946; 
+            color: #46d946; 
+            padding: 8px 16px; 
+            font-size: 12px; 
+            cursor: pointer; 
+            font-family: monospace;
+            margin-top: 5px;
+        }
+        button:hover { background: #4a4a4a; }
+        button:active { background: #5a5a5a; }
+        .loading { color: #ffaa00; padding: 40px; text-align: center; font-size: 18px; }
+        .error { color: #ff4444; padding: 20px; background: #2a1a1a; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>M.I.T.E.L. ZERO-TRUST PERIPHERAL AUTHENTICATION</h1>
+    <div class="subtitle">Competition #1: Global Threat Modeling Challenge | Live Demo</div>
+    
+    <div id="stats">
+        <div class="stat">
+            <div class="stat-label">QUARANTINED</div>
+            <div class="stat-value quarantined" id="stat-q">--</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">TRUSTED</div>
+            <div class="stat-value trusted" id="stat-t">--</div>
+        </div>
+    </div>
+    
+    <div id="error"></div>
+    <div id="devices" class="loading">⚡ SCANNING DEVICES...</div>
+
+    <script>
+        console.log('PAGE LOADED');
+        
+        function unquarantine(deviceId, deviceName) {
+            console.log('UNQUARANTINE CLICKED:', deviceId);
+            
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/mitel/device/action', true);
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            
+            xhr.onload = function() {
+                console.log('Response status:', xhr.status);
+                console.log('Response text:', xhr.responseText);
+                
+                if (xhr.status === 200) {
+                    const result = JSON.parse(xhr.responseText);
+                    if (result.success) {
+                        alert('✓ UNQUARANTINED: ' + deviceName);
+                        loadDevices();
+                    } else {
+                        alert('✗ FAILED: ' + result.error);
+                    }
+                } else {
+                    alert('✗ HTTP ERROR: ' + xhr.status);
+                }
+            };
+            
+            xhr.onerror = function() {
+                console.error('XHR ERROR');
+                alert('✗ NETWORK ERROR');
+            };
+            
+            xhr.send(JSON.stringify({
+                device_id: deviceId,
+                action: 'unquarantine'
+            }));
+        }
+        
+        function loadDevices() {
+            console.log('LOADING DEVICES...');
+            
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/mitel/devices', true);
+            
+            xhr.onload = function() {
+                console.log('Devices response:', xhr.status);
+                
+                if (xhr.status === 200) {
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        console.log('Device count:', data.devices ? data.devices.length : 0);
+                        
+                        document.getElementById('stat-q').textContent = data.quarantined || 0;
+                        document.getElementById('stat-t').textContent = data.trusted || 0;
+                        document.getElementById('error').innerHTML = '';
+                        
+                        let html = '';
+                        if (data.devices && data.devices.length > 0) {
+                            data.devices.forEach(function(d) {
+                                const statusClass = d.trust_status === 'quarantined' ? 'quarantined-device' : 'trusted-device';
+                                const statusText = d.trust_status.toUpperCase();
+                                const statusColor = d.trust_status === 'quarantined' ? 'quarantined' : 'trusted';
+                                
+                                html += '<div class="device ' + statusClass + '">';
+                                html += '<div class="device-name"><span class="' + statusColor + '">' + statusText + '</span> - ' + d.name + '</div>';
+                                html += '<div class="device-id">ID: ' + d.device_id.substring(0, 16) + '...</div>';
+                                
+                                if (d.trust_status === 'quarantined') {
+                                    html += '<button onclick="unquarantine(\'' + d.device_id + '\', \'' + d.name.replace(/'/g, "\\'") + '\')">UNQUARANTINE</button>';
+                                } else if (d.trust_status === 'trusted') {
+                                    html += '<span class="trusted">✓ TRUSTED</span>';
+                                }
+                                
+                                html += '</div>';
+                            });
+                        } else {
+                            html = '<div class="loading">No devices detected</div>';
+                        }
+                        
+                        document.getElementById('devices').innerHTML = html;
+                        
+                    } catch (e) {
+                        console.error('Parse error:', e);
+                        document.getElementById('error').innerHTML = '<div class="error">ERROR: ' + e.message + '</div>';
+                    }
+                } else {
+                    console.error('HTTP error:', xhr.status);
+                    document.getElementById('error').innerHTML = '<div class="error">HTTP ERROR: ' + xhr.status + '</div>';
+                }
+            };
+            
+            xhr.onerror = function() {
+                console.error('Network error');
+                document.getElementById('error').innerHTML = '<div class="error">NETWORK ERROR: Cannot connect to server</div>';
+                document.getElementById('devices').innerHTML = '';
+            };
+            
+            xhr.send();
+        }
+        
+        // Load immediately
+        loadDevices();
+        
+        // Auto-refresh every 3 seconds
+        setInterval(loadDevices, 3000);
+        
+        console.log('AUTO-REFRESH ENABLED');
+    </script>
+</body>
+</html>

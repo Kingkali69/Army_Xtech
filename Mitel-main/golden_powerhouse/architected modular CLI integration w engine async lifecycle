@@ -1,0 +1,319 @@
+# cli_module.py - New CLI module to be integrated with engine_core.py
+import argparse
+import json
+import asyncio
+import logging
+from typing import Dict, Any, Optional, Callable, List, Awaitable
+
+logger = logging.getLogger("G.Legion.CLI")
+
+class EngineCLI:
+    """CLI interface for G.Legion Engine that integrates with the core engine"""
+    
+    def __init__(self, engine=None):
+        """Initialize CLI with optional engine reference"""
+        self.engine = engine
+        self.parser = self._setup_parser()
+        self.command_handlers = self._get_command_handlers()
+    
+    def _setup_parser(self) -> argparse.ArgumentParser:
+        """Setup CLI argument parser"""
+        parser = argparse.ArgumentParser(
+            description='G.Legion Engine Command Line Interface'
+        )
+        
+        parser.add_argument('--config', '-c', 
+                            help='Configuration file path',
+                            default='config/engine_config.yaml')
+        parser.add_argument('--verbose', '-v', action='store_true', 
+                            help='Enable verbose logging')
+        parser.add_argument('--json', action='store_true',
+                            help='Output results as JSON')
+        
+        # Add subparsers for commands
+        subparsers = parser.add_subparsers(dest='command', help='Available commands')
+        
+        # Engine commands
+        start_parser = subparsers.add_parser('start', help='Start the engine')
+        status_parser = subparsers.add_parser('status', help='Get engine status')
+        stop_parser = subparsers.add_parser('stop', help='Stop the engine')
+        
+        # SP-SUB specific commands
+        sync_parser = subparsers.add_parser('sync', help='Trigger sync operation')
+        sync_parser.add_argument('--dry-run', action='store_true', 
+                                 help='Perform sync without applying changes')
+        sync_parser.add_argument('--peers', nargs='+', 
+                                 help='Specific peers to sync with (node IDs)')
+        
+        delta_parser = subparsers.add_parser('test-delta', help='Create and test a delta')
+        delta_parser.add_argument('--entity', required=True, 
+                                 help='Entity ID to create delta for')
+        delta_parser.add_argument('--operation', required=True, choices=['create', 'update', 'delete'],
+                                 help='Delta operation type')
+        delta_parser.add_argument('--data', help='JSON data for the delta')
+        
+        peer_parser = subparsers.add_parser('peers', help='Manage sync peers')
+        peer_parser.add_argument('--list', action='store_true', 
+                                 help='List known peers')
+        peer_parser.add_argument('--add', action='store_true',
+                                 help='Add a new peer')
+        peer_parser.add_argument('--node-id', help='Peer node ID')
+        peer_parser.add_argument('--address', help='Peer address')
+        peer_parser.add_argument('--port', type=int, default=8443, 
+                                 help='Peer port')
+        
+        return parser
+    
+    def _get_command_handlers(self) -> Dict[str, Callable]:
+        """Map commands to their handler functions"""
+        return {
+            'start': self.cmd_start,
+            'status': self.cmd_status,
+            'stop': self.cmd_stop,
+            'sync': self.cmd_sync,
+            'test-delta': self.cmd_test_delta,
+            'peers': self.cmd_peers
+        }
+    
+    async def cmd_start(self, args) -> int:
+        """Start the engine"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        if self.engine.running:
+            logger.info("Engine is already running")
+            return 0
+        
+        try:
+            await self.engine.start()
+            logger.info("Engine started successfully")
+            
+            # Keep running until interrupted
+            if not args.json:
+                print("Engine running. Press Ctrl+C to stop.")
+                
+            await self.engine.run()
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Failed to start engine: {e}")
+            return 1
+    
+    async def cmd_status(self, args) -> int:
+        """Get engine status"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        try:
+            status = self.engine.get_status()
+            
+            if args.json:
+                print(json.dumps(status, indent=2, default=str))
+            else:
+                print(f"Engine Status:")
+                print(f"  Node ID: {status['node_id']}")
+                print(f"  Running: {status['running']}")
+                if status['running']:
+                    uptime = status.get('uptime', 0)
+                    print(f"  Uptime: {uptime:.1f} seconds")
+                
+                print("  Subsystems:")
+                for name, subsys_status in status.get('subsystems', {}).items():
+                    state = subsys_status.get('state', 'unknown')
+                    print(f"    {name}: {state}")
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Failed to get status: {e}")
+            return 1
+    
+    async def cmd_stop(self, args) -> int:
+        """Stop the engine"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        if not self.engine.running:
+            logger.info("Engine is not running")
+            return 0
+        
+        try:
+            await self.engine.stop()
+            logger.info("Engine stopped successfully")
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Failed to stop engine: {e}")
+            return 1
+    
+    async def cmd_sync(self, args) -> int:
+        """Trigger sync operation via SP-SUB"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        try:
+            # Get SP-SUB subsystem
+            if 'sp_sub' not in self.engine.subsystems:
+                logger.error("SP-SUB subsystem not available")
+                return 1
+            
+            sp_sub = self.engine.subsystems['sp_sub']
+            
+            # Execute sync cycle
+            result = await sp_sub.start_sync_cycle(
+                peers=args.peers,
+                dry_run=args.dry_run
+            )
+            
+            if args.json:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"Sync result: {result.get('status')}")
+                print(f"  Peers contacted: {result.get('peers_contacted', 0)}")
+                print(f"  Deltas processed: {result.get('deltas_processed', 0)}")
+                print(f"  Applied: {result.get('deltas_applied', 0)}")
+                print(f"  Failed: {result.get('deltas_failed', 0)}")
+                
+                if result.get('errors'):
+                    print("  Errors:")
+                    for error in result.get('errors', []):
+                        print(f"    - {error}")
+            
+            return 0 if result.get('status') == 'success' else 1
+            
+        except Exception as e:
+            logger.error(f"Sync operation failed: {e}")
+            return 1
+    
+    async def cmd_test_delta(self, args) -> int:
+        """Create and test a delta"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        try:
+            # Get SP-SUB subsystem
+            if 'sp_sub' not in self.engine.subsystems:
+                logger.error("SP-SUB subsystem not available")
+                return 1
+            
+            sp_sub = self.engine.subsystems['sp_sub']
+            
+            # Parse data if provided
+            data = {}
+            if args.data:
+                try:
+                    data = json.loads(args.data)
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON data")
+                    return 1
+            
+            # Create delta through delta engine
+            if hasattr(sp_sub, 'delta_engine') and sp_sub.delta_engine:
+                delta = await sp_sub.delta_engine.create_manual_delta(
+                    args.entity,
+                    args.operation,
+                    data
+                )
+                
+                # Apply the delta
+                result = await sp_sub.verify_and_apply([delta])
+                
+                if args.json:
+                    print(json.dumps({
+                        'delta': delta,
+                        'result': result
+                    }, indent=2, default=str))
+                else:
+                    print(f"Delta created and applied:")
+                    print(f"  Entity: {args.entity}")
+                    print(f"  Operation: {args.operation}")
+                    print(f"  Result: {result}")
+                
+                return 0
+            else:
+                logger.error("Delta engine not available in SP-SUB")
+                return 1
+            
+        except Exception as e:
+            logger.error(f"Delta operation failed: {e}")
+            return 1
+    
+    async def cmd_peers(self, args) -> int:
+        """Manage sync peers"""
+        if not self.engine:
+            logger.error("Engine reference not available")
+            return 1
+        
+        try:
+            # Get SP-SUB subsystem
+            if 'sp_sub' not in self.engine.subsystems:
+                logger.error("SP-SUB subsystem not available")
+                return 1
+            
+            sp_sub = self.engine.subsystems['sp_sub']
+            
+            if args.list:
+                # List known peers
+                if hasattr(sp_sub, 'sync_protocol') and sp_sub.sync_protocol:
+                    peers = sp_sub.sync_protocol.get_known_peers()
+                    
+                    if args.json:
+                        print(json.dumps(peers, indent=2, default=str))
+                    else:
+                        print(f"Known Peers ({len(peers)}):")
+                        for peer_id, peer in peers.items():
+                            print(f"  {peer_id}: {peer.get('address')}:{peer.get('port')}")
+                            print(f"    Last seen: {peer.get('last_seen')}")
+                            print(f"    Online: {peer.get('is_online', False)}")
+                
+                return 0
+                
+            elif args.add and args.node_id and args.address:
+                # Add a new peer
+                if hasattr(sp_sub, 'sync_protocol') and sp_sub.sync_protocol:
+                    await sp_sub.sync_protocol.add_manual_peer(
+                        args.node_id,
+                        args.address,
+                        args.port
+                    )
+                    
+                    print(f"Peer added: {args.node_id} at {args.address}:{args.port}")
+                    return 0
+                else:
+                    logger.error("Sync protocol not available in SP-SUB")
+                    return 1
+            else:
+                logger.error("Invalid peer command. Use --list or --add with required parameters")
+                return 1
+            
+        except Exception as e:
+            logger.error(f"Peer management failed: {e}")
+            return 1
+    
+    def parse_args(self, args=None):
+        """Parse command line arguments"""
+        return self.parser.parse_args(args)
+    
+    async def process_command(self, args) -> int:
+        """Process a CLI command using the appropriate handler"""
+        if not args.command:
+            self.parser.print_help()
+            return 1
+        
+        # Get command handler
+        handler = self.command_handlers.get(args.command)
+        if not handler:
+            logger.error(f"Unknown command: {args.command}")
+            return 1
+        
+        # Execute command handler
+        return await handler(args)
+    
+    def set_engine(self, engine):
+        """Set engine reference after initialization"""
+        self.engine = engine

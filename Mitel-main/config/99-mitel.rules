@@ -1,0 +1,15 @@
+# M.I.T.E.L. USB Monitoring Rules
+# Kernel-level event-driven monitoring (no polling)
+
+# Block all USB storage devices by default
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="*", ATTR{idProduct}=="*", RUN+="/usr/local/bin/mitel-check.sh %k %b{idVendor} %b{idProduct}"
+
+# Allow specific trusted devices (add your device IDs here)
+# ACTION=="add", ATTR{idVendor}=="0781", ATTR{idProduct}=="5567", RUN+="/usr/local/bin/mitel-trusted.sh %k"
+
+# Log all USB events for threat detection
+ACTION=="add", SUBSYSTEM=="usb", RUN+="/usr/local/bin/mitel-log.sh USB_ADD %k %b{idVendor} %b{idProduct}"
+ACTION=="remove", SUBSYSTEM=="usb", RUN+="/usr/local/bin/mitel-log.sh USB_REMOVE %k %b{idVendor} %b{idProduct}"
+
+# Immediate threat response for suspicious devices
+ACTION=="add", ATTR{idVendor}=="0781", ATTR{idProduct}=="5580", RUN+="/usr/local/bin/mitel-threat.sh RUBBER_DUCKY %k"

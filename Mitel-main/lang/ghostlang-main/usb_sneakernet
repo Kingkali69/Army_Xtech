@@ -1,0 +1,19 @@
+# Create udev rule for automatic mounting and running
+cat > /etc/udev/rules.d/99-ghostdrop.rules << EOL
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", RUN+="/usr/local/bin/ghost_drop_handler.sh %p"
+EOL
+
+# Create handler script
+cat > /usr/local/bin/ghost_drop_handler.sh << EOL
+#!/bin/bash
+DEVICE="/dev/$1"
+MOUNT_POINT="/media/ghost_drops"
+mkdir -p $MOUNT_POINT
+mount $DEVICE $MOUNT_POINT
+python /path/to/ghost_drop_usb.py process --path $MOUNT_POINT/ghostdrop
+umount $MOUNT_POINT
+EOL
+chmod +x /usr/local/bin/ghost_drop_handler.sh
+
+# Reload udev rules
+udevadm control --reload-rules

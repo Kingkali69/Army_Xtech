@@ -1,0 +1,525 @@
+import asyncio
+import uuid
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import defaultdict
+import weakref
+import json
+
+
+class SessionStatus(Enum):
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    PENDING = "pending"
+
+
+class UserRole(Enum):
+    GUEST = "guest"
+    USER = "user"
+    MODERATOR = "moderator"
+    ADMIN = "admin"
+    SUPER_ADMIN = "super_admin"
+
+
+class Permission(Enum):
+    READ = "read"
+    WRITE = "write"
+    DELETE = "delete"
+    ADMIN = "admin"
+    SYSTEM = "system"
+
+
+@dataclass
+class Session:
+    session_id: str
+    user_id: str
+    user_role: UserRole
+    created_at: datetime
+    last_activity: datetime
+    expires_at: datetime
+    permissions: Set[Permission]
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    status: SessionStatus = SessionStatus.ACTIVE
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+    
+    def is_active(self) -> bool:
+        return self.status == SessionStatus.ACTIVE and not self.is_expired()
+    
+    def update_activity(self):
+        self.last_activity = datetime.utcnow()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'session_id': self.session_id,
+            'user_id': self.user_id,
+            'user_role': self.user_role.value,
+            'created_at': self.created_at.isoformat(),
+            'last_activity': self.last_activity.isoformat(),
+            'expires_at': self.expires_at.isoformat(),
+            'permissions': [p.value for p in self.permissions],
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'status': self.status.value,
+            'metadata': self.metadata
+        }
+
+
+class SessionControlSubsystem:
+    """
+    Session Control Subsystem (SC-SUB) - Manages user sessions, access control,
+    and session lifecycle for the G.Legion cybersecurity framework.
+    """
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.logger = logging.getLogger(f"{__name__}.SessionControlSubsystem")
+        
+        # Core components
+        self.session_manager = None
+        self.access_control_manager = None
+        self.lifecycle_handler = None
+        self.session_monitor = None
+        
+        # State management
+        self._running = False
+        self._initialized = False
+        self._cleanup_task = None
+        self._monitor_task = None
+        
+        # External subsystem references (injected during initialization)
+        self.event_bus = None
+        self.security_subsystem = None
+    
+    async def initialize(self, **kwargs) -> bool:
+        """Initialize the Session Control Subsystem and all its components."""
+        try:
+            self.logger.info("Initializing Session Control Subsystem (SC-SUB)")
+            
+            # Extract external subsystem references
+            self.event_bus = kwargs.get('event_bus')
+            self.security_subsystem = kwargs.get('security_subsystem')
+            
+            # Initialize core components
+            self.session_manager = SessionManager(self.config, self.logger)
+            self.access_control_manager = AccessControlManager(self.config, self.logger)
+            self.lifecycle_handler = SessionLifecycleHandler(
+                self.config, self.logger, self.session_manager
+            )
+            self.session_monitor = SessionMonitor(self.config, self.logger)
+            
+            # Initialize all components
+            await self.session_manager.initialize()
+            await self.access_control_manager.initialize()
+            await self.lifecycle_handler.initialize()
+            await self.session_monitor.initialize()
+            
+            self._initialized = True
+            self.logger.info("SC-SUB initialization completed successfully")
+            
+            # Publish initialization event
+            if self.event_bus:
+                await self.event_bus.publish('sc_sub.initialized', {
+                    'subsystem': 'SessionControl',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize SC-SUB: {str(e)}")
+            return False
+    
+    async def start(self) -> bool:
+        """Start the Session Control Subsystem and begin operations."""
+        if not self._initialized:
+            self.logger.error("Cannot start SC-SUB: not initialized")
+            return False
+        
+        try:
+            self.logger.info("Starting Session Control Subsystem")
+            
+            # Start all components
+            await self.session_manager.start()
+            await self.access_control_manager.start()
+            await self.lifecycle_handler.start()
+            await self.session_monitor.start()
+            
+            # Start background tasks
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self._monitor_task = asyncio.create_task(self._monitoring_loop())
+            
+            self._running = True
+            self.logger.info("SC-SUB started successfully")
+            
+            # Publish start event
+            if self.event_bus:
+                await self.event_bus.publish('sc_sub.started', {
+                    'subsystem': 'SessionControl',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start SC-SUB: {str(e)}")
+            return False
+    
+    async def stop(self) -> bool:
+        """Stop the Session Control Subsystem and cleanup resources."""
+        try:
+            self.logger.info("Stopping Session Control Subsystem")
+            
+            self._running = False
+            
+            # Cancel background tasks
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if self._monitor_task and not self._monitor_task.done():
+                self._monitor_task.cancel()
+                try:
+                    await self._monitor_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Stop all components
+            if self.session_monitor:
+                await self.session_monitor.stop()
+            if self.lifecycle_handler:
+                await self.lifecycle_handler.stop()
+            if self.access_control_manager:
+                await self.access_control_manager.stop()
+            if self.session_manager:
+                await self.session_manager.stop()
+            
+            self.logger.info("SC-SUB stopped successfully")
+            
+            # Publish stop event
+            if self.event_bus:
+                await self.event_bus.publish('sc_sub.stopped', {
+                    'subsystem': 'SessionControl',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to stop SC-SUB: {str(e)}")
+            return False
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform comprehensive health check of all components."""
+        health_status = {
+            'subsystem': 'SessionControl',
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'initialized': self._initialized,
+            'running': self._running,
+            'components': {}
+        }
+        
+        try:
+            # Check each component
+            if self.session_manager:
+                health_status['components']['session_manager'] = await self.session_manager.health_check()
+            
+            if self.access_control_manager:
+                health_status['components']['access_control'] = await self.access_control_manager.health_check()
+            
+            if self.lifecycle_handler:
+                health_status['components']['lifecycle_handler'] = await self.lifecycle_handler.health_check()
+            
+            if self.session_monitor:
+                health_status['components']['session_monitor'] = await self.session_monitor.health_check()
+            
+            # Determine overall health
+            component_health = [comp.get('status', 'unhealthy') for comp in health_status['components'].values()]
+            if any(status != 'healthy' for status in component_health):
+                health_status['status'] = 'degraded'
+                
+        except Exception as e:
+            health_status['status'] = 'unhealthy'
+            health_status['error'] = str(e)
+            self.logger.error(f"Health check failed: {str(e)}")
+        
+        return health_status
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get detailed status information about the subsystem."""
+        status = {
+            'subsystem': 'SessionControl',
+            'version': '1.0.0',
+            'initialized': self._initialized,
+            'running': self._running,
+            'timestamp': datetime.utcnow().isoformat(),
+            'components': {}
+        }
+        
+        try:
+            if self.session_manager:
+                status['components']['session_manager'] = await self.session_manager.get_status()
+            
+            if self.access_control_manager:
+                status['components']['access_control'] = await self.access_control_manager.get_status()
+            
+            if self.lifecycle_handler:
+                status['components']['lifecycle_handler'] = await self.lifecycle_handler.get_status()
+            
+            if self.session_monitor:
+                status['components']['session_monitor'] = await self.session_monitor.get_status()
+                
+        except Exception as e:
+            status['error'] = str(e)
+            self.logger.error(f"Failed to get status: {str(e)}")
+        
+        return status
+    
+    # Public API Methods
+    
+    async def create_session(self, user_id: str, user_role: UserRole, 
+                           ip_address: str = None, user_agent: str = None,
+                           custom_permissions: Set[Permission] = None,
+                           session_duration: timedelta = None) -> Optional[Session]:
+        """Create a new user session."""
+        if not self._running:
+            return None
+        
+        try:
+            session = await self.session_manager.create_session(
+                user_id, user_role, ip_address, user_agent, 
+                custom_permissions, session_duration
+            )
+            
+            if session and self.event_bus:
+                await self.event_bus.publish('session.created', {
+                    'session_id': session.session_id,
+                    'user_id': user_id,
+                    'user_role': user_role.value,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            return session
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create session: {str(e)}")
+            return None
+    
+    async def validate_session(self, session_id: str) -> Optional[Session]:
+        """Validate and return session if active."""
+        if not self._running or not self.session_manager:
+            return None
+        
+        return await self.session_manager.validate_session(session_id)
+    
+    async def revoke_session(self, session_id: str, reason: str = "manual_revocation") -> bool:
+        """Revoke a specific session."""
+        if not self._running or not self.session_manager:
+            return False
+        
+        success = await self.session_manager.revoke_session(session_id, reason)
+        
+        if success and self.event_bus:
+            await self.event_bus.publish('session.revoked', {
+                'session_id': session_id,
+                'reason': reason,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        return success
+    
+    async def check_permission(self, session_id: str, permission: Permission) -> bool:
+        """Check if a session has a specific permission."""
+        if not self._running or not self.access_control_manager:
+            return False
+        
+        return await self.access_control_manager.check_permission(session_id, permission)
+    
+    async def get_active_sessions(self, user_id: str = None) -> List[Session]:
+        """Get all active sessions, optionally filtered by user."""
+        if not self._running or not self.session_manager:
+            return []
+        
+        return await self.session_manager.get_active_sessions(user_id)
+    
+    # Background Tasks
+    
+    async def _cleanup_loop(self):
+        """Background task for session cleanup and maintenance."""
+        cleanup_interval = self.config.get('cleanup_interval', 300)  # 5 minutes default
+        
+        while self._running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+                if self._running and self.lifecycle_handler:
+                    await self.lifecycle_handler.cleanup_expired_sessions()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in cleanup loop: {str(e)}")
+                await asyncio.sleep(60)  # Wait before retrying
+    
+    async def _monitoring_loop(self):
+        """Background task for session monitoring and metrics."""
+        monitor_interval = self.config.get('monitor_interval', 60)  # 1 minute default
+        
+        while self._running:
+            try:
+                await asyncio.sleep(monitor_interval)
+                if self._running and self.session_monitor:
+                    await self.session_monitor.collect_metrics()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in monitoring loop: {str(e)}")
+                await asyncio.sleep(30)  # Wait before retrying
+
+
+class SessionManager:
+    """Manages session creation, validation, and storage."""
+    
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+        self.config = config
+        self.logger = logger.getChild("SessionManager")
+        self.sessions: Dict[str, Session] = {}
+        self.user_sessions: Dict[str, Set[str]] = defaultdict(set)
+        self._lock = asyncio.Lock()
+        
+        # Configuration
+        self.default_session_duration = timedelta(
+            hours=self.config.get('default_session_hours', 8)
+        )
+        self.max_sessions_per_user = self.config.get('max_sessions_per_user', 5)
+    
+    async def initialize(self):
+        """Initialize the session manager."""
+        self.logger.info("Initializing SessionManager")
+    
+    async def start(self):
+        """Start the session manager."""
+        self.logger.info("Starting SessionManager")
+    
+    async def stop(self):
+        """Stop the session manager and cleanup."""
+        async with self._lock:
+            self.sessions.clear()
+            self.user_sessions.clear()
+        self.logger.info("SessionManager stopped")
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform health check."""
+        return {
+            'status': 'healthy',
+            'active_sessions': len(self.sessions),
+            'unique_users': len(self.user_sessions)
+        }
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get detailed status."""
+        async with self._lock:
+            return {
+                'total_sessions': len(self.sessions),
+                'active_sessions': len([s for s in self.sessions.values() if s.is_active()]),
+                'unique_users': len(self.user_sessions),
+                'expired_sessions': len([s for s in self.sessions.values() if s.is_expired()])
+            }
+    
+    async def create_session(self, user_id: str, user_role: UserRole,
+                           ip_address: str = None, user_agent: str = None,
+                           custom_permissions: Set[Permission] = None,
+                           session_duration: timedelta = None) -> Optional[Session]:
+        """Create a new session for a user."""
+        async with self._lock:
+            # Check session limits
+            if len(self.user_sessions[user_id]) >= self.max_sessions_per_user:
+                self.logger.warning(f"Max sessions reached for user {user_id}")
+                # Clean up expired sessions first
+                await self._cleanup_user_sessions(user_id)
+                if len(self.user_sessions[user_id]) >= self.max_sessions_per_user:
+                    return None
+            
+            # Generate session ID
+            session_id = str(uuid.uuid4())
+            now = datetime.utcnow()
+            duration = session_duration or self.default_session_duration
+            
+            # Determine permissions based on role
+            permissions = custom_permissions or self._get_role_permissions(user_role)
+            
+            # Create session
+            session = Session(
+                session_id=session_id,
+                user_id=user_id,
+                user_role=user_role,
+                created_at=now,
+                last_activity=now,
+                expires_at=now + duration,
+                permissions=permissions,
+                ip_address=ip_address,
+                user_agent=user_agent
+            )
+            
+            # Store session
+            self.sessions[session_id] = session
+            self.user_sessions[user_id].add(session_id)
+            
+            self.logger.info(f"Created session {session_id} for user {user_id}")
+            return session
+    
+    async def validate_session(self, session_id: str) -> Optional[Session]:
+        """Validate a session and return it if active."""
+        async with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return None
+            
+            if not session.is_active():
+                if session.status == SessionStatus.ACTIVE:
+                    session.status = SessionStatus.EXPIRED
+                return None
+            
+            # Update activity
+            session.update_activity()
+            return session
+    
+    async def revoke_session(self, session_id: str, reason: str = "manual") -> bool:
+        """Revoke a specific session."""
+        async with self._lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return False
+            
+            session.status = SessionStatus.REVOKED
+            session.metadata['revocation_reason'] = reason
+            session.metadata['revoked_at'] = datetime.utcnow().isoformat()
+            
+            self.logger.info(f"Revoked session {session_id}: {reason}")
+            return True
+    
+    async def get_active_sessions(self, user_id: str = None) -> List[Session]:
+        """Get active sessions, optionally filtered by user."""
+        async with self._lock:
+            sessions = []
+            
+            if user_id:
+                session_ids = self.user_sessions.get(user_id, set())
+                for sid in session_ids:
+                    session = self.sessions.get(sid)
+                    if session and session.is_active():
+                        sessions.append(session)
+            else:
+                sessions = [s for s in sel

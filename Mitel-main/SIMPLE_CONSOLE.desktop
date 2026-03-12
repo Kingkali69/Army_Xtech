@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SIMPLE CONSOLE
+Comment=Consumer Hardware Optimized - UI Only
+Exec=gnome-terminal -- /home/kali/Desktop/MITEL/Mitel-main/START_SIMPLE.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Utility;
+StartupNotify=true
+Name[en_US]=SIMPLE CONSOLE

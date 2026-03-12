@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""
+CloudCore_Sync_2 Master Launcher
+KK&GDevOps (King Kali & Ghost + Claude)
+
+Universal launcher for Ghost Engine subsystems across all platforms
+Handles initialization, configuration, and orchestration of:
+- AUTH-SUB: Authentication Subsystem
+- EB-SUB: Event Bus Subsystem  
+- SEC-SUB: Security Core Subsystem
+- SC-SUB: Session Control Subsystem
+- AO-SUB: API Orchestration Subsystem
+- SP-SUB: Synchronization Protocol Subsystem
+"""
+
+import asyncio
+import json
+import os
+import sys
+import platform
+import logging
+import argparse
+import signal
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from enum import Enum, auto
+import subprocess
+import importlib.util
+
+# CloudCore imports (these would be your actual subsystem modules)
+# from cloudcore.auth_sub import AuthenticationSubsystem
+# from cloudcore.eb_sub import EventBusSubsystem
+# from cloudcore.sec_sub import SecuritySubsystem
+# from cloudcore.sc_sub import SessionControlSubsystem
+# from cloudcore.ao_sub import APIOrchestrationSubsystem  
+# from cloudcore.sp_sub import SynchronizationSubsystem
+
+class LaunchMode(Enum):
+    FULL = "full"              # All subsystems
+    SECURITY = "security"      # SEC-SUB + AUTH-SUB only
+    SYNC = "sync"             # SP-SUB + EB-SUB only
+    MINIMAL = "minimal"       # EB-SUB only
+    CUSTOM = "custom"         # User-defined subset
+
+class PlatformType(Enum):
+    LINUX = auto()
+    WINDOWS = auto()
+    ANDROID = auto()
+    IOS = auto()
+    UNKNOWN = auto()
+
+@dataclass
+class LaunchConfig:
+    """Configuration for CloudCore launcher"""
+    mode: LaunchMode
+    platform: PlatformType
+    config_path: Optional[str]
+    log_level: str
+    enable_plugins: bool
+    offline_mode: bool
+    security_level: str
+    custom_subsystems: List[str]
+    port_base: int
+    data_dir: str
+
+class CloudCoreLauncher:
+    """
+    Master launcher for CloudCore_Sync_2 Ghost Engine
+    
+    Handles cross-platform initialization and orchestration of all subsystems
+    """
+    
+    def __init__(self):
+        self.platform = self._detect_platform()
+        self.subsystems = {}
+        self.event_bus = None
+        self.config = None
+        self.logger = None
+        self.shutdown_event = asyncio.Event()
+        
+        # Subsystem registry
+        self.available_subsystems = {
+            'AUTH-SUB': 'cloudcore.auth_sub.AuthenticationSubsystem',
+            'EB-SUB': 'cloudcore.eb_sub.EventBusSubsystem',
+            'SEC-SUB': 'cloudcore.sec_sub.SecuritySubsystem', 
+            'SC-SUB': 'cloudcore.sc_sub.SessionControlSubsystem',
+            'AO-SUB': 'cloudcore.ao_sub.APIOrchestrationSubsystem',
+            'SP-SUB': 'cloudcore.sp_sub.SynchronizationSubsystem'
+        }
+        
+        # Platform-specific configurations
+        self.platform_configs = {
+            PlatformType.LINUX: {
+                'data_dir': '/var/lib/cloudcore',
+                'config_dir': '/etc/cloudcore',
+                'log_dir': '/var/log/cloudcore',
+                'service_mode': True
+            },
+            PlatformType.WINDOWS: {
+                'data_dir': os.path.expandvars('%PROGRAMDATA%/CloudCore'),
+                'config_dir': os.path.expandvars('%PROGRAMDATA%/CloudCore/config'),
+                'log_dir': os.path.expandvars('%PROGRAMDATA%/CloudCore/logs'),
+                'service_mode': True
+            },
+            PlatformType.ANDROID: {
+                'data_dir': '/data/data/com.kkgdevops.cloudcore',
+                'config_dir': '/sdcard/CloudCore/config',
+                'log_dir': '/sdcard/CloudCore/logs',
+                'service_mode': False
+            },
+            PlatformType.IOS: {
+                'data_dir': os.path.expanduser('~/Documents/CloudCore'),
+                'config_dir': os.path.expanduser('~/Documents/CloudCore/config'),
+                'log_dir': os.path.expanduser('~/Documents/CloudCore/logs'),
+                'service_mode': False
+            }
+        }
+    
+    def _detect_platform(self) -> PlatformType:
+        """Detect current platform"""
+        system = platform.system().lower()
+        
+        if system == 'linux':
+            # Check if Android (Termux environment)
+            if os.path.exists('/system/build.prop') or 'android' in os.environ.get('PREFIX', '').lower():
+                return PlatformType.ANDROID
+            return PlatformType.LINUX
+        elif system == 'windows':
+            return PlatformType.WINDOWS
+        elif system == 'darwin':
+            return PlatformType.IOS
+        else:
+            return PlatformType.UNKNOWN
+    
+    def setup_logging(self, log_level: str = "INFO") -> None:
+        """Setup platform-appropriate logging"""
+        platform_config = self.platform_configs.get(self.platform, {})
+        log_dir = platform_config.get('log_dir', './logs')
+        
+        # Create log directory
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Configure logging
+        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format=log_format,
+            handlers=[
+                logging.FileHandler(f"{log_dir}/cloudcore.log"),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        self.logger = logging.getLogger("CloudCore.Launcher")
+        self.logger.info(f"CloudCore Launcher initialized on {self.platform.name}")
+    
+    def load_config(self, config_path: Optional[str] = None) -> Dict:
+        """Load configuration from file or generate default"""
+        
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            self.logger.info(f"Loaded configuration from {config_path}")
+        else:
+            # Generate default configuration
+            config = self._generate_default_config()
+            self.logger.info("Using default configuration")
+        
+        # Apply platform-specific overrides
+        platform_config = self.platform_configs.get(self.platform, {})
+        config.update(platform_config)
+        
+        self.config = config
+        return config
+    
+    def _generate_default_config(self) -> Dict:
+        """Generate default configuration based on platform"""
+        platform_config = self.platform_configs.get(self.platform, {})
+        
+        return {
+            "engine": {
+                "deployment_mode": "standalone",
+                "security_level": "high",
+                "offline_capable": True,
+                "platform": self.platform.name.lower()
+            },
+            "subsystems": {
+                "AUTH-SUB": {
+                    "enabled": True,
+                    "hsm_enabled": False,
+                    "biometric_required": self.platform in [PlatformType.ANDROID, PlatformType.IOS],
+                    "mfa_required": True
+                },
+                "EB-SUB": {
+                    "enabled": True,
+                    "buffer_size": 10000,
+                    "persistence": True,
+                    "compression": "lz4"
+                },
+                "SEC-SUB": {
+                    "enabled": True,
+                    "threat_detection": True,
+                    "behavioral_analysis": True,
+                    "quantum_safe": True
+                },
+                "SC-SUB": {
+                    "enabled": True,
+                    "distributed_sessions": True,
+                    "session_timeout": 3600
+                },
+                "AO-SUB": {
+                    "enabled": True,
+                    "graphql_enabled": True,
+                    "rest_enabled": True,
+                    "rate_limiting": True
+                },
+                "SP-SUB": {
+                    "enabled": True,
+                    "sync_mode": "offline_first",
+                    "crdt_enabled": True,
+                    "compression": True
+                }
+            },
+            "networking": {
+                "port_base": 8080,
+                "ssl_enabled": True,
+                "mesh_networking": self.platform == PlatformType.ANDROID
+            },
+            **platform_config
+        }
+    
+    async def initialize_subsystems(self, launch_config: LaunchConfig) -> None:
+        """Initialize and start selected subsystems"""
+        
+        self.logger.info(f"Initializing subsystems for {launch_config.mode.value} mode")
+        
+        # Determine which subsystems to load
+        if launch_config.mode == LaunchMode.FULL:
+            subsystems_to_load = list(self.available_subsystems.keys())
+        elif launch_config.mode == LaunchMode.SECURITY:
+            subsystems_to_load = ['AUTH-SUB', 'SEC-SUB', 'EB-SUB']
+        elif launch_config.mode == LaunchMode.SYNC:
+            subsystems_to_load = ['SP-SUB', 'EB-SUB']
+        elif launch_config.mode == LaunchMode.MINIMAL:
+            subsystems_to_load = ['EB-SUB']
+        elif launch_config.mode == LaunchMode.CUSTOM:
+            subsystems_to_load = launch_config.custom_subsystems
+        else:
+            subsystems_to_load = ['EB-SUB']  # Fallback
+        
+        # Always initialize Event Bus first
+        if 'EB-SUB' not in subsystems_to_load:
+            subsystems_to_load.insert(0, 'EB-SUB')
+        elif subsystems_to_load.index('EB-SUB') != 0:
+            subsystems_to_load.remove('EB-SUB')
+            subsystems_to_load.insert(0, 'EB-SUB')
+        
+        # Initialize subsystems in dependency order
+        for subsystem_name in subsystems_to_load:
+            await self._initialize_subsystem(subsystem_name, launch_config)
+        
+        # Cross-connect all subsystems to event bus
+        await self._connect_subsystems_to_event_bus()
+        
+        self.logger.info(f"Successfully initialized {len(self.subsystems)} subsystems")
+    
+    async def _initialize_subsystem(self, subsystem_name: str, launch_config: LaunchConfig) -> None:
+        """Initialize a single subsystem"""
+        
+        try:
+            self.logger.info(f"Initializing {subsystem_name}...")
+            
+            # For demo purposes, create mock subsystems
+            # In real implementation, you'd import and instantiate actual subsystem classes
+            subsystem = await self._create_mock_subsystem(subsystem_name, launch_config)
+            
+            # Store subsystem reference
+            self.subsystems[subsystem_name] = subsystem
+            
+            # Set event bus reference (except for EB-SUB itself)
+            if subsystem_name != 'EB-SUB':
+                subsystem.event_bus = self.event_bus
+            else:
+                self.event_bus = subsystem
+            
+            # Start the subsystem
+            await subsystem.start()
+            
+            self.logger.info(f"✅ {subsystem_name} initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize {subsystem_name}: {e}")
+            raise
+    
+    async def _create_mock_subsystem(self, subsystem_name: str, launch_config: LaunchConfig):
+        """Create mock subsystem for demonstration"""
+        
+        class MockSubsystem:
+            def __init__(self, name: str):
+                self.name = name
+                self.event_bus = None
+                self.config = {}
+                self.running = False
+                self.logger = logging.getLogger(f"CloudCore.{name}")
+            
+            async def start(self):
+                self.running = True
+                self.logger.info(f"{self.name} started")
+            
+            async def stop(self):
+                self.running = False
+                self.logger.info(f"{self.name} stopped")
+            
+            async def get_status(self):
+                return {
+                    'name': self.name,
+                    'running': self.running,
+                    'platform': launch_config.platform.name
+                }
+        
+        return MockSubsystem(subsystem_name)
+    
+    async def _connect_subsystems_to_event_bus(self) -> None:
+        """Connect all subsystems to the event bus"""
+        
+        if not self.event_bus:
+            self.logger.error("Event bus not initialized!")
+            return
+        
+        for name, subsystem in self.subsystems.items():
+            if name != 'EB-SUB':
+                subsystem.event_bus = self.event_bus
+                self.logger.debug(f"Connected {name} to event bus")
+    
+    async def run(self, launch_config: LaunchConfig) -> None:
+        """Main run loop for CloudCore"""
+        
+        try:
+            # Setup signal handlers for graceful shutdown
+            self._setup_signal_handlers()
+            
+            # Initialize all subsystems
+            await self.initialize_subsystems(launch_config)
+            
+            # Start health monitoring
+            asyncio.create_task(self._health_monitor())
+            
+            # Start platform-specific services
+            await self._start_platform_services(launch_config)
+            
+            self.logger.info("🚀 CloudCore_Sync_2 Ghost Engine fully operational!")
+            self.logger.info(f"Platform: {self.platform.name}")
+            self.logger.info(f"Mode: {launch_config.mode.value}")
+            self.logger.info(f"Active subsystems: {list(self.subsystems.keys())}")
+            
+            # Wait for shutdown signal
+            await self.shutdown_event.wait()
+            
+        except Exception as e:
+            self.logger.error(f"Critical error in main loop: {e}")
+            raise
+        finally:
+            await self.shutdown()
+    
+    async def _start_platform_services(self, launch_config: LaunchConfig) -> None:
+        """Start platform-specific services"""
+        
+        if self.platform == PlatformType.LINUX:
+            # Linux-specific services (systemd integration, etc.)
+            self.logger.info("Starting Linux platform services...")
+            
+        elif self.platform == PlatformType.WINDOWS:
+            # Windows-specific services
+            self.logger.info("Starting Windows platform services...")
+            
+        elif self.platform == PlatformType.ANDROID:
+            # Android-specific services (Termux integration)
+            self.logger.info("Starting Android platform services...")
+            await self._setup_android_services(launch_config)
+            
+        elif self.platform == PlatformType.IOS:
+            # iOS-specific services
+            self.logger.info("Starting iOS platform services...")
+    
+    async def _setup_android_services(self, launch_config: LaunchConfig) -> None:
+        """Setup Android/Termux specific services"""
+        
+        try:
+            # Check if running in Termux
+            if 'com.termux' in os.environ.get('PREFIX', ''):
+                self.logger.info("Detected Termux environment")
+                
+                # Setup Termux-specific configurations
+                termux_config = {
+                    'acquire_wakelock': True,
+                    'background_mode': True,
+                    'notification_service': True
+                }
+                
+                # Try to acquire wake lock to prevent sleep
+                try:
+                    subprocess.run(['termux-wake-lock'], check=False)
+                    self.logger.info("Acquired Termux wake lock")
+                except FileNotFoundError:
+                    self.logger.warning("termux-wake-lock not available")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to setup Android services: {e}")
+    
+    async def _health_monitor(self) -> None:
+        """Monitor subsystem health"""
+        
+        while not self.shutdown_event.is_set():
+            try:
+                for name, subsystem in self.subsystems.items():
+                    status = await subsystem.get_status()
+                    if not status.get('running', False):
+                        self.logger.warning(f"Subsystem {name} appears to be down")
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+            except Exception as e:
+                self.logger.error(f"Error in health monitor: {e}")
+                await asyncio.sleep(60)
+    
+    def _setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown"""
+        
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, initiating shutdown...")
+            asyncio.create_task(self._trigger_shutdown())
+        
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, signal_handler)
+        if hasattr(signal, 'SIGINT'):
+            signal.signal(signal.SIGINT, signal_handler)
+    
+    async def _trigger_shutdown(self) -> None:
+        """Trigger graceful shutdown"""
+        self.shutdown_event.set()
+    
+    async def shutdown(self) -> None:
+        """Graceful shutdown of all subsystems"""
+        
+        self.logger.info("🛑 Initiating CloudCore shutdown...")
+        
+        # Shutdown subsystems in reverse order
+        subsystem_names = list(self.subsystems.keys())
+        subsystem_names.reverse()
+        
+        for name in subsystem_names:
+            try:
+                subsystem = self.subsystems[name]
+                await subsystem.stop()
+                self.logger.info(f"✅ {name} shutdown complete")
+            except Exception as e:
+                self.logger.error(f"❌ Error shutting down {name}: {e}")
+        
+        self.logger.info("🏁 CloudCore shutdown complete")
+    
+    async def get_system_status(self) -> Dict:
+        """Get comprehensive system status"""
+        
+        subsystem_status = {}
+        for name, subsystem in self.subsystems.items():
+            try:
+                subsystem_status[name] = await subsystem.get_status()
+            except Exception as e:
+                subsystem_status[name] = {'error': str(e)}
+        
+        return {
+            'platform': self.platform.name,
+            'uptime': time.time(),
+            'subsystems': subsystem_status,
+            'config': self.config
+        }
+
+
+def create_launch_config_from_args(args) -> LaunchConfig:
+    """Create LaunchConfig from command line arguments"""
+    
+    # Parse mode
+    mode = LaunchMode(args.mode)
+    
+    # Detect platform
+    launcher = CloudCoreLauncher()
+    platform = launcher.platform
+    
+    return LaunchConfig(
+        mode=mode,
+        platform=platform,
+        config_path=args.config,
+        log_level=args.log_level,
+        enable_plugins=args.plugins,
+        offline_mode=args.offline,
+        security_level=args.security,
+        custom_subsystems=args.subsystems.split(',') if args.subsystems else [],
+        port_base=args.port,
+        data_dir=args.data_dir
+    )
+
+
+def main():
+    """Main entry point for CloudCore_Sync_2 launcher"""
+    
+    parser = argparse.ArgumentParser(
+        description="CloudCore_Sync_2 Ghost Engine Launcher",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full deployment with all subsystems
+  python cloudcore_launcher.py --mode full
+  
+  # Security-focused deployment
+  python cloudcore_launcher.py --mode security --security maximum
+  
+  # Minimal sync-only deployment
+  python cloudcore_launcher.py --mode sync --offline
+  
+  # Custom subsystem selection
+  python cloudcore_launcher.py --mode custom --subsystems "AUTH-SUB,SEC-SUB,EB-SUB"
+  
+  # Development mode with debug logging
+  python cloudcore_launcher.py --mode full --log-level debug --config dev_config.json
+        """
+    )
+    
+    parser.add_argument(
+        '--mode', 
+        choices=['full', 'security', 'sync', 'minimal', 'custom'],
+        default='full',
+        help='Launch mode (default: full)'
+    )
+    
+    parser.add_argument(
+        '--config',
+        help='Path to configuration file'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Logging level (default: INFO)'
+    )
+    
+    parser.add_argument(
+        '--security',
+        choices=['low', 'medium', 'high', 'maximum'],
+        default='high',
+        help='Security level (default: high)'
+    )
+    
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=8080,
+        help='Base port number (default: 8080)'
+    )
+    
+    parser.add_argument(
+        '--data-dir',
+        help='Data directory path'
+    )
+    
+    parser.add_argument(
+        '--subsystems',
+        help='Comma-separated list of subsystems for custom mode'
+    )
+    
+    parser.add_argument(
+        '--offline',
+        action='store_true',
+        help='Start in offline mode'
+    )
+    
+    parser.add_argument(
+        '--plugins',
+        action='store_true',
+        default=True,
+        help='Enable plugin system (default: enabled)'
+    )
+    
+    parser.add_argument(
+        '--status',
+        action='store_true',
+        help='Show system status and exit'
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='CloudCore_Sync_2 v2.0.0 - Ghost Engine'
+    )
+    
+    args = parser.parse_args()
+    
+    # Create launcher instance
+    launcher = CloudCoreLauncher()
+    launcher.setup_logging(args.log_level)
+    
+    # Load configuration
+    launcher.load_config(args.config)
+    
+    # Handle status request
+    if args.status:
+        try:
+            status = asyncio.run(launcher.get_system_status())
+            print(json.dumps(status, indent=2))
+            return 0
+        except Exception as e:
+            print(f"Error getting status: {e}")
+            return 1
+    
+    # Create launch configuration
+    launch_config = create_launch_config_from_args(args)
+    
+    try:
+        # Run CloudCore
+        asyncio.run(launcher.run(launch_config))
+        return 0
+        
+    except KeyboardInterrupt:
+        launcher.logger.info("Shutdown requested by user")
+        return 0
+    except Exception as e:
+        launcher.logger.error(f"Fatal error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

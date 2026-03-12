@@ -1,0 +1,1495 @@
+
+# sp_subsystem/ghost_sync_protocol.py (Enhanced v5)
+import asyncio
+import logging
+import json
+import socket
+import struct
+import time
+import hashlib
+from typing import Dict, List, Any, Optional, Set, Tuple
+from datetime import datetime, timezone
+import ssl
+import uuid
+
+class PeerInfo:
+    """Information about a sync peer"""
+    def __init__(self, node_id: str, address: str, port: int, 
+                 capabilities: List[str], last_seen: Optional[datetime] = None):
+        self.node_id = node_id
+        self.address = address
+        self.port = port
+        self.capabilities = capabilities
+        self.last_seen = last_seen or datetime.now(timezone.utc)
+        self.connection_failures = 0
+        self.is_online = True
+        self.sync_version = 1
+    
+    @property
+    def endpoint(self) -> str:
+        return f"{self.address}:{self.port}"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'node_id': self.node_id,
+            'address': self.address,
+            'port': self.port,
+            'capabilities': self.capabilities,
+            'last_seen': self.last_seen.isoformat(),
+            'is_online': self.is_online,
+            'connection_failures': self.connection_failures,
+            'sync_version': self.sync_version
+        }
+
+class GhostSyncProtocol:
+    """Enhanced P2P/mesh sync protocol with offline-first design"""
+    
+    def __init__(self, config: Dict[str, Any], integrity_verifier=None, delta_engine=None):
+        self.config = config
+        self.mode = config.get('mode', 'mesh')
+        self.discovery_enabled = config.get('discovery_enabled', True)
+        self.encryption_enabled = config.get('encryption_enabled', True)
+        self.fallback_modes = config.get('fallback_modes', ['offline'])
+        
+        self.logger = logging.getLogger("GhostSyncProtocol")
+        
+        # Component dependencies
+        self.integrity_verifier = integrity_verifier
+        self.delta_engine = delta_engine
+        
+        # Peer management
+        self.known_peers: Dict[str, PeerInfo] = {}
+        self.active_connections: Set[str] = set()
+        
+        # Protocol settings
+        self.listen_port = config.get('listen_port', 8443)
+        self.discovery_port = config.get('discovery_port', 8444)
+        self.timeout_seconds = config.get('timeout_seconds', 10)
+        self.max_connections = config.get('max_connections', 20)
+        
+        # Node identity
+        self.node_id = str(uuid.uuid4())
+        
+        # Servers
+        self.server = None
+        self.discovery_socket = None
+        self.running = False
+        
+        # Offline queue for when no peers available
+        self.offline_queue = []
+        
+    async def initialize(self, node_id: str = None):
+        """Initialize protocol services"""
+        if node_id:
+            self.node_id = node_id
+            
+        try:
+            if self.mode in ['mesh', 'p2p']:
+                await self._start_server()
+                
+            if self.discovery_enabled:
+                await self._start_discovery()
+                
+            self.running = True
+            asyncio.create_task(self._maintenance_loop())
+            
+            self.logger.info(f"Ghost sync protocol v5 initialized in {self.mode} mode")
+            
+        except Exception as e:
+            self.logger.error(f"Protocol initialization failed: {e}")
+            raise
+    
+    async def shutdown(self):
+        """Shutdown protocol services"""
+        self.running = False
+        
+        try:
+            if self.server:
+                self.server.close()
+                await self.server.wait_closed()
+                
+            if self.discovery_socket:
+                self.discovery_socket.close()
+                
+            for peer_id in list(self.active_connections):
+                await self._disconnect_peer(peer_id)
+                
+            self.logger.info("Ghost sync protocol shut down")
+            
+        except Exception as e:
+            self.logger.error(f"Protocol shutdown error: {e}")
+    
+    async def _start_server(self):
+        """Start server for incoming sync connections"""
+        try:
+            self.server = await asyncio.start_server(
+                self._handle_peer_connection,
+                '0.0.0.0',
+                self.listen_port
+            )
+            
+            self.logger.info(f"Sync server listening on port {self.listen_port}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start server: {e}")
+            if 'offline' in self.fallback_modes:
+                self.logger.info("Falling back to offline mode")
+            else:
+                raise
+    
+    async def _start_discovery(self):
+        """Start UDP peer discovery"""
+        try:
+            self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.discovery_socket.bind(('', self.discovery_port))
+            self.discovery_socket.setblocking(False)
+            
+            asyncio.create_task(self._discovery_listener())
+            asyncio.create_task(self._periodic_discovery())
+            
+            self.logger.info(f"Discovery service started on port {self.discovery_port}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start discovery: {e}")
+    
+    async def _discovery_listener(self):
+        """Listen for discovery broadcasts"""
+        while self.running:
+            try:
+                loop = asyncio.get_event_loop()
+                data, addr = await loop.sock_recvfrom(self.discovery_socket, 1024)
+                
+                await self._process_discovery_message(data, addr)
+                
+            except Exception as e:
+                if self.running:
+                    self.logger.debug(f"Discovery listener error: {e}")
+                await asyncio.sleep(0.1)
+    
+    async def _process_discovery_message(self, data: bytes, addr: Tuple[str, int]):
+        """Process incoming discovery message"""
+        try:
+            message = json.loads(data.decode('utf-8'))
+            
+            if message.get('type') == 'ghost_discovery':
+                node_id = message.get('node_id')
+                if node_id and node_id != self.node_id:
+                    # Add or update peer
+                    peer = PeerInfo(
+                        node_id,
+                        addr[0],
+                        message.get('port', self.listen_port),
+                        message.get('capabilities', [])
+                    )
+                    self.known_peers[node_id] = peer
+                    
+                    self.logger.debug(f"Discovered peer: {node_id} at {addr[0]}")
+                    
+                    # Send response
+                    response = {
+                        'type': 'ghost_discovery_response',
+                        'node_id': self.node_id,
+                        'port': self.listen_port,
+                        'capabilities': ['sync', 'crdt', 'offline'],
+                        'timestamp': time.time()
+                    }
+                    
+                    response_data = json.dumps(response).encode('utf-8')
+                    self.discovery_socket.sendto(response_data, addr)
+                    
+            elif message.get('type') == 'ghost_discovery_response':
+                node_id = message.get('node_id')
+                if node_id and node_id != self.node_id:
+                    peer = PeerInfo(
+                        node_id,
+                        addr[0],
+                        message.get('port', self.listen_port),
+                        message.get('capabilities', [])
+                    )
+                    self.known_peers[node_id] = peer
+                    
+        except Exception as e:
+            self.logger.debug(f"Failed to process discovery message: {e}")
+    
+    async def _periodic_discovery(self):
+        """Periodically broadcast discovery messages"""
+        while self.running:
+            try:
+                await self._broadcast_discovery()
+                await asyncio.sleep(30)  # Every 30 seconds
+                
+            except Exception as e:
+                self.logger.debug(f"Discovery broadcast error: {e}")
+                await asyncio.sleep(30)
+    
+    async def _broadcast_discovery(self):
+        """Broadcast discovery message"""
+        try:
+            message = {
+                'type': 'ghost_discovery',
+                'node_id': self.node_id,
+                'port': self.listen_port,
+                'capabilities': ['sync', 'crdt', 'offline'],
+                'timestamp': time.time()
+            }
+            
+            data = json.dumps(message).encode('utf-8')
+            
+            # Broadcast to local network
+            self.discovery_socket.sendto(data, ('<broadcast>', self.discovery_port))
+            
+            # Also try loopback for local testing
+            self.discovery_socket.sendto(data, ('127.0.0.1', self.discovery_port))
+            
+        except Exception as e:
+            self.logger.debug(f"Discovery broadcast failed: {e}")
+    
+    async def _maintenance_loop(self):
+        """Background maintenance tasks"""
+        while self.running:
+            try:
+                # Clean up stale peers
+                current_time = datetime.now(timezone.utc)
+                stale_peers = []
+                
+                for peer_id, peer in self.known_peers.items():
+                    if (current_time - peer.last_seen).total_seconds() > 300:  # 5 minutes
+                        stale_peers.append(peer_id)
+                
+                for peer_id in stale_peers:
+                    del self.known_peers[peer_id]
+                    self.active_connections.discard(peer_id)
+                
+                # Process offline queue if we have peers
+                if self.offline_queue and self.known_peers:
+                    await self._process_offline_queue()
+                
+                await asyncio.sleep(60)  # Run every minute
+                
+            except Exception as e:
+                self.logger.error(f"Maintenance loop error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _process_offline_queue(self):
+        """Process queued operations from offline mode"""
+        try:
+            while self.offline_queue:
+                operation = self.offline_queue.pop(0)
+                await self._execute_queued_operation(operation)
+                
+        except Exception as e:
+            self.logger.error(f"Offline queue processing error: {e}")
+    
+    async def _execute_queued_operation(self, operation: Dict[str, Any]):
+        """Execute a queued sync operation"""
+        op_type = operation.get('type')
+        
+        if op_type == 'sync_deltas':
+            deltas = operation.get('deltas', [])
+            await self._sync_deltas_to_peers(deltas)
+            
+        elif op_type == 'pull_request':
+            await self._request_sync_from_peers()
+    
+    async def _handle_peer_connection(self, reader: asyncio.StreamReader, 
+                                     writer: asyncio.StreamWriter):
+        """Handle incoming peer connection"""
+        peer_addr = writer.get_extra_info('peername')
+        self.logger.debug(f"New peer connection from {peer_addr}")
+        
+        try:
+            peer_info = await self._peer_handshake(reader, writer)
+            
+            if peer_info:
+                self.known_peers[peer_info.node_id] = peer_info
+                self.active_connections.add(peer_info.node_id)
+                
+                await self._handle_sync_session(reader, writer, peer_info)
+                
+        except Exception as e:
+            self.logger.error(f"Peer connection error: {e}")
+            
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    
+    async def _peer_handshake(self, reader: asyncio.StreamReader, 
+                             writer: asyncio.StreamWriter) -> Optional[PeerInfo]:
+        """Perform handshake with peer"""
+        try:
+            # Send our info
+            handshake = {
+                'protocol': 'ghost_sync',
+                'version': '5.0',
+                'node_id': self.node_id,
+                'capabilities': ['sync', 'crdt', 'offline', 'verify'],
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, handshake)
+            
+            # Receive peer info
+            peer_handshake = await self._receive_json(reader)
+            
+            if peer_handshake and peer_handshake.get('protocol') == 'ghost_sync':
+                return PeerInfo(
+                    peer_handshake['node_id'],
+                    writer.get_extra_info('peername')[0],
+                    writer.get_extra_info('peername')[1],
+                    peer_handshake.get('capabilities', [])
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Handshake failed: {e}")
+            
+        return None
+    
+    async def _send_json(self, writer: asyncio.StreamWriter, data: Dict[str, Any]):
+        """Send JSON message with length prefix"""
+        try:
+            json_data = json.dumps(data, default=str)
+            message_bytes = json_data.encode('utf-8')
+            
+            # Send length prefix (4 bytes big endian)
+            length = len(message_bytes)
+            writer.write(struct.pack('>I', length))
+            writer.write(message_bytes)
+            
+            await writer.drain()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send JSON: {e}")
+            raise
+    
+    async def _receive_json(self, reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
+        """Receive JSON message with length prefix"""
+        try:
+            # Read length prefix
+            length_data = await asyncio.wait_for(reader.read(4), timeout=self.timeout_seconds)
+            if len(length_data) != 4:
+                return None
+            
+            length = struct.unpack('>I', length_data)[0]
+            if length > 10 * 1024 * 1024:  # 10MB limit
+                raise ValueError(f"Message too large: {length}")
+            
+            # Read message data
+            message_data = await asyncio.wait_for(reader.read(length), timeout=self.timeout_seconds)
+            if len(message_data) != length:
+                return None
+            
+            return json.loads(message_data.decode('utf-8'))
+            
+        except asyncio.TimeoutError:
+            self.logger.debug("Receive timeout")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to receive JSON: {e}")
+            return None
+    
+    async def _handle_sync_session(self, reader: asyncio.StreamReader,
+                                  writer: asyncio.StreamWriter, peer: PeerInfo):
+        """Handle sync session with peer"""
+        try:
+            while True:
+                message = await self._receive_json(reader)
+                if not message:
+                    break
+                
+                response = await self._process_sync_message(message, peer)
+                if response:
+                    await self._send_json(writer, response)
+                    
+        except Exception as e:
+            self.logger.error(f"Sync session error with {peer.node_id}: {e}")
+        finally:
+            self.active_connections.discard(peer.node_id)
+    
+    async def _process_sync_message(self, message: Dict[str, Any], 
+                                   peer: PeerInfo) -> Optional[Dict[str, Any]]:
+        """Process sync message from peer"""
+        msg_type = message.get('type')
+        
+        if msg_type == 'push_deltas':
+            return await self._handle_push_deltas(message, peer)
+        elif msg_type == 'pull_request':
+            return await self._handle_pull_request(message, peer)
+        elif msg_type == 'sync_status':
+            return await self._handle_sync_status(message, peer)
+        
+        return None
+    
+    async def _handle_push_deltas(self, message: Dict[str, Any], 
+                                 peer: PeerInfo) -> Dict[str, Any]:
+        """Handle incoming delta push"""
+        deltas = message.get('deltas', [])
+        
+        try:
+            # Verify and apply deltas
+            applied_count, failed_count = await self.verify_and_apply(deltas)
+            
+            return {
+                'type': 'push_response',
+                'status': 'success',
+                'applied': applied_count,
+                'failed': failed_count,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to process push from {peer.node_id}: {e}")
+            return {
+                'type': 'push_response',
+                'status': 'error',
+                'error': str(e),
+                'timestamp': time.time()
+            }
+    
+    async def _handle_pull_request(self, message: Dict[str, Any], 
+                                  peer: PeerInfo) -> Dict[str, Any]:
+        """Handle pull request from peer"""
+        try:
+            # Get our pending deltas (would need to be implemented in delta_engine)
+            if self.delta_engine:
+                pending_deltas = await self.delta_engine.get_pending_deltas()
+            else:
+                pending_deltas = []
+            
+            return {
+                'type': 'pull_response',
+                'deltas': pending_deltas,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            return {
+                'type': 'pull_response',
+                'status': 'error',
+                'error': str(e),
+                'timestamp': time.time()
+            }
+    
+    async def _handle_sync_status(self, message: Dict[str, Any], 
+                                 peer: PeerInfo) -> Dict[str, Any]:
+        """Handle sync status request"""
+        return {
+            'type': 'status_response',
+            'node_id': self.node_id,
+            'online_peers': len([p for p in self.known_peers.values() if p.is_online]),
+            'sync_version': 5,
+            'timestamp': time.time()
+        }
+    
+    async def verify_and_apply(self, deltas: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Verify deltas with IntegrityVerifier and apply with DeltaEngine"""
+        applied_count = 0
+        failed_count = 0
+        
+        for delta in deltas:
+            try:
+                # Verify integrity if verifier available
+                if self.integrity_verifier:
+                    verification_result = await self.integrity_verifier.verify_delta(delta)
+                    if not verification_result.get('valid', False):
+                        self.logger.warning(f"Delta failed verification: {verification_result.get('errors')}")
+                        failed_count += 1
+                        continue
+                
+                # Apply delta if engine available
+                if self.delta_engine:
+                    success = await self.delta_engine.apply_delta(delta)
+                    if success:
+                        applied_count += 1
+                    else:
+                        failed_count += 1
+                else:
+                    # No delta engine, just count as applied
+                    applied_count += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Error processing delta: {e}")
+                failed_count += 1
+        
+        self.logger.info(f"Applied {applied_count} deltas, failed {failed_count}")
+        return applied_count, failed_count
+    
+    async def discover_peers(self) -> List[str]:
+        """Discover available peers"""
+        if not self.running:
+            return []
+        
+        # Trigger discovery broadcast
+        if self.discovery_enabled:
+            await self._broadcast_discovery()
+            await asyncio.sleep(2)  # Wait for responses
+        
+        # Return online peers
+        online_peers = [peer_id for peer_id, peer in self.known_peers.items() if peer.is_online]
+        self.logger.info(f"Discovered {len(online_peers)} online peers")
+        
+        return online_peers
+    
+    async def push_deltas(self, deltas: List[Dict[str, Any]]) -> bool:
+        """Push deltas to available peers"""
+        if not deltas:
+            return True
+        
+        online_peers = [p for p in self.known_peers.values() if p.is_online]
+        
+        if not online_peers:
+            # Queue for offline mode
+            self.offline_queue.append({
+                'type': 'sync_deltas',
+                'deltas': deltas,
+                'timestamp': time.time()
+            })
+            self.logger.info(f"Queued {len(deltas)} deltas for offline sync")
+            return True
+        
+        return await self._sync_deltas_to_peers(deltas)
+    
+    async def _sync_deltas_to_peers(self, deltas: List[Dict[str, Any]]) -> bool:
+        """Sync deltas to connected peers"""
+        success_count = 0
+        
+        for peer in [p for p in self.known_peers.values() if p.is_online]:
+            try:
+                success = await self._push_to_peer(peer, deltas)
+                if success:
+                    success_count += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Failed to sync with peer {peer.node_id}: {e}")
+                peer.connection_failures += 1
+                if peer.connection_failures > 3:
+                    peer.is_online = False
+        
+        return success_count > 0
+    
+    async def _push_to_peer(self, peer: PeerInfo, deltas: List[Dict[str, Any]]) -> bool:
+        """Push deltas to a specific peer"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(peer.address, peer.port),
+                timeout=self.timeout_seconds
+            )
+            
+            # Handshake
+            handshake_peer = await self._peer_handshake(reader, writer)
+            if not handshake_peer:
+                return False
+            
+            # Send deltas
+            push_message = {
+                'type': 'push_deltas',
+                'deltas': deltas,
+                'from_node': self.node_id,
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, push_message)
+            
+            # Get response
+            response = await self._receive_json(reader)
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            if response and response.get('status') == 'success':
+                peer.last_seen = datetime.now(timezone.utc)
+                peer.connection_failures = 0
+                return True
+            
+        except Exception as e:
+            self.logger.debug(f"Push to peer {peer.node_id} failed: {e}")
+            
+        return False
+    
+    async def pull_from_peers(self) -> List[Dict[str, Any]]:
+        """Pull deltas from available peers"""
+        all_deltas = []
+        
+        for peer in [p for p in self.known_peers.values() if p.is_online]:
+            try:
+                deltas = await self._pull_from_peer(peer)
+                all_deltas.extend(deltas)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to pull from peer {peer.node_id}: {e}")
+        
+        return all_deltas
+    
+    async def _pull_from_peer(self, peer: PeerInfo) -> List[Dict[str, Any]]:
+        """Pull deltas from a specific peer"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(peer.address, peer.port),
+                timeout=self.timeout_seconds
+            )
+            
+            handshake_peer = await self._peer_handshake(reader, writer)
+            if not handshake_peer:
+                return []
+            
+            pull_message = {
+                'type': 'pull_request',
+                'from_node': self.node_id,
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, pull_message)
+            response = await self._receive_json(reader)
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            if response and 'deltas' in response:
+                return response['deltas']
+            
+        except Exception as e:
+            self.logger.debug(f"Pull from peer {peer.node_id} failed: {e}")
+            
+        return []
+    
+    async def _disconnect_peer(self, peer_id: str):
+        """Disconnect from a peer"""
+        try:
+            self.active_connections.discard(peer_id)
+            if peer_id in self.known_peers:
+                self.known_peers[peer_id].is_online = False
+        except Exception as e:
+            self.logger.error(f"Error disconnecting from {peer_id}: {e}")
+    
+    async def get_protocol_status(self) -> Dict[str, Any]:
+        """Get detailed protocol status"""
+        online_peers = [p for p in self.known_peers.values() if p.is_online]
+        
+        return {
+            'node_id': self.node_id,
+            'mode': self.mode,
+            'running': self.running,
+            'listening_port': self.listen_port,
+            'discovery_enabled': self.discovery_enabled,
+            'total_known_peers': len(self.known_peers),
+            'online_peers': len(online_peers),
+            'active_connections': len(self.active_connections),
+            'offline_queue_size': len(self.offline_queue),
+            'peers': [p.to_dict() for p in online_peers[:10]]  # Limit output
+        }
+
+    async def add_manual_peer(self, node_id: str, address: str, port: int):
+        """Manually add a peer"""
+        peer = PeerInfo(node_id, address, port, ['sync'])
+        self.known_peers[node_id] = peer
+        self.logger.info(f"Added manual peer: {node_id} at {address}:{port}")
+
+    async def _request_sync_from_peers(self):
+        """Request sync from all peers"""
+        for peer in [p for p in self.known_peers.values() if p.is_online]:
+            try:
+                await self._pull_from_peer(peer)
+            except Exception as e:
+                self.logger.error(f"Failed to request sync from {peer.node_id}: {e}")
+
+
+# sp_subsystem/crdt_models.py (New v5 Component)
+class CRDTUserState:
+    """CRDT model for user state synchronization"""
+    
+    def __init__(self, user_id: str, node_id: str):
+        self.user_id = user_id
+        self.node_id = node_id
+        self.state = {}
+        self.vector_clock = {node_id: 0}
+        self.tombstones = {}  # For deleted keys
+        
+    def set_field(self, field: str, value: Any) -> Dict[str, Any]:
+        """Set a field and return delta"""
+        self.vector_clock[self.node_id] = self.vector_clock.get(self.node_id, 0) + 1
+        timestamp = time.time()
+        
+        # Remove from tombstones if present
+        if field in self.tombstones:
+            del self.tombstones[field]
+        
+        old_value = self.state.get(field)
+        self.state[field] = {
+            'value': value,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy()
+        }
+        
+        return {
+            'type': 'user_state_set',
+            'entity_id': self.user_id,
+            'field': field,
+            'value': value,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy(),
+            'old_value': old_value
+        }
+    
+    def delete_field(self, field: str) -> Dict[str, Any]:
+        """Delete a field and return delta"""
+        self.vector_clock[self.node_id] = self.vector_clock.get(self.node_id, 0) + 1
+        timestamp = time.time()
+        
+        old_value = self.state.get(field)
+        
+        if field in self.state:
+            # Add tombstone
+            self.tombstones[field] = {
+                'timestamp': timestamp,
+                'node_id': self.node_id,
+                'vector_clock': self.vector_clock.copy()
+            }
+            del self.state[field]
+        
+        return {
+            'type': 'user_state_delete',
+            'entity_id': self.user_id,
+            'field': field,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy(),
+            'old_value': old_value
+        }
+    
+    def merge_delta(self, delta: Dict[str, Any]) -> bool:
+        """Merge incoming delta using CRDT rules"""
+        try:
+            field = delta.get('field')
+            delta_timestamp = delta.get('timestamp', 0)
+            delta_node = delta.get('node_id')
+            delta_vector_clock = delta.get('vector_clock', {})
+            
+            # Update our vector clock
+            for node, clock in delta_vector_clock.items():
+                self.vector_clock[node] = max(self.vector_clock.get(node, 0), clock)
+            
+            if delta.get('type') == 'user_state_set':
+                value = delta.get('value')
+                
+                # Check if we should accept this update
+                current = self.state.get(field)
+                tombstone = self.tombstones.get(field)
+                
+                accept_update = False
+                
+                if not current and not tombstone:
+                    # New field
+                    accept_update = True
+                elif tombstone:
+                    # Field was deleted - accept if delta is newer
+                    if delta_timestamp > tombstone.get('timestamp', 0):
+                        accept_update = True
+                        del self.tombstones[field]
+                    elif delta_timestamp == tombstone.get('timestamp', 0):
+                        # Same timestamp - use node_id as tiebreaker
+                        if delta_node > tombstone.get('node_id', ''):
+                            accept_update = True
+                            del self.tombstones[field]
+                else:
+                    # Field exists - accept if delta is newer
+                    current_timestamp = current.get('timestamp', 0)
+                    if delta_timestamp > current_timestamp:
+                        accept_update = True
+                    elif delta_timestamp == current_timestamp:
+                        # Same timestamp - use node_id as tiebreaker (hash comparison)
+                        current_hash = self._hash_value(current.get('value'))
+                        delta_hash = self._hash_value(value)
+                        if delta_hash > current_hash:
+                            accept_update = True
+                
+                if accept_update:
+                    self.state[field] = {
+                        'value': value,
+                        'timestamp': delta_timestamp,
+                        'node_id': delta_node,
+                        'vector_clock': delta_vector_clock.copy()
+                    }
+                    return True
+                    
+            elif delta.get('type') == 'user_state_delete':
+                current = self.state.get(field)
+                tombstone = self.tombstones.get(field)
+                
+                accept_delete = False
+                
+                if current:
+                    # Field exists - accept delete if delta is newer
+                    current_timestamp = current.get('timestamp', 0)
+                    if delta_timestamp > current_timestamp:
+                        accept_delete = True
+                    elif delta_timestamp == current_timestamp:
+                        # Same timestamp - use node_id as tiebreaker
+                        if delta_node > current.get('node_id', ''):
+                            accept_delete = True
+                elif not tombstone:
+                    # No current value or tombstone - accept delete
+                    accept_delete = True
+                elif tombstone:
+                    # Already deleted - accept if delta is newer
+                    if delta_timestamp > tombstone.get('timestamp', 0):
+                        accept_delete = True
+                
+                if accept_delete:
+                    if field in self.state:
+                        del self.state[field]
+                    self.tombstones[field] = {
+                        'timestamp': delta_timestamp,
+                        'node_id': delta_node,
+                        'vector_clock': delta_vector_clock.copy()
+                    }
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            return False
+    
+    def _hash_value(self, value: Any) -> str:
+        """Create hash of value for tiebreaking"""
+        value_str = json.dumps(value, sort_keys=True, default=str)
+        return hashlib.sha256(value_str.encode()).hexdigest()
+    
+    def get_state(self) -> Dict[str, Any]:
+        """Get current state values only"""
+        return {field: data['value'] for field, data in self.state.items()}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict"""
+        return {
+            'user_id': self.user_id,
+            'node_id': self.node_id,
+            'state': self.state,
+            'vector_clock': self.vector_clock,
+            'tombstones': self.tombstones
+        }
+
+
+class CRDTFileChunk:
+    """CRDT model for file chunk synchronization"""
+    
+    def __init__(self, file_id: str, chunk_id: str, node_id: str):
+        self.file_id = file_id
+        self.chunk_id = chunk_id
+        self.node_id = node_id
+        self.content = b""
+        self.metadata = {}
+        self.version = 0
+        self.vector_clock = {node_id: 0}
+        self.is_deleted = False
+        
+    def update_content(self, content: bytes, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Update chunk content and return delta"""
+        self.vector_clock[self.node_id] = self.vector_clock.get(self.node_id, 0) + 1
+        self.version += 1
+        timestamp = time.time()
+        
+        old_content = self.content
+        old_metadata = self.metadata.copy()
+        
+        self.content = content
+        self.metadata.update(metadata or {})
+        self.is_deleted = False
+        
+        return {
+            'type': 'file_chunk_update',
+            'entity_id': f"{self.file_id}#{self.chunk_id}",
+            'file_id': self.file_id,
+            'chunk_id': self.chunk_id,
+            'content': content,
+            'metadata': metadata or {},
+            'version': self.version,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy(),
+            'old_content_hash': self._hash_content(old_content)
+        }
+    
+    def delete_chunk(self) -> Dict[str, Any]:
+        """Mark chunk as deleted and return delta"""
+        self.vector_clock[self.node_id] = self.vector_clock.get(self.node_id, 0) + 1
+        self.version += 1
+        timestamp = time.time()
+        
+        self.is_deleted = True
+        self.content = b""
+        
+        return {
+            'type': 'file_chunk_delete',
+            'entity_id': f"{self.file_id}#{self.chunk_id}",
+            'file_id': self.file_id,
+            'chunk_id': self.chunk_id,
+            'version': self.version,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy()
+        }
+    
+    def merge_delta(self, delta: Dict[str, Any]) -> bool:
+        """Merge incoming delta using CRDT rules"""
+        try:
+            delta_version = delta.get('version', 0)
+            delta_timestamp = delta.get('timestamp', 0)
+            delta_node = delta.get('node_id')
+            delta_vector_clock = delta.get('vector_clock', {})
+            
+            # Update vector clock
+            for node, clock in delta_vector_clock.items():
+                self.vector_clock[node] = max(self.vector_clock.get(node, 0), clock)
+            
+            # Only accept if delta is newer
+            accept_delta = False
+            
+            if delta_version > self.version:
+                accept_delta = True
+            elif delta_version == self.version:
+                # Same version - use timestamp + node_id tiebreaker
+                if delta_timestamp > self.metadata.get('timestamp', 0):
+                    accept_delta = True
+                elif delta_timestamp == self.metadata.get('timestamp', 0):
+                    # Use content hash for deterministic tiebreaking
+                    if delta.get('type') == 'file_chunk_update':
+                        delta_content = delta.get('content', b"")
+                        delta_hash = self._hash_content(delta_content)
+                        current_hash = self._hash_content(self.content)
+                        accept_delta = delta_hash > current_hash
+                    else:
+                        accept_delta = delta_node > self.node_id
+            
+            if accept_delta:
+                if delta.get('type') == 'file_chunk_update':
+                    self.content = delta.get('content', b"")
+                    self.metadata.update(delta.get('metadata', {}))
+                    self.metadata['timestamp'] = delta_timestamp
+                    self.is_deleted = False
+                elif delta.get('type') == 'file_chunk_delete':
+                    self.content = b""
+                    self.is_deleted = True
+                
+                self.version = delta_version
+                return True
+                
+            return False
+            
+        except Exception as e:
+            return False
+    
+    def _hash_content(self, content: bytes) -> str:
+        """Hash content for comparison"""
+        return hashlib.sha256(content).hexdigest()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict"""
+        return {
+            'file_id': self.file_id,
+            'chunk_id': self.chunk_id,
+            'node_id': self.node_id,
+            'content': self.content,
+            'metadata': self.metadata,
+            'version': self.version,
+            'vector_clock': self.vector_clock,
+            'is_deleted': self.is_deleted
+        }
+
+
+# Enhanced Delta Engine with CRDT support
+class EnhancedDeltaEngine:
+    """Enhanced Delta Engine with CRDT support and pending delta management"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger("DeltaEngine")
+        self.node_id = str(uuid.uuid4())
+        
+        # CRDT models
+        self.crdt_user_states = {}  # user_id -> CRDTUserState
+        self.crdt_file_chunks = {}  # file_id#chunk_id -> CRDTFileChunk
+        
+        # Pending deltas for sync
+        self.pending_deltas = []
+        
+    async def get_pending_deltas(self) -> List[Dict[str, Any]]:
+        """Get pending deltas for synchronization"""
+        # Return copy and clear pending
+        deltas = self.pending_deltas.copy()
+        self.pending_deltas.clear()
+        return deltas
+    
+    async def create_user_state_delta(self, user_id: str, field: str, value: Any) -> Dict[str, Any]:
+        """Create CRDT delta for user state change"""
+        if user_id not in self.crdt_user_states:
+            self.crdt_user_states[user_id] = CRDTUserState(user_id, self.node_id)
+        
+        user_state = self.crdt_user_states[user_id]
+        delta = user_state.set_field(field, value)
+        
+        # Add to pending deltas
+        self.pending_deltas.append(delta)
+        
+        return delta
+    
+    async def create_file_chunk_delta(self, file_id: str, chunk_id: str, 
+                                    content: bytes, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Create CRDT delta for file chunk change"""
+        chunk_key = f"{file_id}#{chunk_id}"
+        
+        if chunk_key not in self.crdt_file_chunks:
+            self.crdt_file_chunks[chunk_key] = CRDTFileChunk(file_id, chunk_id, self.node_id)
+        
+        file_chunk = self.crdt_file_chunks[chunk_key]
+        delta = file_chunk.update_content(content, metadata)
+        
+        # Add to pending deltas
+        self.pending_deltas.append(delta)
+        
+        return delta
+    
+    async def apply_delta(self, delta: Dict[str, Any]) -> bool:
+        """Apply a delta (fallback implementation)"""
+        try:
+            self.logger.info(f"Applying delta: {delta.get('type')}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to apply delta: {e}")
+            return False
+    
+    async def apply_crdt_delta(self, delta: Dict[str, Any]) -> bool:
+        """Apply CRDT delta with proper conflict resolution"""
+        try:
+            delta_type = delta.get('type')
+            
+            if delta_type in ['user_state_set', 'user_state_delete']:
+                user_id = delta.get('entity_id')
+                if user_id not in self.crdt_user_states:
+                    self.crdt_user_states[user_id] = CRDTUserState(user_id, self.node_id)
+                
+                return self.crdt_user_states[user_id].merge_delta(delta)
+                
+            elif delta_type in ['file_chunk_update', 'file_chunk_delete']:
+                entity_id = delta.get('entity_id')
+                if '#' in entity_id:
+                    file_id, chunk_id = entity_id.split('#', 1)
+                    
+                    if entity_id not in self.crdt_file_chunks:
+                        self.crdt_file_chunks[entity_id] = CRDTFileChunk(file_id, chunk_id, self.node_id)
+                    
+                    return self.crdt_file_chunks[entity_id].merge_delta(delta)
+            
+            # Fallback to regular delta application
+            return await self.apply_delta(delta)
+            
+        except Exception as e:
+            self.logger.error(f"CRDT delta application failed: {e}")
+            return False
+
+    async def create_manual_delta(self, entity_id: str, operation: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a manual delta for testing/demo purposes"""
+        return {
+            'type': f'manual_{operation}',
+            'entity_id': entity_id,
+            'data': data,
+            'timestamp': time.time(),
+            'node_id': self.node_id,
+            'operation': operation
+        }
+
+
+# Sync Coordinator (Fixed imports)
+class SyncCoordinator:
+    """Central coordinator for Ghost synchronization operations"""
+    
+    def __init__(self, config_file: str = None):
+        self.config_file = config_file or "sp_sub_config.yaml"
+        self.config = self._load_config()
+        self.logger = logging.getLogger("SyncCoordinator")
+        
+        # Core components
+        self.sync_protocol = None
+        self.delta_engine = None
+        self.integrity_verifier = None
+        
+        # State management
+        self.node_id = str(uuid.uuid4())
+        self.sync_state = {}
+        self.sync_state_file = "ghost_sync_state.json"
+        
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from file"""
+        try:
+            import yaml
+            with open(self.config_file, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            self.logger.warning(f"Could not load config from {self.config_file}: {e}")
+            return self._get_default_config()
+    
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration"""
+        return {
+            'sync': {
+                'interval_seconds': 300,
+                'batch_size': 100,
+                'max_retries': 3,
+                'timeout_seconds': 30,
+                'offline_mode': True
+            },
+            'protocol': {
+                'mode': 'mesh',
+                'discovery_enabled': True,
+                'encryption_enabled': True,
+                'fallback_modes': ['offline'],
+                'listen_port': 8443,
+                'discovery_port': 8444,
+                'timeout_seconds': 10,
+                'max_connections': 20
+            },
+            'delta': {
+                'compression_enabled': True,
+                'max_delta_size': 1048576,
+                'crdt_mode': True
+            }
+        }
+    
+    async def initialize(self):
+        """Initialize sync coordinator and components"""
+        try:
+            # Load existing state
+            await self._load_sync_state()
+            
+            # Initialize delta engine
+            self.delta_engine = EnhancedDeltaEngine(self.config.get('delta', {}))
+            self.delta_engine.node_id = self.node_id
+            
+            # Initialize sync protocol
+            protocol_config = self.config.get('protocol', {})
+            self.sync_protocol = GhostSyncProtocol(
+                protocol_config, 
+                self.integrity_verifier, 
+                self.delta_engine
+            )
+            await self.sync_protocol.initialize(self.node_id)
+            
+            self.logger.info(f"Sync coordinator initialized with node_id: {self.node_id[:8]}...")
+            
+        except Exception as e:
+            self.logger.error(f"Coordinator initialization failed: {e}")
+            raise
+    
+    async def _load_sync_state(self):
+        """Load sync state from disk"""
+        try:
+            with open(self.sync_state_file, 'r') as f:
+                self.sync_state = json.load(f)
+                if 'node_id' in self.sync_state:
+                    self.node_id = self.sync_state['node_id']
+        except FileNotFoundError:
+            self.logger.info("No existing sync state found, starting fresh")
+        except Exception as e:
+            self.logger.error(f"Failed to load sync state: {e}")
+    
+    async def save_sync_state(self):
+        """Save sync state to disk"""
+        try:
+            self.sync_state.update({
+                'node_id': self.node_id,
+                'last_save': datetime.now(timezone.utc).isoformat(),
+                'version_vector': getattr(self, 'version_vector', {}),
+                'sync_count': self.sync_state.get('sync_count', 0)
+            })
+            
+            with open(self.sync_state_file, 'w') as f:
+                json.dump(self.sync_state, f, indent=2)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save sync state: {e}")
+    
+    async def start_sync_cycle(self, peers: List[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+        """Start a complete sync cycle"""
+        start_time = time.time()
+        result = {
+            'status': 'started',
+            'dry_run': dry_run,
+            'start_time': datetime.now(timezone.utc).isoformat(),
+            'peers_requested': peers or [],
+            'peers_contacted': 0,
+            'deltas_processed': 0,
+            'conflicts_found': 0,
+            'errors': []
+        }
+        
+        try:
+            self.logger.info(f"Starting sync cycle (dry_run={dry_run})")
+            
+            # Discover peers if none specified
+            if not peers:
+                peers = await self.sync_protocol.discover_peers()
+            
+            result['peers_contacted'] = len(peers)
+            
+            if not peers:
+                self.logger.warning("No peers available for sync")
+                result['status'] = 'no_peers'
+                return result
+            
+            # Pull deltas from peers
+            incoming_deltas = await self.sync_protocol.pull_from_peers()
+            result['deltas_received'] = len(incoming_deltas)
+            
+            # Push our pending deltas
+            if self.delta_engine:
+                pending_deltas = await self.delta_engine.get_pending_deltas()
+                if pending_deltas and not dry_run:
+                    push_success = await self.sync_protocol.push_deltas(pending_deltas)
+                    result['deltas_pushed'] = len(pending_deltas) if push_success else 0
+                else:
+                    result['deltas_pushed'] = 0
+            
+            # Process incoming deltas
+            if incoming_deltas and not dry_run:
+                applied, failed = await self.sync_protocol.verify_and_apply(incoming_deltas)
+                result['deltas_applied'] = applied
+                result['deltas_failed'] = failed
+                result['deltas_processed'] = applied + failed
+            else:
+                result['deltas_processed'] = len(incoming_deltas)
+                result['deltas_applied'] = 0
+                result['deltas_failed'] = 0
+            
+            # Update sync state
+            if not dry_run:
+                self.sync_state['sync_count'] = self.sync_state.get('sync_count', 0) + 1
+                self.sync_state['last_sync_time'] = datetime.now(timezone.utc).isoformat()
+                await self.save_sync_state()
+            
+            result['status'] = 'success'
+            result['changes_applied'] = not dry_run and (result['deltas_applied'] > 0 or result['deltas_pushed'] > 0)
+            
+        except Exception as e:
+            self.logger.error(f"Sync cycle failed: {e}")
+            result['status'] = 'failed'
+            result['error'] = str(e)
+            result['errors'].append(str(e))
+        
+        finally:
+            result['duration_seconds'] = time.time() - start_time
+            result['end_time'] = datetime.now(timezone.utc).isoformat()
+        
+        return result
+    
+    async def get_sync_status(self) -> Dict[str, Any]:
+        """Get current sync status"""
+        status = {
+            'node_id': self.node_id,
+            'sync_in_progress': False,  # Would need to track this
+            'last_sync_time': self.sync_state.get('last_sync_time', 'Never'),
+            'sync_count': self.sync_state.get('sync_count', 0),
+            'pending_conflicts': len(self.sync_state.get('pending_conflicts', [])),
+            'version_vector': self.sync_state.get('version_vector', {}),
+            'checkpoint_count': self.sync_state.get('checkpoint_count', 0)
+        }
+        
+        # Add protocol status if available
+        if self.sync_protocol:
+            protocol_status = await self.sync_protocol.get_protocol_status()
+            status.update({
+                'protocol_running': protocol_status['running'],
+                'known_peers': protocol_status['total_known_peers'],
+                'online_peers': protocol_status['online_peers'],
+                'offline_queue_size': protocol_status['offline_queue_size']
+            })
+        
+        return status
+
+
+# Event Integration (Fixed imports)
+class SPEventIntegration:
+    """Enhanced Event Bus integration for SP-SUB v5"""
+    
+    def __init__(self, sync_coordinator, event_bus=None):
+        self.sync_coordinator = sync_coordinator
+        self.event_bus = event_bus
+        self.logger = logging.getLogger("SPEventIntegration")
+        
+        # Event handlers
+        self.handlers = {}
+        self.running = False
+        
+    async def initialize(self):
+        """Initialize event integration"""
+        if self.event_bus:
+            await self._subscribe_to_events()
+            self.running = True
+            self.logger.info("Event integration initialized")
+        else:
+            self.logger.warning("No event bus provided - running without event integration")
+    
+    async def shutdown(self):
+        """Shutdown event integration"""
+        self.running = False
+        if self.event_bus:
+            await self._unsubscribe_from_events()
+    
+    async def _subscribe_to_events(self):
+        """Subscribe to relevant Event Bus events"""
+        try:
+            # Core sync events
+            await self.event_bus.subscribe('SYNC_REQUEST', self._on_sync_request)
+            await self.event_bus.subscribe('SYNC_RESPONSE', self._on_sync_response)
+            
+            # File system events
+            await self.event_bus.subscribe('FILE_CREATED', self._on_file_created)
+            await self.event_bus.subscribe('FILE_MODIFIED', self._on_file_modified)
+            await self.event_bus.subscribe('FILE_DELETED', self._on_file_deleted)
+            
+            self.logger.info("Subscribed to event bus events")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe to events: {e}")
+    
+    async def _unsubscribe_from_events(self):
+        """Unsubscribe from all events"""
+        try:
+            events = [
+                'SYNC_REQUEST', 'SYNC_RESPONSE', 'FILE_CREATED', 
+                'FILE_MODIFIED', 'FILE_DELETED'
+            ]
+            
+            for event in events:
+                if hasattr(self.event_bus, 'unsubscribe'):
+                    await self.event_bus.unsubscribe(event, self.handlers.get(event))
+                
+        except Exception as e:
+            self.logger.error(f"Failed to unsubscribe from events: {e}")
+    
+    async def _on_sync_request(self, event_data: Dict[str, Any]):
+        """Handle sync request from event bus"""
+        try:
+            self.logger.info(f"Received sync request: {event_data}")
+            
+            peers = event_data.get('peers')
+            dry_run = event_data.get('dry_run', False)
+            
+            result = await self.sync_coordinator.start_sync_cycle(
+                peers=peers, 
+                dry_run=dry_run
+            )
+            
+            await self._publish_event('SYNC_COMPLETED', {
+                'request_id': event_data.get('request_id'),
+                'result': result,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+            
+        except Exception as e:
+            self.logger.error(f"Error handling sync request: {e}")
+    
+    async def _on_sync_response(self, event_data: Dict[str, Any]):
+        """Handle sync response from event bus"""
+        try:
+            deltas = event_data.get('deltas', [])
+            source_node = event_data.get('source_node')
+            
+            if deltas and self.sync_coordinator.sync_protocol:
+                applied, failed = await self.sync_coordinator.sync_protocol.verify_and_apply(deltas)
+                
+                await self._publish_event('SYNC_MERGE_STATUS', {
+                    'source_node': source_node,
+                    'applied': applied,
+                    'failed': failed,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+                    
+        except Exception as e:
+            self.logger.error(f"Error handling sync response: {e}")
+    
+    async def _on_file_created(self, event_data: Dict[str, Any]):
+        """Handle file creation event"""
+        try:
+            file_path = event_data.get('path')
+            if file_path and self.sync_coordinator.delta_engine:
+                delta = await self.sync_coordinator.delta_engine.create_manual_delta(
+                    file_path, 'create', event_data
+                )
+                await self._queue_delta_for_sync(delta)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling file creation: {e}")
+    
+    async def _on_file_modified(self, event_data: Dict[str, Any]):
+        """Handle file modification event"""
+        try:
+            file_path = event_data.get('path')
+            if file_path and self.sync_coordinator.delta_engine:
+                delta = await self.sync_coordinator.delta_engine.create_manual_delta(
+                    file_path, 'update', event_data
+                )
+                await self._queue_delta_for_sync(delta)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling file modification: {e}")
+    
+    async def _on_file_deleted(self, event_data: Dict[str, Any]):
+        """Handle file deletion event"""
+        try:
+            file_path = event_data.get('path')
+            if file_path and self.sync_coordinator.delta_engine:
+                delta = await self.sync_coordinator.delta_engine.create_manual_delta(
+                    file_path, 'delete', event_data
+                )
+                await self._queue_delta_for_sync(delta)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling file deletion: {e}")
+    
+    async def _queue_delta_for_sync(self, delta: Dict[str, Any]):
+        """Queue delta for synchronization"""
+        try:
+            if self.sync_coordinator.sync_protocol:
+                await self.sync_coordinator.sync_protocol.push_deltas([delta])
+            else:
+                self.logger.warning("No sync protocol available to queue delta")
+                
+        except Exception as e:
+            self.logger.error(f"Error queueing delta for sync: {e}")
+    
+    async def _publish_event(self, event_type: str, event_data: Dict[str, Any]):
+        """Publish event to event bus"""
+        try:
+            if self.event_bus and hasattr(self.event_bus, 'publish'):
+                await self.event_bus.publish(event_type, event_data)
+            else:
+                self.logger.debug(f"Would publish event {event_type}: {event_data}")
+                
+        except Exception as e:
+            self.logger.error(f"Error publishing event {event_type}: {e}")
+
+
+# Simple CLI Implementation
+class GhostSyncCLI:
+    """Simple CLI for Ghost Sync operations"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger("GhostSync")
+        self.coordinator = None
+        
+    async def run_command(self, command: str, **kwargs) -> Dict[str, Any]:
+        """Run a sync command"""
+        try:
+            if not self.coordinator:
+                self.coordinator = SyncCoordinator()
+                await self.coordinator.initialize()
+            
+            if command == 'sync':
+                return await self.coordinator.start_sync_cycle(
+                    peers=kwargs.get('peers'),
+                    dry_run=kwargs.get('dry_run', False

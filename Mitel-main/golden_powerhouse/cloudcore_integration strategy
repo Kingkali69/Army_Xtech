@@ -1,0 +1,1992 @@
+# sp_subsystem_v5_complete.py
+# G.Legion Framework - Complete SP + SC Subsystem Integration v5 (Production Ready)
+
+import asyncio
+import logging
+import json
+import socket
+import struct
+import time
+import hashlib
+import uuid
+import yaml
+import os
+from typing import Dict, List, Any, Optional, Set, Tuple
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from abc import ABC, abstractmethod
+
+# ============================================================================
+# BASE SUBSYSTEM INTERFACE
+# ============================================================================
+
+class BaseSubsystem(ABC):
+    """Base class for all G.Legion subsystems"""
+    
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
+        self.running = False
+        self.initialized = False
+        self.subsystem_id = str(uuid.uuid4())[:8]
+        self.logger = logging.getLogger(f"G.Legion.{self.__class__.__name__}")
+        self.start_time = None
+        
+    @abstractmethod
+    async def initialize(self):
+        """Initialize the subsystem"""
+        pass
+    
+    @abstractmethod
+    async def start(self):
+        """Start the subsystem"""
+        pass
+    
+    @abstractmethod
+    async def stop(self):
+        """Stop the subsystem"""
+        pass
+    
+    async def health_check(self) -> bool:
+        """Perform health check"""
+        return self.running and self.initialized
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get subsystem status"""
+        return {
+            'subsystem_id': self.subsystem_id,
+            'running': self.running,
+            'initialized': self.initialized,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'uptime': (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
+        }
+
+# ============================================================================
+# PEER MANAGEMENT (SP-SUB)
+# ============================================================================
+
+class PeerInfo:
+    """Information about a sync peer"""
+    def __init__(self, node_id: str, address: str, port: int, 
+                 capabilities: List[str], last_seen: Optional[datetime] = None):
+        self.node_id = node_id
+        self.address = address
+        self.port = port
+        self.capabilities = capabilities
+        self.last_seen = last_seen or datetime.now(timezone.utc)
+        self.connection_failures = 0
+        self.is_online = True
+        self.sync_version = 1
+    
+    @property
+    def endpoint(self) -> str:
+        return f"{self.address}:{self.port}"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'node_id': self.node_id,
+            'address': self.address,
+            'port': self.port,
+            'capabilities': self.capabilities,
+            'last_seen': self.last_seen.isoformat(),
+            'is_online': self.is_online,
+            'connection_failures': self.connection_failures,
+            'sync_version': self.sync_version
+        }
+
+# ============================================================================
+# CRDT MODELS (SP-SUB)
+# ============================================================================
+
+class CRDTUserState:
+    """CRDT model for user state synchronization"""
+    
+    def __init__(self, user_id: str, node_id: str):
+        self.user_id = user_id
+        self.node_id = node_id
+        self.state = {}
+        self.vector_clock = {node_id: 0}
+        self.tombstones = {}  # For deleted keys
+        
+    def set_field(self, field: str, value: Any) -> Dict[str, Any]:
+        """Set a field and return delta"""
+        self.vector_clock[self.node_id] = self.vector_clock.get(self.node_id, 0) + 1
+        timestamp = time.time()
+        
+        # Remove from tombstones if present
+        if field in self.tombstones:
+            del self.tombstones[field]
+        
+        old_value = self.state.get(field)
+        self.state[field] = {
+            'value': value,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy()
+        }
+        
+        return {
+            'type': 'user_state_set',
+            'entity_id': self.user_id,
+            'field': field,
+            'value': value,
+            'timestamp': timestamp,
+            'node_id': self.node_id,
+            'vector_clock': self.vector_clock.copy(),
+            'old_value': old_value
+        }
+    
+    def merge_delta(self, delta: Dict[str, Any]) -> bool:
+        """Merge incoming delta using CRDT rules"""
+        try:
+            field = delta.get('field')
+            delta_timestamp = delta.get('timestamp', 0)
+            delta_node = delta.get('node_id')
+            delta_vector_clock = delta.get('vector_clock', {})
+            
+            # Update our vector clock
+            for node, clock in delta_vector_clock.items():
+                self.vector_clock[node] = max(self.vector_clock.get(node, 0), clock)
+            
+            if delta.get('type') == 'user_state_set':
+                value = delta.get('value')
+                
+                # Check if we should accept this update
+                current = self.state.get(field)
+                tombstone = self.tombstones.get(field)
+                
+                accept_update = False
+                
+                if not current and not tombstone:
+                    accept_update = True
+                elif tombstone:
+                    if delta_timestamp > tombstone.get('timestamp', 0):
+                        accept_update = True
+                        del self.tombstones[field]
+                    elif delta_timestamp == tombstone.get('timestamp', 0):
+                        if delta_node > tombstone.get('node_id', ''):
+                            accept_update = True
+                            del self.tombstones[field]
+                else:
+                    current_timestamp = current.get('timestamp', 0)
+                    if delta_timestamp > current_timestamp:
+                        accept_update = True
+                    elif delta_timestamp == current_timestamp:
+                        current_hash = self._hash_value(current.get('value'))
+                        delta_hash = self._hash_value(value)
+                        if delta_hash > current_hash:
+                            accept_update = True
+                
+                if accept_update:
+                    self.state[field] = {
+                        'value': value,
+                        'timestamp': delta_timestamp,
+                        'node_id': delta_node,
+                        'vector_clock': delta_vector_clock.copy()
+                    }
+                    return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def _hash_value(self, value: Any) -> str:
+        """Create hash of value for tiebreaking"""
+        value_str = json.dumps(value, sort_keys=True, default=str)
+        return hashlib.sha256(value_str.encode()).hexdigest()
+    
+    def get_state(self) -> Dict[str, Any]:
+        """Get current state values only"""
+        return {field: data['value'] for field, data in self.state.items()}
+
+# ============================================================================
+# SESSION CONTROL SUBSYSTEM (SC-SUB)
+# ============================================================================
+
+class SessionManager:
+    """Manages user sessions and access control"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger("SessionManager")
+        self.sessions = {}
+        self.user_sessions = {}
+        self.max_sessions = config.get('max_sessions', 10000)
+        self.session_timeout = config.get('session_timeout', 3600)
+        self.max_user_sessions = config.get('max_user_sessions', 5)
+        
+    async def create_session(self, user_id: str, metadata: Dict = None) -> str:
+        """Create a new session"""
+        # Check limits
+        if len(self.sessions) >= self.max_sessions:
+            raise RuntimeError("Maximum sessions exceeded")
+        
+        user_session_count = len(self.user_sessions.get(user_id, []))
+        if user_session_count >= self.max_user_sessions:
+            # Clean up oldest session for this user
+            oldest_session = min(self.user_sessions[user_id], 
+                               key=lambda s: self.sessions[s]['created_at'])
+            await self.destroy_session(oldest_session)
+        
+        # Create session
+        session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        session_data = {
+            'session_id': session_id,
+            'user_id': user_id,
+            'created_at': datetime.now(),
+            'last_activity': datetime.now(),
+            'metadata': metadata or {}
+        }
+        
+        self.sessions[session_id] = session_data
+        
+        # Track user sessions
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = []
+        self.user_sessions[user_id].append(session_id)
+        
+        self.logger.debug(f"Created session {session_id} for user {user_id}")
+        return session_id
+    
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get session data"""
+        if session_id not in self.sessions:
+            return None
+        
+        session = self.sessions[session_id]
+        
+        # Check if expired
+        if self._is_expired(session):
+            await self.destroy_session(session_id)
+            return None
+        
+        # Update activity
+        session['last_activity'] = datetime.now()
+        return session.copy()
+    
+    async def destroy_session(self, session_id: str) -> bool:
+        """Destroy a session"""
+        if session_id not in self.sessions:
+            return False
+        
+        session = self.sessions[session_id]
+        user_id = session['user_id']
+        
+        # Remove from sessions
+        del self.sessions[session_id]
+        
+        # Remove from user sessions
+        if user_id in self.user_sessions:
+            self.user_sessions[user_id] = [
+                s for s in self.user_sessions[user_id] if s != session_id
+            ]
+            if not self.user_sessions[user_id]:
+                del self.user_sessions[user_id]
+        
+        self.logger.debug(f"Destroyed session {session_id}")
+        return True
+    
+    def _is_expired(self, session: Dict) -> bool:
+        """Check if session is expired"""
+        last_activity = session['last_activity']
+        return (datetime.now() - last_activity).total_seconds() > self.session_timeout
+    
+    async def cleanup_expired_sessions(self) -> int:
+        """Clean up expired sessions and return count cleaned"""
+        expired_sessions = []
+        for session_id, session in self.sessions.items():
+            if self._is_expired(session):
+                expired_sessions.append(session_id)
+        
+        for session_id in expired_sessions:
+            await self.destroy_session(session_id)
+        
+        return len(expired_sessions)
+    
+    def get_active_sessions_count(self) -> int:
+        """Get count of active sessions"""
+        return len(self.sessions)
+    
+    def get_user_sessions(self, user_id: str) -> List[str]:
+        """Get sessions for a specific user"""
+        return self.user_sessions.get(user_id, [])
+
+class AccessControlManager:
+    """Manages access control and permissions"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger("AccessControlManager")
+        self.permissions = {}
+        self.roles = {}
+        self.user_roles = {}
+        
+        # Initialize default roles and permissions
+        self._setup_default_permissions()
+    
+    def _setup_default_permissions(self):
+        """Setup default roles and permissions"""
+        self.roles = {
+            'admin': ['read', 'write', 'delete', 'manage_users', 'manage_system'],
+            'user': ['read', 'write'],
+            'guest': ['read']
+        }
+        
+        self.permissions = {
+            'read': 'Read access to resources',
+            'write': 'Write access to resources',
+            'delete': 'Delete access to resources',
+            'manage_users': 'User management permissions',
+            'manage_system': 'System management permissions'
+        }
+    
+    def assign_role(self, user_id: str, role: str) -> bool:
+        """Assign a role to a user"""
+        if role not in self.roles:
+            return False
+        
+        if user_id not in self.user_roles:
+            self.user_roles[user_id] = set()
+        
+        self.user_roles[user_id].add(role)
+        self.logger.debug(f"Assigned role {role} to user {user_id}")
+        return True
+    
+    def revoke_role(self, user_id: str, role: str) -> bool:
+        """Revoke a role from a user"""
+        if user_id not in self.user_roles:
+            return False
+        
+        if role in self.user_roles[user_id]:
+            self.user_roles[user_id].discard(role)
+            self.logger.debug(f"Revoked role {role} from user {user_id}")
+            return True
+        
+        return False
+    
+    def has_permission(self, user_id: str, permission: str) -> bool:
+        """Check if user has a specific permission"""
+        user_roles = self.user_roles.get(user_id, set())
+        
+        for role in user_roles:
+            if permission in self.roles.get(role, []):
+                return True
+        
+        return False
+    
+    def get_user_permissions(self, user_id: str) -> Set[str]:
+        """Get all permissions for a user"""
+        user_roles = self.user_roles.get(user_id, set())
+        permissions = set()
+        
+        for role in user_roles:
+            permissions.update(self.roles.get(role, []))
+        
+        return permissions
+
+class SessionLifecycleHandler:
+    """Handles session lifecycle events"""
+    
+    def __init__(self, session_manager: SessionManager, event_bus=None):
+        self.session_manager = session_manager
+        self.event_bus = event_bus
+        self.logger = logging.getLogger("SessionLifecycleHandler")
+        self.session_events = []
+        
+    async def on_session_created(self, session_id: str, user_id: str, metadata: Dict = None):
+        """Handle session creation event"""
+        event_data = {
+            'type': 'session_created',
+            'session_id': session_id,
+            'user_id': user_id,
+            'metadata': metadata or {},
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.session_events.append(event_data)
+        self.logger.info(f"Session created: {session_id} for user {user_id}")
+        
+        if self.event_bus:
+            await self.event_bus.publish('session_created', event_data)
+    
+    async def on_session_destroyed(self, session_id: str, user_id: str = None):
+        """Handle session destruction event"""
+        event_data = {
+            'type': 'session_destroyed',
+            'session_id': session_id,
+            'user_id': user_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.session_events.append(event_data)
+        self.logger.info(f"Session destroyed: {session_id}")
+        
+        if self.event_bus:
+            await self.event_bus.publish('session_destroyed', event_data)
+    
+    async def on_session_activity(self, session_id: str, activity_type: str = 'access'):
+        """Handle session activity event"""
+        event_data = {
+            'type': 'session_activity',
+            'session_id': session_id,
+            'activity_type': activity_type,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.session_events.append(event_data)
+        
+        if self.event_bus:
+            await self.event_bus.publish('session_activity', event_data)
+
+class SessionMonitor:
+    """Monitors session health and metrics"""
+    
+    def __init__(self, session_manager: SessionManager):
+        self.session_manager = session_manager
+        self.logger = logging.getLogger("SessionMonitor")
+        self.metrics = {
+            'total_sessions_created': 0,
+            'total_sessions_destroyed': 0,
+            'sessions_expired': 0,
+            'peak_concurrent_sessions': 0
+        }
+        self.monitoring_task = None
+        
+    async def start_monitoring(self):
+        """Start session monitoring"""
+        if self.monitoring_task:
+            return
+        
+        self.monitoring_task = asyncio.create_task(self._monitoring_loop())
+        self.logger.info("Session monitoring started")
+    
+    async def stop_monitoring(self):
+        """Stop session monitoring"""
+        if self.monitoring_task:
+            self.monitoring_task.cancel()
+            try:
+                await self.monitoring_task
+            except asyncio.CancelledError:
+                pass
+            self.monitoring_task = None
+        
+        self.logger.info("Session monitoring stopped")
+    
+    async def _monitoring_loop(self):
+        """Main monitoring loop"""
+        while True:
+            try:
+                # Update metrics
+                current_sessions = self.session_manager.get_active_sessions_count()
+                self.metrics['peak_concurrent_sessions'] = max(
+                    self.metrics['peak_concurrent_sessions'], 
+                    current_sessions
+                )
+                
+                # Clean up expired sessions
+                expired_count = await self.session_manager.cleanup_expired_sessions()
+                if expired_count > 0:
+                    self.metrics['sessions_expired'] += expired_count
+                    self.logger.info(f"Cleaned up {expired_count} expired sessions")
+                
+                await asyncio.sleep(60)  # Check every minute
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in monitoring loop: {e}")
+                await asyncio.sleep(10)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get session metrics"""
+        current_sessions = self.session_manager.get_active_sessions_count()
+        
+        return {
+            **self.metrics,
+            'current_active_sessions': current_sessions,
+            'timestamp': datetime.now().isoformat()
+        }
+
+class SessionControlSubsystem(BaseSubsystem):
+    """Session Control Subsystem - Manages user sessions and access control"""
+    
+    def __init__(self, config: Dict[str, Any] = None):
+        super().__init__(config)
+        
+        # Core components
+        self.session_manager = None
+        self.access_control = None
+        self.lifecycle_handler = None
+        self.session_monitor = None
+        
+        # Configuration
+        self.cleanup_interval = self.config.get('cleanup_interval', 300)
+        
+    async def initialize(self):
+        """Initialize SC-SUB"""
+        try:
+            # Initialize session manager
+            self.session_manager = SessionManager(self.config)
+            
+            # Initialize access control
+            self.access_control = AccessControlManager(self.config)
+            
+            # Initialize lifecycle handler
+            self.lifecycle_handler = SessionLifecycleHandler(self.session_manager)
+            
+            # Initialize session monitor
+            self.session_monitor = SessionMonitor(self.session_manager)
+            
+            self.initialized = True
+            self.logger.info("SC-SUB initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"SC-SUB initialization failed: {e}")
+            raise
+    
+    async def start(self):
+        """Start SC-SUB"""
+        if not self.initialized:
+            raise RuntimeError("SC-SUB not initialized")
+        
+        if self.running:
+            return
+        
+        # Start session monitoring
+        await self.session_monitor.start_monitoring()
+        
+        self.running = True
+        self.start_time = datetime.now()
+        self.logger.info("SC-SUB started")
+    
+    async def stop(self):
+        """Stop SC-SUB"""
+        if not self.running:
+            return
+        
+        # Stop session monitoring
+        if self.session_monitor:
+            await self.session_monitor.stop_monitoring()
+        
+        self.running = False
+        self.logger.info("SC-SUB stopped")
+    
+    # Session management interface
+    async def create_session(self, user_id: str, metadata: Dict = None) -> str:
+        """Create a new user session"""
+        if not self.running:
+            raise RuntimeError("SC-SUB not running")
+        
+        session_id = await self.session_manager.create_session(user_id, metadata)
+        await self.lifecycle_handler.on_session_created(session_id, user_id, metadata)
+        return session_id
+    
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get session information"""
+        if not self.running:
+            return None
+        
+        session = await self.session_manager.get_session(session_id)
+        if session:
+            await self.lifecycle_handler.on_session_activity(session_id)
+        return session
+    
+    async def destroy_session(self, session_id: str) -> bool:
+        """Destroy a session"""
+        if not self.running:
+            return False
+        
+        # Get session info before destroying
+        session = await self.session_manager.get_session(session_id)
+        user_id = session.get('user_id') if session else None
+        
+        success = await self.session_manager.destroy_session(session_id)
+        if success:
+            await self.lifecycle_handler.on_session_destroyed(session_id, user_id)
+        
+        return success
+    
+    # Access control interface
+    def assign_role(self, user_id: str, role: str) -> bool:
+        """Assign role to user"""
+        if not self.running:
+            return False
+        
+        return self.access_control.assign_role(user_id, role)
+    
+    def has_permission(self, user_id: str, permission: str) -> bool:
+        """Check user permission"""
+        if not self.running:
+            return False
+        
+        return self.access_control.has_permission(user_id, permission)
+    
+    def get_session_metrics(self) -> Dict[str, Any]:
+        """Get session metrics"""
+        if not self.running or not self.session_monitor:
+            return {}
+        
+        return self.session_monitor.get_metrics()
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get detailed SC-SUB status"""
+        base_status = super().get_status()
+        
+        if self.running:
+            base_status.update({
+                'active_sessions': self.session_manager.get_active_sessions_count() if self.session_manager else 0,
+                'metrics': self.get_session_metrics()
+            })
+        
+        return base_status
+
+# ============================================================================
+# ENHANCED DELTA ENGINE (SP-SUB)
+# ============================================================================
+
+class EnhancedDeltaEngine:
+    """Enhanced Delta Engine with CRDT support and pending delta management"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger("DeltaEngine")
+        self.node_id = str(uuid.uuid4())
+        
+        # CRDT models
+        self.crdt_user_states = {}  # user_id -> CRDTUserState
+        
+        # Pending deltas for sync
+        self.pending_deltas = []
+        
+    async def get_pending_deltas(self) -> List[Dict[str, Any]]:
+        """Get pending deltas for synchronization"""
+        deltas = self.pending_deltas.copy()
+        self.pending_deltas.clear()
+        return deltas
+    
+    async def create_user_state_delta(self, user_id: str, field: str, value: Any) -> Dict[str, Any]:
+        """Create CRDT delta for user state change"""
+        if user_id not in self.crdt_user_states:
+            self.crdt_user_states[user_id] = CRDTUserState(user_id, self.node_id)
+        
+        user_state = self.crdt_user_states[user_id]
+        delta = user_state.set_field(field, value)
+        
+        # Add to pending deltas
+        self.pending_deltas.append(delta)
+        
+        return delta
+    
+    async def apply_delta(self, delta: Dict[str, Any]) -> bool:
+        """Apply a delta"""
+        try:
+            self.logger.debug(f"Applying delta: {delta.get('type')}")
+            
+            # Handle CRDT deltas
+            if delta.get('type') in ['user_state_set', 'user_state_delete']:
+                user_id = delta.get('entity_id')
+                if user_id not in self.crdt_user_states:
+                    self.crdt_user_states[user_id] = CRDTUserState(user_id, self.node_id)
+                
+                return self.crdt_user_states[user_id].merge_delta(delta)
+            
+            # Generic delta handling
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to apply delta: {e}")
+            return False
+
+    async def create_manual_delta(self, entity_id: str, operation: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a manual delta for testing/demo purposes"""
+        delta = {
+            'type': f'manual_{operation}',
+            'entity_id': entity_id,
+            'data': data,
+            'timestamp': time.time(),
+            'node_id': self.node_id,
+            'operation': operation
+        }
+        self.pending_deltas.append(delta)
+        return delta
+
+# ============================================================================
+# GHOST SYNC PROTOCOL (SP-SUB)
+# ============================================================================
+
+class GhostSyncProtocol:
+    """Enhanced P2P/mesh sync protocol with offline-first design"""
+    
+    def __init__(self, config: Dict[str, Any], integrity_verifier=None, delta_engine=None):
+        self.config = config
+        self.mode = config.get('mode', 'mesh')
+        self.discovery_enabled = config.get('discovery_enabled', True)
+        
+        self.logger = logging.getLogger("GhostSyncProtocol")
+        
+        # Component dependencies
+        self.integrity_verifier = integrity_verifier
+        self.delta_engine = delta_engine
+        
+        # Peer management
+        self.known_peers: Dict[str, PeerInfo] = {}
+        self.active_connections: Set[str] = set()
+        
+        # Protocol settings
+        self.listen_port = config.get('listen_port', 8443)
+        self.discovery_port = config.get('discovery_port', 8444)
+        self.timeout_seconds = config.get('timeout_seconds', 10)
+        self.max_connections = config.get('max_connections', 20)
+        
+        # Node identity
+        self.node_id = str(uuid.uuid4())
+        
+        # Servers
+        self.server = None
+        self.discovery_socket = None
+        self.running = False
+        
+        # Offline queue for when no peers available
+        self.offline_queue = []
+        
+    async def initialize(self, node_id: str = None):
+        """Initialize protocol services"""
+        if node_id:
+            self.node_id = node_id
+            
+        try:
+            if self.mode in ['mesh', 'p2p']:
+                await self._start_server()
+                
+            if self.discovery_enabled:
+                await self._start_discovery()
+                
+            self.running = True
+            asyncio.create_task(self._maintenance_loop())
+            
+            self.logger.info(f"Ghost sync protocol v5 initialized in {self.mode} mode")
+            
+        except Exception as e:
+            self.logger.error(f"Protocol initialization failed: {e}")
+            # Continue in offline mode
+            self.running = True
+            asyncio.create_task(self._maintenance_loop())
+    
+    async def shutdown(self):
+        """Shutdown protocol services"""
+        self.running = False
+        
+        try:
+            if self.server:
+                self.server.close()
+                await self.server.wait_closed()
+                
+            if self.discovery_socket:
+                self.discovery_socket.close()
+                
+            for peer_id in list(self.active_connections):
+                await self._disconnect_peer(peer_id)
+                
+            self.logger.info("Ghost sync protocol shut down")
+            
+        except Exception as e:
+            self.logger.error(f"Protocol shutdown error: {e}")
+    
+    async def _start_server(self):
+        """Start server for incoming sync connections"""
+        try:
+            self.server = await asyncio.start_server(
+                self._handle_peer_connection,
+                '0.0.0.0',
+                self.listen_port
+            )
+            
+            self.logger.info(f"Sync server listening on port {self.listen_port}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to start server: {e} - continuing in offline mode")
+    
+    async def _start_discovery(self):
+        """Start UDP peer discovery"""
+        try:
+            self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.discovery_socket.bind(('', self.discovery_port))
+            self.discovery_socket.setblocking(False)
+            
+            asyncio.create_task(self._discovery_listener())
+            asyncio.create_task(self._periodic_discovery())
+            
+            self.logger.info(f"Discovery service started on port {self.discovery_port}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to start discovery: {e}")
+    
+    async def _maintenance_loop(self):
+        """Background maintenance tasks"""
+        while self.running:
+            try:
+                # Clean up stale peers
+                current_time = datetime.now(timezone.utc)
+                stale_peers = []
+                
+                for peer_id, peer in self.known_peers.items():
+                    if (current_time - peer.last_seen).total_seconds() > 300:  # 5 minutes
+                        stale_peers.append(peer_id)
+                
+                for peer_id in stale_peers:
+                    del self.known_peers[peer_id]
+                    self.active_connections.discard(peer_id)
+                
+                # Process offline queue if we have peers
+                if self.offline_queue and self.known_peers:
+                    await self._process_offline_queue()
+                
+                await asyncio.sleep(60)  # Run every minute
+                
+            except Exception as e:
+                self.logger.error(f"Maintenance loop error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _process_offline_queue(self):
+        """Process queued operations from offline mode"""
+        try:
+            while self.offline_queue and len(self.offline_queue) > 0:
+                operation = self.offline_queue.pop(0)
+                await self._execute_queued_operation(operation)
+                
+        except Exception as e:
+            self.logger.error(f"Offline queue processing error: {e}")
+    
+    async def _execute_queued_operation(self, operation: Dict[str, Any]):
+        """Execute a queued sync operation"""
+        op_type = operation.get('type')
+        
+        if op_type == 'sync_deltas':
+            deltas = operation.get('deltas', [])
+            await self._sync_deltas_to_peers(deltas)
+    
+    async def _discovery_listener(self):
+        """Listen for discovery broadcasts"""
+        while self.running:
+            try:
+                loop = asyncio.get_event_loop()
+                data, addr = await loop.sock_recvfrom(self.discovery_socket, 1024)
+                await self._process_discovery_message(data, addr)
+            except Exception:
+                await asyncio.sleep(0.1)
+    
+    async def _periodic_discovery(self):
+        """Periodically broadcast discovery messages"""
+        while self.running:
+            try:
+                await self._broadcast_discovery()
+                await asyncio.sleep(30)
+            except Exception:
+                await asyncio.sleep(30)
+    
+    async def _broadcast_discovery(self):
+        """Broadcast discovery message"""
+        try:
+            message = {
+                'type': 'ghost_discovery',
+                'node_id': self.node_id,
+                'port': self.listen_port,
+                'capabilities': ['sync', 'crdt', 'offline'],
+                'timestamp': time.time()
+            }
+            
+            data = json.dumps(message).encode('utf-8')
+            self.discovery_socket.sendto(data, ('<broadcast>', self.discovery_port))
+            
+        except Exception:
+            pass
+    
+    async def _process_discovery_message(self, data: bytes, addr: Tuple[str, int]):
+        """Process incoming discovery message"""
+        try:
+            message = json.loads(data.decode('utf-8'))
+            
+            if message.get('type') == 'ghost_discovery':
+                node_id = message.get('node_id')
+                if node_id and node_id != self.node_id:
+                    peer = PeerInfo(
+                        node_id,
+                        addr[0],
+                        message.get('port', self.listen_port),
+                        message.get('capabilities', [])
+                    )
+                    self.known_peers[node_id] = peer
+                    
+        except Exception:
+            pass
+    
+    async def _handle_peer_connection(self, reader: asyncio.StreamReader, 
+                                     writer: asyncio.StreamWriter):
+        """Handle incoming peer connection"""
+        try:
+            peer_info = await self._peer_handshake(reader, writer)
+            
+            if peer_info:
+                self.known_peers[peer_info.node_id] = peer_info
+                self.active_connections.add(peer_info.node_id)
+                await self._handle_sync_session(reader, writer, peer_info)
+                
+        except Exception as e:
+            self.logger.error(f"Peer connection error: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    
+    async def _peer_handshake(self, reader: asyncio.StreamReader, 
+                             writer: asyncio.StreamWriter) -> Optional[PeerInfo]:
+        """Perform handshake with peer"""
+        try:
+            handshake = {
+                'protocol': 'ghost_sync',
+                'version': '5.0',
+                'node_id': self.node_id,
+                'capabilities': ['sync', 'crdt', 'offline'],
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, handshake)
+            peer_handshake = await self._receive_json(reader)
+            
+            if peer_handshake and peer_handshake.get('protocol') == 'ghost_sync':
+                return PeerInfo(
+                    peer_handshake['node_id'],
+                    writer.get_extra_info('peername')[0],
+                    writer.get_extra_info('peername')[1],
+                    peer_handshake.get('capabilities', [])
+                )
+                
+        except Exception:
+            pass
+            
+        return None
+    
+    async def _send_json(self, writer: asyncio.StreamWriter, data: Dict[str, Any]):
+        """Send JSON message with length prefix"""
+        try:
+            json_data = json.dumps(data, default=str)
+            message_bytes = json_data.encode('utf-8')
+            
+            length = len(message_bytes)
+            writer.write(struct.pack('>I', length))
+            writer.write(message_bytes)
+            
+            await writer.drain()
+            
+        except Exception as e:
+            raise
+    
+    async def _receive_json(self, reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
+        """Receive JSON message with length prefix"""
+        try:
+            length_data = await asyncio.wait_for(reader.read(4), timeout=self.timeout_seconds)
+            if len(length_data) != 4:
+                return None
+            
+            length = struct.unpack('>I', length_data)[0]
+            if length > 10 * 1024 * 1024:  # 10MB limit
+                return None
+            
+            message_data = await asyncio.wait_for(reader.read(length), timeout=self.timeout_seconds)
+            if len(message_data) != length:
+                return None
+            
+            return json.loads(message_data.decode('utf-8'))
+            
+        except Exception:
+            return None
+    
+    async def _handle_sync_session(self, reader: asyncio.StreamReader,
+                                  writer: asyncio.StreamWriter, peer: PeerInfo):
+        """Handle sync session with peer"""
+        try:
+            while True:
+                message = await self._receive_json(reader)
+                if not message:
+                    break
+                
+                response = await self._process_sync_message(message, peer)
+                if response:
+                    await self._send_json(writer, response)
+                    
+        except Exception:
+            pass
+        finally:
+            self.active_connections.discard(peer.node_id)
+    
+    async def _process_sync_message(self, message: Dict[str, Any], 
+                                   peer: PeerInfo) -> Optional[Dict[str, Any]]:
+        """Process sync message from peer"""
+        msg_type = message.get('type')
+        
+        if msg_type == 'push_deltas':
+            return await self._handle_push_deltas(message, peer)
+        elif msg_type == 'pull_request':
+            return await self._handle_pull_request(message, peer)
+        
+        return None
+    
+    async def _handle_push_deltas(self, message: Dict[str, Any], 
+                                 peer: PeerInfo) -> Dict[str, Any]:
+        """Handle incoming delta push"""
+        deltas = message.get('deltas', [])
+        
+        try:
+            applied_count, failed_count = await self.verify_and_apply(deltas)
+            
+            return {
+                'type': 'push_response',
+                'status': 'success',
+                'applied': applied_count,
+                'failed': failed_count,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            return {
+                'type': 'push_response',
+                'status': 'error',
+                'error': str(e),
+                'timestamp': time.time()
+            }
+    
+    async def _handle_pull_request(self, message: Dict[str, Any], 
+                                  peer: PeerInfo) -> Dict[str, Any]:
+        """Handle pull request from peer"""
+        try:
+            if self.delta_engine:
+                pending_deltas = await self.delta_engine.get_pending_deltas()
+            else:
+                pending_deltas = []
+            
+            return {
+                'type': 'pull_response',
+                'deltas': pending_deltas,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            return {
+                'type': 'pull_response',
+                'status': 'error',
+                'error': str(e),
+                'timestamp': time.time()
+            }
+    
+    async def verify_and_apply(self, deltas: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Verify deltas and apply with DeltaEngine"""
+        applied_count = 0
+        failed_count = 0
+        
+        for delta in deltas:
+            try:
+                if self.delta_engine:
+                    success = await self.delta_engine.apply_delta(delta)
+                    if success:
+                        applied_count += 1
+                    else:
+                        failed_count += 1
+                else:
+                    applied_count += 1
+                    
+            except Exception:
+                failed_count += 1
+        
+        return applied_count, failed_count
+    
+    async def discover_peers(self) -> List[str]:
+        """Discover available peers"""
+        if not self.running:
+            return []
+        
+        if self.discovery_enabled and self.discovery_socket:
+            await self._broadcast_discovery()
+            await asyncio.sleep(2)  # Wait for responses
+        
+        online_peers = [peer_id for peer_id, peer in self.known_peers.items() if peer.is_online]
+        return online_peers
+    
+    async def push_deltas(self, deltas: List[Dict[str, Any]]) -> bool:
+        """Push deltas to available peers"""
+        if not deltas:
+            return True
+        
+        online_peers = [p for p in self.known_peers.values() if p.is_online]
+        
+        if not online_peers:
+            # Queue for offline mode
+            self.offline_queue.append({
+                'type': 'sync_deltas',
+                'deltas': deltas,
+                'timestamp': time.time()
+            })
+            self.logger.info(f"Queued {len(deltas)} deltas for offline sync")
+            return True
+        
+        return await self._sync_deltas_to_peers(deltas)
+    
+    async def _sync_deltas_to_peers(self, deltas: List[Dict[str, Any]]) -> bool:
+        """Sync deltas to connected peers"""
+        success_count = 0
+        
+        for peer in [p for p in self.known_peers.values() if p.is_online]:
+            try:
+                success = await self._push_to_peer(peer, deltas)
+                if success:
+                    success_count += 1
+                    
+            except Exception:
+                peer.connection_failures += 1
+                if peer.connection_failures > 3:
+                    peer.is_online = False
+        
+        return success_count > 0
+    
+    async def _push_to_peer(self, peer: PeerInfo, deltas: List[Dict[str, Any]]) -> bool:
+        """Push deltas to a specific peer"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(peer.address, peer.port),
+                timeout=self.timeout_seconds
+            )
+            
+            handshake_peer = await self._peer_handshake(reader, writer)
+            if not handshake_peer:
+                return False
+            
+            push_message = {
+                'type': 'push_deltas',
+                'deltas': deltas,
+                'from_node': self.node_id,
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, push_message)
+            response = await self._receive_json(reader)
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            if response and response.get('status') == 'success':
+                peer.last_seen = datetime.now(timezone.utc)
+                peer.connection_failures = 0
+                return True
+            
+        except Exception:
+            pass
+            
+        return False
+    
+    async def pull_from_peers(self) -> List[Dict[str, Any]]:
+        """Pull deltas from available peers"""
+        all_deltas = []
+        
+        for peer in [p for p in self.known_peers.values() if p.is_online]:
+            try:
+                deltas = await self._pull_from_peer(peer)
+                all_deltas.extend(deltas)
+            except Exception:
+                pass
+        
+        return all_deltas
+    
+    async def _pull_from_peer(self, peer: PeerInfo) -> List[Dict[str, Any]]:
+        """Pull deltas from a specific peer"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(peer.address, peer.port),
+                timeout=self.timeout_seconds
+            )
+            
+            handshake_peer = await self._peer_handshake(reader, writer)
+            if not handshake_peer:
+                return []
+            
+            pull_message = {
+                'type': 'pull_request',
+                'from_node': self.node_id,
+                'timestamp': time.time()
+            }
+            
+            await self._send_json(writer, pull_message)
+            response = await self._receive_json(reader)
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            if response and 'deltas' in response:
+                return response['deltas']
+            
+        except Exception:
+            pass
+            
+        return []
+    
+    async def _disconnect_peer(self, peer_id: str):
+        """Disconnect from a peer"""
+        try:
+            self.active_connections.discard(peer_id)
+            if peer_id in self.known_peers:
+                self.known_peers[peer_id].is_online = False
+        except Exception:
+            pass
+    
+    async def get_protocol_status(self) -> Dict[str, Any]:
+        """Get detailed protocol status"""
+        online_peers = [p for p in self.known_peers.values() if p.is_online]
+        
+        return {
+            'node_id': self.node_id,
+            'mode': self.mode,
+            'running': self.running,
+            'listening_port': self.listen_port,
+            'discovery_enabled': self.discovery_enabled,
+            'total_known_peers': len(self.known_peers),
+            'online_peers': len(online_peers),
+            'active_connections': len(self.active_connections),
+            'offline_queue_size': len(self.offline_queue),
+            'peers': [p.to_dict() for p in online_peers[:5]]
+        }
+
+    async def add_manual_peer(self, node_id: str, address: str, port: int):
+        """Manually add a peer"""
+        peer = PeerInfo(node_id, address, port, ['sync'])
+        self.known_peers[node_id] = peer
+
+# ============================================================================
+# SYNC COORDINATOR (ENHANCED WITH SC-SUB)
+# ============================================================================
+
+class SyncCoordinator:
+    """Central coordinator for Ghost synchronization operations with integrated subsystems"""
+    
+    def __init__(self, config_file: str = None):
+        self.config_file = config_file or "config/sp_config.yaml"
+        self.config = self._load_config()
+        self.logger = logging.getLogger("SyncCoordinator")
+        
+        # Core components
+        self.sync_protocol = None
+        self.delta_engine = None
+        
+        # Integrated subsystems
+        self.session_control = None
+        
+        # State management
+        self.node_id = str(uuid.uuid4())
+        self.sync_state = {}
+        self.sync_state_file = "data/ghost_sync_state.json"
+        self.subsystems = {}
+        
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    return yaml.safe_load(f)
+        except Exception as e:
+            self.logger.warning(f"Could not load config from {self.config_file}: {e}")
+        
+        return self._get_default_config()
+    
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration"""
+        return {
+            'sync': {
+                'interval_seconds': 300,
+                'batch_size': 100,
+                'max_retries': 3,
+                'timeout_seconds': 30,
+                'offline_mode': True
+            },
+            'protocol': {
+                'mode': 'mesh',
+                'discovery_enabled': True,
+                'listen_port': 8443,
+                'discovery_port': 8444,
+                'timeout_seconds': 10,
+                'max_connections': 20
+            },
+            'delta': {
+                'compression_enabled': True,
+                'max_delta_size': 1048576,
+                'crdt_mode': True
+            },
+            'session_control': {
+                'max_sessions': 10000,
+                'session_timeout': 3600,
+                'max_user_sessions': 5,
+                'cleanup_interval': 300
+            }
+        }
+    
+    async def initialize(self):
+        """Initialize sync coordinator and all subsystems"""
+        try:
+            # Ensure data directory exists
+            os.makedirs(os.path.dirname(self.sync_state_file), exist_ok=True)
+            
+            # Load existing state
+            await self._load_sync_state()
+            
+            # Initialize delta engine
+            self.delta_engine = EnhancedDeltaEngine(self.config.get('delta', {}))
+            self.delta_engine.node_id = self.node_id
+            
+            # Initialize sync protocol
+            protocol_config = self.config.get('protocol', {})
+            self.sync_protocol = GhostSyncProtocol(
+                protocol_config, 
+                None,  # integrity_verifier
+                self.delta_engine
+            )
+            await self.sync_protocol.initialize(self.node_id)
+            
+            # Initialize Session Control Subsystem
+            await self._initialize_session_control()
+            
+            # Register subsystems
+            self._register_subsystems()
+            
+            self.logger.info(f"Sync coordinator initialized with node_id: {self.node_id[:8]}...")
+            
+        except Exception as e:
+            self.logger.error(f"Coordinator initialization failed: {e}")
+            raise
+    
+    async def _initialize_session_control(self):
+        """Initialize Session Control Subsystem"""
+        try:
+            sc_config = self.config.get('session_control', {})
+            self.session_control = SessionControlSubsystem(sc_config)
+            await self.session_control.initialize()
+            
+            self.logger.info("Session Control Subsystem initialized")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Session Control: {e}")
+            raise
+    
+    def _register_subsystems(self):
+        """Register all subsystems for centralized management"""
+        self.subsystems = {
+            'session_control': self.session_control
+        }
+        
+        self.logger.info(f"Registered {len(self.subsystems)} subsystems")
+    
+    async def _load_sync_state(self):
+        """Load sync state from disk"""
+        try:
+            if os.path.exists(self.sync_state_file):
+                with open(self.sync_state_file, 'r') as f:
+                    self.sync_state = json.load(f)
+                    if 'node_id' in self.sync_state:
+                        self.node_id = self.sync_state['node_id']
+        except FileNotFoundError:
+            self.logger.info("No existing sync state found, starting fresh")
+        except Exception as e:
+            self.logger.error(f"Failed to load sync state: {e}")
+    
+    async def save_sync_state(self):
+        """Save sync state to disk"""
+        try:
+            self.sync_state.update({
+                'node_id': self.node_id,
+                'last_save': datetime.now(timezone.utc).isoformat(),
+                'sync_count': self.sync_state.get('sync_count', 0)
+            })
+            
+            with open(self.sync_state_file, 'w') as f:
+                json.dump(self.sync_state, f, indent=2)
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save sync state: {e}")
+    
+    async def start_sync_cycle(self, peers: List[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+        """Start a complete sync cycle"""
+        start_time = time.time()
+        result = {
+            'status': 'started',
+            'dry_run': dry_run,
+            'start_time': datetime.now(timezone.utc).isoformat(),
+            'peers_requested': peers or [],
+            'peers_contacted': 0,
+            'deltas_processed': 0,
+            'conflicts_found': 0,
+            'errors': []
+        }
+        
+        try:
+            self.logger.info(f"Starting sync cycle (dry_run={dry_run})")
+            
+            # Discover peers if none specified
+            if not peers:
+                peers = await self.sync_protocol.discover_peers()
+            
+            result['peers_contacted'] = len(peers)
+            
+            if not peers:
+                self.logger.warning("No peers available for sync")
+                result['status'] = 'no_peers'
+                return result
+            
+            # Pull deltas from peers
+            incoming_deltas = await self.sync_protocol.pull_from_peers()
+            result['deltas_received'] = len(incoming_deltas)
+            
+            # Push our pending deltas
+            if self.delta_engine:
+                pending_deltas = await self.delta_engine.get_pending_deltas()
+                if pending_deltas and not dry_run:
+                    push_success = await self.sync_protocol.push_deltas(pending_deltas)
+                    result['deltas_pushed'] = len(pending_deltas) if push_success else 0
+                else:
+                    result['deltas_pushed'] = 0
+            
+            # Process incoming deltas
+            if incoming_deltas and not dry_run:
+                applied, failed = await self.sync_protocol.verify_and_apply(incoming_deltas)
+                result['deltas_applied'] = applied
+                result['deltas_failed'] = failed
+                result['deltas_processed'] = applied + failed
+            else:
+                result['deltas_processed'] = len(incoming_deltas)
+                result['deltas_applied'] = 0
+                result['deltas_failed'] = 0
+            
+            # Update sync state
+            if not dry_run:
+                self.sync_state['sync_count'] = self.sync_state.get('sync_count', 0) + 1
+                self.sync_state['last_sync_time'] = datetime.now(timezone.utc).isoformat()
+                await self.save_sync_state()
+            
+            result['status'] = 'success'
+            result['changes_applied'] = not dry_run and (result['deltas_applied'] > 0 or result['deltas_pushed'] > 0)
+            
+        except Exception as e:
+            self.logger.error(f"Sync cycle failed: {e}")
+            result['status'] = 'failed'
+            result['error'] = str(e)
+            result['errors'].append(str(e))
+        
+        finally:
+            result['duration_seconds'] = time.time() - start_time
+            result['end_time'] = datetime.now(timezone.utc).isoformat()
+        
+        return result
+    
+    async def get_sync_status(self) -> Dict[str, Any]:
+        """Get current sync status with subsystem information"""
+        status = {
+            'node_id': self.node_id,
+            'last_sync_time': self.sync_state.get('last_sync_time', 'Never'),
+            'sync_count': self.sync_state.get('sync_count', 0),
+            'pending_conflicts': len(self.sync_state.get('pending_conflicts', [])),
+            'checkpoint_count': self.sync_state.get('checkpoint_count', 0),
+            'subsystems': {}
+        }
+        
+        # Add protocol status if available
+        if self.sync_protocol:
+            protocol_status = await self.sync_protocol.get_protocol_status()
+            status.update({
+                'protocol_running': protocol_status['running'],
+                'known_peers': protocol_status['total_known_peers'],
+                'online_peers': protocol_status['online_peers'],
+                'offline_queue_size': protocol_status['offline_queue_size']
+            })
+        
+        # Add subsystem status
+        for name, subsystem in self.subsystems.items():
+            if subsystem:
+                status['subsystems'][name] = subsystem.get_status()
+        
+        return status
+
+    async def create_test_delta(self, user_id: str = None, operation: str = 'test') -> Dict[str, Any]:
+        """Create a test delta for demonstration"""
+        if not user_id:
+            user_id = f"test_user_{int(time.time())}"
+        
+        if self.delta_engine and operation == 'user_state':
+            return await self.delta_engine.create_user_state_delta(
+                user_id, 'status', f'updated_at_{int(time.time())}'
+            )
+        else:
+            return await self.delta_engine.create_manual_delta(
+                user_id, operation, {'test_data': f'value_{int(time.time())}'}
+            )
+
+    async def start(self):
+        """Start the coordinator and all subsystems"""
+        if self.sync_protocol:
+            # Protocol is already initialized, just ensure it's running
+            pass
+        
+        # Start all subsystems
+        for name, subsystem in self.subsystems.items():
+            if subsystem and not subsystem.running:
+                try:
+                    await subsystem.start()
+                    self.logger.info(f"Started subsystem: {name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to start subsystem {name}: {e}")
+    
+    async def stop(self):
+        """Stop the coordinator and all subsystems"""
+        # Stop all subsystems
+        for name, subsystem in self.subsystems.items():
+            if subsystem and subsystem.running:
+                try:
+                    await subsystem.stop()
+                    self.logger.info(f"Stopped subsystem: {name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to stop subsystem {name}: {e}")
+        
+        if self.sync_protocol:
+            await self.sync_protocol.shutdown()
+    
+    # Session Control Interface
+    async def create_session(self, user_id: str, metadata: Dict = None) -> str:
+        """Create a new user session through SC-SUB"""
+        if not self.session_control or not self.session_control.running:
+            raise RuntimeError("Session Control subsystem not available")
+        
+        return await self.session_control.create_session(user_id, metadata)
+    
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get session information through SC-SUB"""
+        if not self.session_control or not self.session_control.running:
+            return None
+        
+        return await self.session_control.get_session(session_id)
+    
+    async def destroy_session(self, session_id: str) -> bool:
+        """Destroy a session through SC-SUB"""
+        if not self.session_control or not self.session_control.running:
+            return False
+        
+        return await self.session_control.destroy_session(session_id)
+    
+    def assign_user_role(self, user_id: str, role: str) -> bool:
+        """Assign role to user through SC-SUB"""
+        if not self.session_control or not self.session_control.running:
+            return False
+        
+        return self.session_control.assign_role(user_id, role)
+    
+    def check_user_permission(self, user_id: str, permission: str) -> bool:
+        """Check user permission through SC-SUB"""
+        if not self.session_control or not self.session_control.running:
+            return False
+        
+        return self.session_control.has_permission(user_id, permission)
+
+# ============================================================================
+# EVENT BUS INTEGRATION (ENHANCED FOR SC-SUB)
+# ============================================================================
+
+class SPEventBusIntegration:
+    """Event Bus integration for SP-SUB + SC-SUB v5"""
+    
+    def __init__(self, sync_coordinator, event_bus=None):
+        self.sync_coordinator = sync_coordinator
+        self.event_bus = event_bus
+        self.logger = logging.getLogger("SPEventIntegration")
+        self.running = False
+        
+    async def initialize(self):
+        """Initialize event integration"""
+        if self.event_bus:
+            await self._subscribe_to_events()
+            self.running = True
+            self.logger.info("SP + SC Event Bus integration initialized")
+        else:
+            self.logger.warning("No event bus provided - running without event integration")
+    
+    async def shutdown(self):
+        """Shutdown event integration"""
+        self.running = False
+    
+    async def _subscribe_to_events(self):
+        """Subscribe to relevant Event Bus events"""
+        try:
+            # SP-SUB events
+            await self.event_bus.subscribe('sync_request', self._on_sync_request)
+            await self.event_bus.subscribe('file_changed', self._on_file_changed)
+            
+            # SC-SUB events
+            await self.event_bus.subscribe('session_request', self._on_session_request)
+            await self.event_bus.subscribe('user_login', self._on_user_login)
+            await self.event_bus.subscribe('user_logout', self._on_user_logout)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe to events: {e}")
+    
+    async def _on_sync_request(self, event_data: Dict[str, Any]):
+        """Handle sync request from event bus"""
+        try:
+            self.logger.info(f"Received sync request: {event_data}")
+            
+            peers = event_data.get('peers')
+            dry_run = event_data.get('dry_run', False)
+            
+            result = await self.sync_coordinator.start_sync_cycle(
+                peers=peers, 
+                dry_run=dry_run
+            )
+            
+            if self.event_bus and hasattr(self.event_bus, 'publish'):
+                await self.event_bus.publish('sync_completed', {
+                    'request_id': event_data.get('request_id'),
+                    'result': result,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                })
+            
+        except Exception as e:
+            self.logger.error(f"Error handling sync request: {e}")
+    
+    async def _on_file_changed(self, event_data: Dict[str, Any]):
+        """Handle file change event"""
+        try:
+            file_path = event_data.get('path')
+            if file_path and self.sync_coordinator.delta_engine:
+                delta = await self.sync_coordinator.delta_engine.create_manual_delta(
+                    file_path, 'file_change', event_data
+                )
+                # Delta is automatically queued in create_manual_delta
+                
+        except Exception as e:
+            self.logger.error(f"Error handling file change: {e}")
+    
+    async def _on_session_request(self, event_data: Dict[str, Any]):
+        """Handle session-related requests"""
+        try:
+            request_type = event_data.get('type')
+            
+            if request_type == 'create_session':
+                user_id = event_data.get('user_id')
+                metadata = event_data.get('metadata', {})
+                
+                if user_id:
+                    session_id = await self.sync_coordinator.create_session(user_id, metadata)
+                    
+                    if self.event_bus:
+                        await self.event_bus.publish('session_created', {
+                            'session_id': session_id,
+                            'user_id': user_id,
+                            'request_id': event_data.get('request_id'),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        })
+            
+            elif request_type == 'destroy_session':
+                session_id = event_data.get('session_id')
+                
+                if session_id:
+                    success = await self.sync_coordinator.destroy_session(session_id)
+                    
+                    if self.event_bus:
+                        await self.event_bus.publish('session_destroyed', {
+                            'session_id': session_id,
+                            'success': success,
+                            'request_id': event_data.get('request_id'),
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        })
+                
+        except Exception as e:
+            self.logger.error(f"Error handling session request: {e}")
+    
+    async def _on_user_login(self, event_data: Dict[str, Any]):
+        """Handle user login event"""
+        try:
+            user_id = event_data.get('user_id')
+            
+            if user_id:
+                # Create session for logged in user
+                metadata = {
+                    'login_time': datetime.now().isoformat(),
+                    'login_method': event_data.get('method', 'unknown'),
+                    'ip_address': event_data.get('ip_address')
+                }
+                
+                session_id = await self.sync_coordinator.create_session(user_id, metadata)
+                
+                # Assign default user role if not already assigned
+                self.sync_coordinator.assign_user_role(user_id, 'user')
+                
+                self.logger.info(f"Created session {session_id} for user login: {user_id}")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling user login: {e}")
+    
+    async def _on_user_logout(self, event_data: Dict[str, Any]):
+        """Handle user logout event"""
+        try:
+            user_id = event_data.get('user_id')
+            session_id = event_data.get('session_id')
+            
+            if session_id:
+                # Destroy specific session
+                await self.sync_coordinator.destroy_session(session_id)
+                self.logger.info(f"Destroyed session {session_id} for user logout")
+            elif user_id:
+                # Destroy all sessions for user
+                if self.sync_coordinator.session_control:
+                    user_sessions = self.sync_coordinator.session_control.session_manager.get_user_sessions(user_id)
+                    for sess_id in user_sessions:
+                        await self.sync_coordinator.destroy_session(sess_id)
+                    self.logger.info(f"Destroyed {len(user_sessions)} sessions for user {user_id}")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling user logout: {e}")
+
+# ============================================================================
+# ENHANCED GHOST SYNC PROTOCOL (Main Entry Point)
+# ============================================================================
+
+class EnhancedGhostSyncProtocol:
+    """Enhanced Ghost Sync Protocol v5 - Main subsystem interface with SC-SUB integration"""
+    
+    def __init__(self, config: Dict[str, Any], node_id: str):
+        self.config = config
+        self.node_id = node_id
+        self.logger = logging.getLogger("EnhancedGhostSyncProtocol")
+        
+        # Core coordinator
+        self.coordinator = None
+        self.event_integration = None
+        self.running = False
+    
+    async def initialize(self):
+        """Initialize the enhanced sync protocol with all subsystems"""
+        try:
+            # Create sync coordinator
+            config_file = self.config.get('config_file', 'config/sp_config.yaml')
+            self.coordinator = SyncCoordinator(config_file)
+            self.coordinator.node_id = self.node_id
+            
+            # Initialize coordinator (includes all subsystems)
+            await self.coordinator.initialize()
+            
+            # Initialize event integration if event bus is available
+            event_bus = self.config.get('event_bus')
+            if event_bus:
+                self.event_integration = SPEventBusIntegration(self.coordinator, event_bus)
+                await self.event_integration.initialize()
+            
+            self.running = True
+            self.logger.info("Enhanced Ghost Sync Protocol v5 with SC-SUB initialized")
+            
+        except Exception as e:
+            self.logger.error(f"Enhanced protocol initialization failed: {e}")
+            raise
+    
+    async def start(self):
+        """Start the sync protocol and all subsystems"""
+        if self.coordinator:
+            await self.coordinator.start()
+    
+    async def stop(self):
+        """Stop the sync protocol and all subsystems"""
+        if self.event_integration:
+            await self.event_integration.shutdown()
+        
+        if self.coordinator:
+            await self.coordinator.stop()
+        
+        self.running = False
+    
+    async def sync(self, peers: List[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+        """Perform sync operation"""
+        if not self.coordinator:
+            return {'error': 'Coordinator not initialized'}
+        
+        return await self.coordinator.start_sync_cycle(peers, dry_run)
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get sync status including all subsystems"""
+        if not self.coordinator:
+            return {'error': 'Coordinator not initialized'}
+        
+        return await self.coordinator.get_sync_status()
+    
+    async def create_test_delta(self, user_id: str = None) -> Dict[str, Any]:
+        """Create test delta for demonstration"""
+        if not self.coordinator:
+            return {'error': 'Coordinator not initialized'}
+        
+        return await self.coordinator.create_test_delta(user_id)
+    
+    # Session Control Interface
+    async def create_session(self, user_id: str, metadata: Dict = None) -> str:
+        """Create user session through SC-SUB"""
+        if not self.coordinator:
+            raise RuntimeError('Coordinator not initialized')
+        
+        return await self.coordinator.create_session(user_id, metadata)
+    
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get session information through SC-SUB"""
+        if not self.coordinator:
+            return None
+        
+        return await self.coordinator.get_session(session_id)
+    
+    async def destroy_session(self, session_id: str) -> bool:
+        """Destroy session through SC-SUB"""
+        if not self.coordinator:
+            return False
+        
+        return await self.coordinator.destroy_session(session_id)
+    
+    def assign_user_role(self, user_id: str, role: str) -> bool:
+        """Assign role to user through SC-SUB"""
+        if not self.coordinator:
+            return False
+        
+        return self.coordinator.assign_user_role(user_id, role)
+    
+    def check_user_permission(self, user_id: str, permission: str) -> bool:
+        """Check user permission through SC-SUB"""
+        if not self.coordinator:
+            return False
+        
+        return self.coordinator.check_user_permission(user_id, permission)
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform comprehensive health check"""
+        if not self.running or not self.coordinator:
+            return {'status': 'unhealthy', 'reason': 'Not running or initialized'}
+        
+        health_status = {
+            'status': 'healthy',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'components': {}
+        }
+        
+        # Check all subsystems
+        for name, subsystem in self.coordinator.subsystems.items():
+            if subsystem:
+                try:
+                    is_healthy = await subsystem.health_check()
+                    health_status['components'][name] = {
+                        'status': 'healthy' if is_healthy else 'unhealthy',
+                        'details': subsystem.get_status()
+                    }
+                except Exception as e:
+                    health_status['components'][name] = {
+                        'status': 'error',
+                        'error': str(e)
+                    }
+        
+        # Check protocol
+        if self.coordinator.sync_protocol:
+            protocol_status = await self.coordinator.sync_protocol.get_protocol_status()
+            health_status['components']['sync_protocol'] = {
+                'status': 'healthy' if protocol_status['running'] else 'unhealthy',
+                'details': protocol_status
+            }
+        
+        # Overall health determination
+        component_statuses = [comp.get('status') for comp in health_status['components'].values()]
+        if any(status == 'error' for status in component_statuses):
+            health_status['status'] = 'degraded'
+        elif any(status == 'unhealthy' for status in component_statuses):
+            health_status['status'] = 'degraded'
+        
+        return health_status
+
+# ============================================================================
+# CLI AND TESTING INTERFACE
+# ============================================================================
+
+async def main():
+    """Main CLI interface for testing the integrated system"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="G.Legion CloudCore Sync v2 + SP-SUB + SC-SUB")
+    parser.add_argument('--config', default='config/sp_config.yaml', help='Configuration file')
+    parser.add_argument('--node-id', help='Node ID (auto-generated if not provided)')
+    parser.add_argument('--command', choices=['start', 'sync', 'status', 'test'], default='start')
+    parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
+    parser.add_argument('--peers', nargs='*', help='Peer nodes to sync with')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create configuration
+    config = {
+        'config_file': args.config,
+        'event_bus': None  # Could be injected here
+    }
+    
+    node_id = args.node_id or str(uuid.uuid4())
+    
+    # Initialize protocol
+    protocol = EnhancedGhostSyncProtocol(config, node_id)
+    
+    try:
+        await protocol.initialize()
+        await protocol.start()
+        
+        if args.command == 'sync':
+            result = await protocol.sync(args.peers, args.dry_run)
+            print(json.dumps(result, indent=2, default=str))
+        
+        elif args.command == 'status':
+            status = await protocol.get_status()
+            print(json.dumps(status, indent=2, default=str))
+        
+        elif args.command == 'test':
+            # Test session creation
+            print("Testing Session Control...")
+            session_id = await protocol.create_session('test_user', {'test': True})
+            print(f"Created session: {session_id}")
+            
+            session = await protocol.get_session(session_id)
+            print(f"Session data: {session}")
+            
+            # Test permissions
+            protocol.assign_user_role('test_user', 'admin')
+            has_perm = protocol.check_user_permission('test_user', 'read')
+            print(f"User has read permission: {has_perm}")
+            
+            # Test sync
+            delta = await protocol.create_test_delta('test_user')
+            print(f"Created test delta: {delta}")
+            
+            # Health check
+            health = await protocol.health_check()
+            print("Health check:")
+            print(json.dumps(health, indent=2, default=str))
+        
+        elif args.command == 'start':
+            print("Protocol started. Press Ctrl+C to stop...")
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                print("Shutting down...")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        await protocol.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())

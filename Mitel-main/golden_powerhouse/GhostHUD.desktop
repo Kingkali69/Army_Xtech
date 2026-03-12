@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GhostHUD
+Comment=Nexian Omni Quantum Compute GhostOps Engine
+Exec=sh %k/START_GHOSTHUD.sh
+Icon=application-x-executable
+Terminal=true
+Categories=Network;Security;
+StartupNotify=true
+Path=%k
+

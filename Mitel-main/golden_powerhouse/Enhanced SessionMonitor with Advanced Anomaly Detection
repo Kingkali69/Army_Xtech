@@ -1,0 +1,775 @@
+import asyncio
+import logging
+import time
+import statistics
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import defaultdict, deque
+import json
+import ipaddress
+
+
+class ThreatLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium" 
+    HIGH = "high"
+
+
+class AnomalyType(Enum):
+    UNUSUAL_LOGIN_TIME = "unusual_login_time"
+    RAPID_SESSION_CYCLING = "rapid_session_cycling"
+    GEOLOCATION_MISMATCH = "geolocation_mismatch"
+    CONCURRENT_IP_SESSIONS = "concurrent_ip_sessions"
+    PERMISSION_ESCALATION = "permission_escalation"
+    SESSION_DURATION_ANOMALY = "session_duration_anomaly"
+    FAILED_AUTH_SPIKE = "failed_auth_spike"
+
+
+@dataclass
+class UserBaseline:
+    """Stores behavioral baseline for a specific user."""
+    user_id: str
+    typical_login_hours: Set[int] = field(default_factory=set)
+    typical_locations: Set[str] = field(default_factory=set)
+    avg_session_duration: float = 0.0
+    session_count_history: deque = field(default_factory=lambda: deque(maxlen=100))
+    ip_history: deque = field(default_factory=lambda: deque(maxlen=50))
+    login_time_history: deque = field(default_factory=lambda: deque(maxlen=100))
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+    
+    def update_baseline(self, session_data: Dict[str, Any]):
+        """Update user baseline with new session data."""
+        now = datetime.utcnow()
+        
+        # Update login hours
+        if 'created_at' in session_data:
+            login_time = datetime.fromisoformat(session_data['created_at'].replace('Z', '+00:00'))
+            self.typical_login_hours.add(login_time.hour)
+            self.login_time_history.append(login_time.hour)
+        
+        # Update IP history
+        if 'ip_address' in session_data and session_data['ip_address']:
+            self.ip_history.append(session_data['ip_address'])
+            
+            # Extract location from IP (simplified - would use GeoIP in production)
+            location = self._extract_location_from_ip(session_data['ip_address'])
+            if location:
+                self.typical_locations.add(location)
+        
+        # Update session duration if session ended
+        if 'duration' in session_data:
+            self.session_count_history.append(session_data['duration'])
+            if len(self.session_count_history) > 0:
+                self.avg_session_duration = sum(self.session_count_history) / len(self.session_count_history)
+        
+        self.last_updated = now
+    
+    def _extract_location_from_ip(self, ip: str) -> Optional[str]:
+        """Extract geographic location from IP address."""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private:
+                return "private_network"
+            
+            # In production, this would use a GeoIP service
+            # For demo purposes, we'll use IP ranges for basic geographic detection
+            ip_int = int(ip_obj)
+            
+            # Simplified geographic mapping (would use real GeoIP database)
+            if ip_int < 16777216:  # 1.0.0.0/8 range
+                return "region_asia"
+            elif ip_int < 33554432:  # 2.0.0.0/8 range  
+                return "region_europe"
+            else:
+                return "region_americas"
+                
+        except ValueError:
+            return None
+
+
+@dataclass
+class AnomalyEvent:
+    """Represents a detected anomaly."""
+    user_id: str
+    session_id: str
+    anomaly_type: AnomalyType
+    threat_level: ThreatLevel
+    confidence_score: float
+    details: Dict[str, Any]
+    detected_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert anomaly event to dictionary for event publishing."""
+        return {
+            'user_id': self.user_id,
+            'session_id': self.session_id,
+            'anomaly_type': self.anomaly_type.value,
+            'threat_level': self.threat_level.value,
+            'confidence_score': self.confidence_score,
+            'details': self.details,
+            'detected_at': self.detected_at.isoformat()
+        }
+
+
+class AnomalyDetector:
+    """Advanced anomaly detection engine for session behavioral analysis."""
+    
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+        self.config = config
+        self.logger = logger.getChild("AnomalyDetector")
+        
+        # User behavioral baselines
+        self.user_baselines: Dict[str, UserBaseline] = {}
+        self.recent_anomalies: deque = deque(maxlen=1000)
+        
+        # Configuration
+        self.detection_config = self.config.get('anomaly_detection', {})
+        self.thresholds = self.detection_config.get('thresholds', {
+            'unusual_hour_std_dev': 2.0,
+            'rapid_cycling_window': 300,  # 5 minutes
+            'rapid_cycling_threshold': 5,
+            'concurrent_ip_limit': 3,
+            'location_change_time_limit': 3600,  # 1 hour
+            'session_duration_std_dev': 2.5,
+            'failed_auth_spike_threshold': 5,
+            'failed_auth_window': 300
+        })
+        
+        self.auto_revoke = self.detection_config.get('auto_revoke', True)
+        self.report_only = self.detection_config.get('report_only', False)
+        
+        # Tracking data
+        self.session_events: deque = deque(maxlen=10000)
+        self.failed_auth_tracking: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._lock = asyncio.Lock()
+    
+    async def initialize(self):
+        """Initialize the anomaly detector."""
+        self.logger.info("Initializing AnomalyDetector")
+        
+        # Load existing baselines if available
+        await self._load_baselines()
+    
+    async def analyze_session_event(self, session_data: Dict[str, Any], 
+                                  event_type: str) -> List[AnomalyEvent]:
+        """Analyze a session event for anomalies."""
+        anomalies = []
+        
+        try:
+            async with self._lock:
+                user_id = session_data.get('user_id')
+                session_id = session_data.get('session_id')
+                
+                if not user_id or not session_id:
+                    return anomalies
+                
+                # Ensure user baseline exists
+                if user_id not in self.user_baselines:
+                    self.user_baselines[user_id] = UserBaseline(user_id=user_id)
+                
+                baseline = self.user_baselines[user_id]
+                
+                # Track session event
+                self.session_events.append({
+                    'user_id': user_id,
+                    'session_id': session_id,
+                    'event_type': event_type,
+                    'timestamp': datetime.utcnow(),
+                    'data': session_data
+                })
+                
+                # Perform different anomaly checks based on event type
+                if event_type == 'session_created':
+                    anomalies.extend(await self._check_login_anomalies(session_data, baseline))
+                    anomalies.extend(await self._check_concurrent_sessions(session_data, baseline))
+                    anomalies.extend(await self._check_geolocation_anomalies(session_data, baseline))
+                
+                elif event_type == 'session_ended':
+                    anomalies.extend(await self._check_session_duration_anomalies(session_data, baseline))
+                
+                elif event_type == 'failed_authentication':
+                    anomalies.extend(await self._check_failed_auth_anomalies(session_data, baseline))
+                
+                # Check for rapid session cycling
+                anomalies.extend(await self._check_rapid_cycling(user_id, baseline))
+                
+                # Update baseline with new data
+                baseline.update_baseline(session_data)
+                
+                # Store detected anomalies
+                for anomaly in anomalies:
+                    self.recent_anomalies.append(anomaly)
+                    self.logger.warning(f"Anomaly detected: {anomaly.anomaly_type.value} "
+                                      f"for user {user_id} with {anomaly.threat_level.value} threat level")
+        
+        except Exception as e:
+            self.logger.error(f"Error analyzing session event: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_login_anomalies(self, session_data: Dict[str, Any], 
+                                   baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for unusual login time anomalies."""
+        anomalies = []
+        
+        try:
+            created_at = session_data.get('created_at')
+            if not created_at:
+                return anomalies
+            
+            login_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            login_hour = login_time.hour
+            
+            # Check if user has established baseline
+            if len(baseline.login_time_history) < 5:
+                return anomalies  # Not enough data for baseline
+            
+            # Calculate if this hour is unusual
+            typical_hours = list(baseline.typical_login_hours)
+            if len(typical_hours) > 2:
+                hour_variance = statistics.variance(typical_hours) if len(typical_hours) > 1 else 0
+                
+                # Check if login hour is outside typical pattern
+                if login_hour not in baseline.typical_login_hours and hour_variance > 0:
+                    # Calculate how unusual this time is
+                    mean_hour = statistics.mean(typical_hours)
+                    std_dev = statistics.stdev(typical_hours) if len(typical_hours) > 1 else 1
+                    
+                    deviation = abs(login_hour - mean_hour)
+                    if deviation > self.thresholds['unusual_hour_std_dev'] * std_dev:
+                        threat_level = ThreatLevel.MEDIUM if deviation > 3 * std_dev else ThreatLevel.LOW
+                        confidence = min(0.95, deviation / (4 * std_dev))
+                        
+                        anomalies.append(AnomalyEvent(
+                            user_id=baseline.user_id,
+                            session_id=session_data.get('session_id'),
+                            anomaly_type=AnomalyType.UNUSUAL_LOGIN_TIME,
+                            threat_level=threat_level,
+                            confidence_score=confidence,
+                            details={
+                                'login_hour': login_hour,
+                                'typical_hours': list(baseline.typical_login_hours),
+                                'deviation': deviation,
+                                'std_dev': std_dev
+                            }
+                        ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking login anomalies: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_concurrent_sessions(self, session_data: Dict[str, Any], 
+                                       baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for concurrent sessions from multiple IP addresses."""
+        anomalies = []
+        
+        try:
+            user_id = baseline.user_id
+            current_ip = session_data.get('ip_address')
+            
+            if not current_ip:
+                return anomalies
+            
+            # Count recent IPs for this user from session events
+            recent_ips = set()
+            now = datetime.utcnow()
+            
+            for event in reversed(self.session_events):
+                if event['user_id'] == user_id and event['event_type'] == 'session_created':
+                    event_time = event['timestamp']
+                    if (now - event_time).seconds < 3600:  # Within last hour
+                        event_ip = event['data'].get('ip_address')
+                        if event_ip:
+                            recent_ips.add(event_ip)
+                    else:
+                        break  # Events are ordered by time
+            
+            if len(recent_ips) >= self.thresholds['concurrent_ip_limit']:
+                threat_level = ThreatLevel.HIGH if len(recent_ips) > 5 else ThreatLevel.MEDIUM
+                confidence = min(0.95, len(recent_ips) / 10.0)
+                
+                anomalies.append(AnomalyEvent(
+                    user_id=user_id,
+                    session_id=session_data.get('session_id'),
+                    anomaly_type=AnomalyType.CONCURRENT_IP_SESSIONS,
+                    threat_level=threat_level,
+                    confidence_score=confidence,
+                    details={
+                        'concurrent_ips': list(recent_ips),
+                        'ip_count': len(recent_ips),
+                        'current_ip': current_ip
+                    }
+                ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking concurrent sessions: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_geolocation_anomalies(self, session_data: Dict[str, Any], 
+                                         baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for impossible geolocation changes."""
+        anomalies = []
+        
+        try:
+            current_ip = session_data.get('ip_address')
+            if not current_ip:
+                return anomalies
+            
+            current_location = baseline._extract_location_from_ip(current_ip)
+            if not current_location or len(baseline.ip_history) < 2:
+                return anomalies
+            
+            # Check recent location changes
+            recent_locations = []
+            now = datetime.utcnow()
+            
+            for event in reversed(self.session_events):
+                if (event['user_id'] == baseline.user_id and 
+                    event['event_type'] == 'session_created' and
+                    (now - event['timestamp']).seconds < self.thresholds['location_change_time_limit']):
+                    
+                    event_ip = event['data'].get('ip_address')
+                    if event_ip:
+                        location = baseline._extract_location_from_ip(event_ip)
+                        if location and location != current_location:
+                            recent_locations.append(location)
+            
+            # If user changed locations too quickly
+            if recent_locations and current_location not in baseline.typical_locations:
+                different_locations = len(set(recent_locations + [current_location]))
+                
+                if different_locations > 1:  # Multiple locations in short time
+                    threat_level = ThreatLevel.HIGH if different_locations > 2 else ThreatLevel.MEDIUM
+                    confidence = min(0.9, different_locations / 3.0)
+                    
+                    anomalies.append(AnomalyEvent(
+                        user_id=baseline.user_id,
+                        session_id=session_data.get('session_id'),
+                        anomaly_type=AnomalyType.GEOLOCATION_MISMATCH,
+                        threat_level=threat_level,
+                        confidence_score=confidence,
+                        details={
+                            'current_location': current_location,
+                            'recent_locations': recent_locations,
+                            'typical_locations': list(baseline.typical_locations),
+                            'time_window': self.thresholds['location_change_time_limit']
+                        }
+                    ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking geolocation anomalies: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_rapid_cycling(self, user_id: str, baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for rapid session creation/destruction cycles."""
+        anomalies = []
+        
+        try:
+            now = datetime.utcnow()
+            window_start = now - timedelta(seconds=self.thresholds['rapid_cycling_window'])
+            
+            # Count recent session creation events for this user
+            recent_sessions = 0
+            for event in reversed(self.session_events):
+                if (event['user_id'] == user_id and 
+                    event['event_type'] == 'session_created' and
+                    event['timestamp'] >= window_start):
+                    recent_sessions += 1
+                elif event['timestamp'] < window_start:
+                    break
+            
+            if recent_sessions >= self.thresholds['rapid_cycling_threshold']:
+                threat_level = ThreatLevel.HIGH if recent_sessions > 10 else ThreatLevel.MEDIUM
+                confidence = min(0.95, recent_sessions / 15.0)
+                
+                anomalies.append(AnomalyEvent(
+                    user_id=user_id,
+                    session_id="",  # This is a pattern-based anomaly
+                    anomaly_type=AnomalyType.RAPID_SESSION_CYCLING,
+                    threat_level=threat_level,
+                    confidence_score=confidence,
+                    details={
+                        'session_count': recent_sessions,
+                        'time_window': self.thresholds['rapid_cycling_window'],
+                        'threshold': self.thresholds['rapid_cycling_threshold']
+                    }
+                ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking rapid cycling: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_session_duration_anomalies(self, session_data: Dict[str, Any], 
+                                              baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for unusual session duration patterns."""
+        anomalies = []
+        
+        try:
+            duration = session_data.get('duration')
+            if not duration or len(baseline.session_count_history) < 5:
+                return anomalies
+            
+            durations = list(baseline.session_count_history)
+            mean_duration = statistics.mean(durations)
+            std_dev = statistics.stdev(durations) if len(durations) > 1 else mean_duration * 0.5
+            
+            deviation = abs(duration - mean_duration)
+            if deviation > self.thresholds['session_duration_std_dev'] * std_dev:
+                threat_level = ThreatLevel.MEDIUM if deviation > 3 * std_dev else ThreatLevel.LOW
+                confidence = min(0.8, deviation / (4 * std_dev))
+                
+                anomalies.append(AnomalyEvent(
+                    user_id=baseline.user_id,
+                    session_id=session_data.get('session_id'),
+                    anomaly_type=AnomalyType.SESSION_DURATION_ANOMALY,
+                    threat_level=threat_level,
+                    confidence_score=confidence,
+                    details={
+                        'duration': duration,
+                        'mean_duration': mean_duration,
+                        'std_dev': std_dev,
+                        'deviation': deviation
+                    }
+                ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking session duration anomalies: {str(e)}")
+        
+        return anomalies
+    
+    async def _check_failed_auth_anomalies(self, session_data: Dict[str, Any], 
+                                         baseline: UserBaseline) -> List[AnomalyEvent]:
+        """Check for failed authentication spikes."""
+        anomalies = []
+        
+        try:
+            user_id = baseline.user_id
+            now = datetime.utcnow()
+            
+            # Track failed authentication attempt
+            self.failed_auth_tracking[user_id].append(now)
+            
+            # Count recent failed attempts
+            window_start = now - timedelta(seconds=self.thresholds['failed_auth_window'])
+            recent_failures = sum(1 for ts in self.failed_auth_tracking[user_id] 
+                                if ts >= window_start)
+            
+            if recent_failures >= self.thresholds['failed_auth_spike_threshold']:
+                threat_level = ThreatLevel.HIGH if recent_failures > 10 else ThreatLevel.MEDIUM
+                confidence = min(0.95, recent_failures / 20.0)
+                
+                anomalies.append(AnomalyEvent(
+                    user_id=user_id,
+                    session_id=session_data.get('session_id', ''),
+                    anomaly_type=AnomalyType.FAILED_AUTH_SPIKE,
+                    threat_level=threat_level,
+                    confidence_score=confidence,
+                    details={
+                        'failed_attempts': recent_failures,
+                        'time_window': self.thresholds['failed_auth_window'],
+                        'threshold': self.thresholds['failed_auth_spike_threshold']
+                    }
+                ))
+        
+        except Exception as e:
+            self.logger.error(f"Error checking failed auth anomalies: {str(e)}")
+        
+        return anomalies
+    
+    async def get_user_risk_score(self, user_id: str) -> float:
+        """Calculate overall risk score for a user based on recent anomalies."""
+        try:
+            now = datetime.utcnow()
+            risk_score = 0.0
+            
+            # Weight anomalies by recency and severity
+            for anomaly in self.recent_anomalies:
+                if (anomaly.user_id == user_id and 
+                    (now - anomaly.detected_at).seconds < 3600):  # Last hour
+                    
+                    # Weight by threat level
+                    weight = {
+                        ThreatLevel.LOW: 0.2,
+                        ThreatLevel.MEDIUM: 0.5,
+                        ThreatLevel.HIGH: 1.0
+                    }.get(anomaly.threat_level, 0.1)
+                    
+                    # Decay by time
+                    age_minutes = (now - anomaly.detected_at).seconds / 60
+                    time_decay = max(0.1, 1.0 - (age_minutes / 60))  # Decay over 1 hour
+                    
+                    risk_score += weight * anomaly.confidence_score * time_decay
+            
+            return min(1.0, risk_score)  # Cap at 1.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating risk score: {str(e)}")
+            return 0.0
+    
+    async def _load_baselines(self):
+        """Load existing user baselines from storage (placeholder)."""
+        # In production, this would load from persistent storage
+        self.logger.debug("Loading user baselines from storage")
+    
+    async def _save_baselines(self):
+        """Save user baselines to persistent storage (placeholder)."""
+        # In production, this would save to persistent storage
+        self.logger.debug("Saving user baselines to storage")
+
+
+class SessionMonitor:
+    """Enhanced session monitor with advanced anomaly detection capabilities."""
+    
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger, 
+                 session_manager=None, security_subsystem=None, event_bus=None):
+        self.config = config
+        self.logger = logger.getChild("SessionMonitor")
+        
+        # External dependencies
+        self.session_manager = session_manager
+        self.security_subsystem = security_subsystem
+        self.event_bus = event_bus
+        
+        # Core components
+        self.anomaly_detector = AnomalyDetector(config, logger)
+        
+        # Metrics storage
+        self.metrics = {
+            'sessions_created': 0,
+            'sessions_expired': 0,
+            'sessions_revoked': 0,
+            'failed_authentications': 0,
+            'active_sessions_peak': 0,
+            'anomalies_detected': 0,
+            'high_threat_anomalies': 0,
+            'auto_revocations': 0,
+            'last_collection': None
+        }
+        
+        # Configuration
+        self.collect_interval = self.config.get('monitor_interval', 60)
+        self.anomaly_config = self.config.get('anomaly_detection', {})
+        self.auto_revoke_enabled = self.anomaly_config.get('auto_revoke', True)
+        self.report_only = self.anomaly_config.get('report_only', False)
+        
+        # State
+        self._running = False
+    
+    async def initialize(self):
+        """Initialize the session monitor."""
+        self.logger.info("Initializing Enhanced SessionMonitor with Anomaly Detection")
+        await self.anomaly_detector.initialize()
+    
+    async def start(self):
+        """Start the session monitor."""
+        self.logger.info("Starting Enhanced SessionMonitor")
+        self._running = True
+    
+    async def stop(self):
+        """Stop the session monitor."""
+        self.logger.info("Stopping Enhanced SessionMonitor")
+        self._running = False
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform comprehensive health check."""
+        return {
+            'status': 'healthy',
+            'anomaly_detector': 'active',
+            'baselines_count': len(self.anomaly_detector.user_baselines),
+            'recent_anomalies': len(self.anomaly_detector.recent_anomalies)
+        }
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get detailed status including anomaly detection metrics."""
+        return {
+            'metrics': self.metrics.copy(),
+            'collect_interval': self.collect_interval,
+            'anomaly_detection': {
+                'enabled': True,
+                'auto_revoke': self.auto_revoke_enabled,
+                'report_only': self.report_only,
+                'user_baselines': len(self.anomaly_detector.user_baselines),
+                'recent_anomalies': len(self.anomaly_detector.recent_anomalies),
+                'thresholds': self.anomaly_detector.thresholds
+            }
+        }
+    
+    async def collect_metrics(self):
+        """Enhanced metrics collection with anomaly analysis."""
+        try:
+            self.metrics['last_collection'] = datetime.utcnow().isoformat()
+            
+            # Collect session metrics from session manager if available
+            if self.session_manager:
+                status = await self.session_manager.get_status()
+                self.metrics['active_sessions_peak'] = max(
+                    self.metrics['active_sessions_peak'],
+                    status.get('active_sessions', 0)
+                )
+            
+            # Perform periodic anomaly analysis
+            await self._analyze_user_behaviors()
+            
+            self.logger.debug("Enhanced metrics collection completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error collecting enhanced metrics: {str(e)}")
+    
+    async def record_session_event(self, event_type: str, session_data: Dict[str, Any]):
+        """Record and analyze session events for anomalies."""
+        try:
+            # Update basic metrics
+            if event_type == 'session_created':
+                self.metrics['sessions_created'] += 1
+            elif event_type == 'session_expired':
+                self.metrics['sessions_expired'] += 1
+            elif event_type == 'session_revoked':
+                self.metrics['sessions_revoked'] += 1
+            elif event_type == 'failed_authentication':
+                self.metrics['failed_authentications'] += 1
+            
+            # Perform anomaly analysis
+            anomalies = await self.anomaly_detector.analyze_session_event(session_data, event_type)
+            
+            if anomalies:
+                self.metrics['anomalies_detected'] += len(anomalies)
+                
+                # Process each detected anomaly
+                for anomaly in anomalies:
+                    await self._process_anomaly(anomaly)
+            
+        except Exception as e:
+            self.logger.error(f"Error recording session event: {str(e)}")
+    
+    async def _process_anomaly(self, anomaly: AnomalyEvent):
+        """Process a detected anomaly with appropriate security actions."""
+        try:
+            self.logger.warning(f"Processing anomaly: {anomaly.anomaly_type.value} "
+                              f"for user {anomaly.user_id} (threat: {anomaly.threat_level.value})")
+            
+            # Count high-threat anomalies
+            if anomaly.threat_level == ThreatLevel.HIGH:
+                self.metrics['high_threat_anomalies'] += 1
+            
+            # Publish anomaly event to event bus
+            if self.event_bus:
+                await self.event_bus.publish('session.anomaly', anomaly.to_dict())
+            
+            # Trigger security subsystem detection
+            if self.security_subsystem:
+                await self.security_subsystem.detect_threat({
+                    'type': 'session_anomaly',
+                    'user_id': anomaly.user_id,
+                    'session_id': anomaly.session_id,
+                    'threat_level': anomaly.threat_level.value,
+                    'details': anomaly.details
+                })
+            
+            # Auto-revoke session for high-threat anomalies
+            if (not self.report_only and 
+                self.auto_revoke_enabled and 
+                anomaly.threat_level == ThreatLevel.HIGH and
+                anomaly.session_id and 
+                self.session_manager):
+                
+                success = await self.session_manager.revoke_session(
+                    anomaly.session_id, 
+                    f"auto_revocation_{anomaly.anomaly_type.value}"
+                )
+                
+                if success:
+                    self.metrics['auto_revocations'] += 1
+                    self.logger.warning(f"Auto-revoked session {anomaly.session_id} "
+                                      f"due to {anomaly.anomaly_type.value}")
+                    
+                    # Publish revocation event
+                    if self.event_bus:
+                        await self.event_bus.publish('session.auto_revoked', {
+                            'session_id': anomaly.session_id,
+                            'user_id': anomaly.user_id,
+                            'reason': anomaly.anomaly_type.value,
+                            'threat_level': anomaly.threat_level.value,
+                            'timestamp': datetime.utcnow().isoformat()
+                        })
+        
+        except Exception as e:
+            self.logger.error(f"Error processing anomaly: {str(e)}")
+    
+    async def _analyze_user_behaviors(self):
+        """Perform periodic analysis of user behavioral patterns."""
+        try:
+            # Get risk scores for all users with recent activity
+            for user_id in self.anomaly_detector.user_baselines.keys():
+                risk_score = await self.anomaly_detector.get_user_risk_score(user_id)
+                
+                if risk_score > 0.7:  # High overall risk
+                    self.logger.warning(f"User {user_id} has elevated risk score: {risk_score:.2f}")
+                    
+                    # Could trigger additional security measures here
+                    if self.event_bus:
+                        await self.event_bus.publish('user.high_risk', {
+                            'user_id': user_id,
+                            'risk_score': risk_score,
+                            'timestamp': datetime.utcnow().isoformat()
+                        })
+        
+        except Exception as e:
+            self.logger.error(f"Error analyzing user behaviors: {str(e)}")
+    
+    async def get_user_anomalies(self, user_id: str, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent anomalies for a specific user."""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            user_anomalies = []
+            
+            for anomaly in self.anomaly_detector.recent_anomalies:
+                if (anomaly.user_id == user_id and 
+                    anomaly.detected_at >= cutoff_time):
+                    user_anomalies.append(anomaly.to_dict())
+            
+            return sorted(user_anomalies, key=lambda x: x['detected_at'], reverse=True)
+            
+        except Exception as e:
+            self.logger.error(f"Error getting user anomalies: {str(e)}")
+            return []
+    
+    async def get_anomaly_summary(self, hours: int = 24) -> Dict[str, Any]:
+        """Get summary of detected anomalies."""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            
+            summary = {
+                'total_anomalies': 0,
+                'by_type': defaultdict(int),
+                'by_threat_level': defaultdict(int),
+                'unique_users': set(),
+                'time_range_hours': hours
+            }
+            
+            for anomaly in self.anomaly_detector.recent_anomalies:
+                if anomaly.detected_at >= cutoff_time:
+                    summary['total_anomalies'] += 1
+                    summary['by_type'][anomaly.anomaly_type.value] += 1
+                    summary['by_threat_level'][anomaly.threat_level.value] += 1
+                    summary['unique_users'].add(anomaly.user_id)
+            
+            summary['unique_users'] = len(summary['unique_users'])
+            summary['by_type'] = dict(summary['by_type'])
+            summary['by_threat_level'] = dict(summary['by_threat_level'])
+            
+            return summary
+            
+        except Exception as e:
+            self.logger.error(f"Error getting anomaly summary: {str(e)}")
+            return {}
+    
+    # Legacy compatibility methods
+    def record_event(self, event_type: str, data: Dict[str, Any] = None):
+        """Legacy method for backward compatibility."""
+        asyncio.create_task(self.record_session_event(event_type, data or {}))
