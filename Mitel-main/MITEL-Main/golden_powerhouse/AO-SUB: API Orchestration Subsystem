@@ -1,0 +1,1392 @@
+"""
+AO-SUB: API Orchestration Subsystem for Ghost / G.Legion Architecture
+Production-grade API gateway with rate limiting, transformations, and health monitoring
+"""
+
+import asyncio
+import aiohttp
+import yaml
+import json
+import time
+import logging
+import hashlib
+import uuid
+from typing import Dict, List, Any, Optional, Union, Callable, Set, Tuple
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
+import argparse
+import sys
+from urllib.parse import urljoin, urlparse
+import weakref
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import queue
+import secrets
+import base64
+
+# Import from EB-SUB (Event Bus Subsystem)
+try:
+    from eb_sub import GhostSubsystemBus, GhostEvent, EventPriority
+except ImportError:
+    # Fallback for standalone usage
+    class GhostEvent:
+        def __init__(self, event_type, data, **kwargs):
+            self.event_type = event_type
+            self.data = data
+            self.event_id = str(uuid.uuid4())
+    
+    class EventPriority:
+        LOW = 1
+        NORMAL = 2
+        HIGH = 3
+        CRITICAL = 4
+    
+    class GhostSubsystemBus:
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self): pass
+        async def stop(self): pass
+        def publish_sync(self, *args, **kwargs): pass
+        async def publish_async(self, *args, **kwargs): pass
+
+
+class APIMethod(Enum):
+    GET = "GET"
+    POST = "POST"
+    PUT = "PUT"
+    DELETE = "DELETE"
+    PATCH = "PATCH"
+    HEAD = "HEAD"
+    OPTIONS = "OPTIONS"
+
+
+class APIAuthType(Enum):
+    NONE = "none"
+    API_KEY = "api_key"
+    BEARER = "bearer"
+    BASIC = "basic"
+    OAUTH2 = "oauth2"
+    CUSTOM = "custom"
+
+
+class RateLimitStrategy(Enum):
+    TOKEN_BUCKET = "token_bucket"
+    LEAKY_BUCKET = "leaky_bucket"
+    SLIDING_WINDOW = "sliding_window"
+
+
+class APIStatus(Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded" 
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class APIEndpoint:
+    """Configuration for an external API endpoint"""
+    name: str
+    base_url: str
+    auth_type: APIAuthType = APIAuthType.NONE
+    api_key: Optional[str] = None
+    bearer_token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    timeout: float = 30.0
+    max_retries: int = 3
+    retry_backoff: float = 1.0
+    rate_limit: Optional[Dict] = None
+    health_check_path: str = "/health"
+    health_check_interval: int = 300  # seconds
+    enabled: bool = True
+    priority: int = 1
+    tags: Set[str] = field(default_factory=set)
+
+
+@dataclass
+class APIRequest:
+    """Represents an API request"""
+    endpoint_name: str
+    path: str
+    method: APIMethod = APIMethod.GET
+    params: Optional[Dict] = None
+    data: Optional[Any] = None
+    headers: Optional[Dict[str, str]] = None
+    timeout: Optional[float] = None
+    retry_count: int = 0
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    callback: Optional[Callable] = None
+
+
+@dataclass
+class APIResponse:
+    """Represents an API response"""
+    request_id: str
+    endpoint_name: str
+    status_code: int
+    data: Any = None
+    headers: Optional[Dict] = None
+    error: Optional[str] = None
+    response_time: float = 0.0
+    timestamp: datetime = field(default_factory=datetime.now)
+    retry_count: int = 0
+
+
+class RateLimiter:
+    """Advanced rate limiter with multiple strategies"""
+    
+    def __init__(self, strategy: RateLimitStrategy = RateLimitStrategy.TOKEN_BUCKET,
+                 rate: float = 10.0, capacity: int = 100, window_size: int = 60):
+        self.strategy = strategy
+        self.rate = rate  # requests per second
+        self.capacity = capacity  # max requests
+        self.window_size = window_size  # for sliding window
+        
+        # Token bucket state
+        self.tokens = float(capacity)
+        self.last_update = time.time()
+        
+        # Sliding window state
+        self.requests = []
+        
+        # Thread safety
+        self._lock = threading.RLock()
+        
+        self.logger = logging.getLogger("Ghost.AO-SUB")
+        
+        # Register event handlers
+        self._register_event_handlers()
+    
+    def _register_event_handlers(self):
+        """Register handlers for Ghost events"""
+        self.event_bus.subscribe("API_REQUEST", self._handle_api_request_event)
+        self.event_bus.subscribe("SYSTEM_SHUTDOWN", self._handle_shutdown_event)
+        self.event_bus.subscribe("AO_STATUS_REQUEST", self._handle_status_request)
+    
+    async def start(self):
+        """Start the AO-SUB subsystem"""
+        if not self._is_running:
+            self._is_running = True
+            
+            # Start components
+            await self.client_manager.initialize()
+            self.event_bus.start()
+            
+            # Start request processor
+            loop = asyncio.get_event_loop()
+            self._processor_task = loop.create_task(self._process_requests())
+            
+            # Publish startup event
+            await self.event_bus.publish_async(
+                "AO_SUBSYSTEM_READY",
+                {"subsystem": "AO-SUB", "timestamp": datetime.now().isoformat()},
+                priority=EventPriority.HIGH
+            )
+            
+            self.logger.info("AO-SUB started successfully")
+    
+    async def stop(self):
+        """Stop the AO-SUB subsystem"""
+        if self._is_running:
+            self._is_running = False
+            
+            # Stop processor
+            if self._processor_task:
+                self._processor_task.cancel()
+                try:
+                    await self._processor_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Stop components
+            await self.client_manager.shutdown()
+            await self.event_bus.stop()
+            
+            self.logger.info("AO-SUB stopped")
+    
+    async def _process_requests(self):
+        """Process queued API requests"""
+        while self._is_running:
+            try:
+                # Get request from queue with timeout
+                request = await asyncio.wait_for(
+                    self.request_queue.get(), timeout=1.0
+                )
+                
+                # Make the API request
+                response = await self.client_manager.make_request(request)
+                
+                # Handle response
+                await self._handle_response(request, response)
+                
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                self.logger.error(f"Request processor error: {e}")
+    
+    async def _handle_response(self, request: APIRequest, response: APIResponse):
+        """Handle API response"""
+        # Call response callback if provided
+        if request.callback:
+            try:
+                if asyncio.iscoroutinefunction(request.callback):
+                    await request.callback(response)
+                else:
+                    request.callback(response)
+            except Exception as e:
+                self.logger.error(f"Response callback error: {e}")
+        
+        # Publish response event
+        event_data = {
+            'request_id': response.request_id,
+            'endpoint': response.endpoint_name,
+            'status_code': response.status_code,
+            'response_time': response.response_time,
+            'success': response.error is None,
+            'data': response.data
+        }
+        
+        event_type = "API_RESPONSE_SUCCESS" if response.error is None else "API_RESPONSE_ERROR"
+        priority = EventPriority.NORMAL if response.error is None else EventPriority.HIGH
+        
+        await self.event_bus.publish_async(event_type, event_data, priority=priority)
+    
+    async def _handle_api_request_event(self, event: GhostEvent):
+        """Handle API request events from other subsystems"""
+        try:
+            data = event.data
+            
+            request = APIRequest(
+                endpoint_name=data['endpoint'],
+                path=data['path'],
+                method=APIMethod(data.get('method', 'GET')),
+                params=data.get('params'),
+                data=data.get('data'),
+                headers=data.get('headers'),
+                timeout=data.get('timeout'),
+                metadata=data.get('metadata', {})
+            )
+            
+            # Add to processing queue
+            await self.request_queue.put(request)
+            
+            self.logger.debug(f"Queued API request: {request.request_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling API request event: {e}")
+    
+    async def _handle_shutdown_event(self, event: GhostEvent):
+        """Handle system shutdown events"""
+        self.logger.info("Received shutdown event, stopping AO-SUB")
+        await self.stop()
+    
+    async def _handle_status_request(self, event: GhostEvent):
+        """Handle status request events"""
+        stats = self.get_comprehensive_stats()
+        
+        await self.event_bus.publish_async(
+            "AO_STATUS_RESPONSE",
+            {
+                'subsystem': 'AO-SUB',
+                'stats': stats,
+                'timestamp': datetime.now().isoformat()
+            },
+            priority=EventPriority.NORMAL
+        )
+    
+    async def make_request(self, endpoint_name: str, path: str, 
+                          method: APIMethod = APIMethod.GET,
+                          params: Optional[Dict] = None,
+                          data: Optional[Any] = None,
+                          headers: Optional[Dict] = None,
+                          callback: Optional[Callable] = None) -> str:
+        """Make an API request and return request ID"""
+        request = APIRequest(
+            endpoint_name=endpoint_name,
+            path=path,
+            method=method,
+            params=params,
+            data=data,
+            headers=headers,
+            callback=callback
+        )
+        
+        await self.request_queue.put(request)
+        return request.request_id
+    
+    async def make_request_sync(self, endpoint_name: str, path: str,
+                               method: APIMethod = APIMethod.GET,
+                               **kwargs) -> APIResponse:
+        """Make a synchronous API request and wait for response"""
+        request = APIRequest(
+            endpoint_name=endpoint_name,
+            path=path,
+            method=method,
+            **kwargs
+        )
+        
+        return await self.client_manager.make_request(request)
+    
+    def get_comprehensive_stats(self) -> Dict:
+        """Get comprehensive subsystem statistics"""
+        return {
+            'ao_sub': {
+                'is_running': self._is_running,
+                'queue_size': self.request_queue.qsize(),
+                'registered_callbacks': len(self.response_callbacks)
+            },
+            'client_manager': self.client_manager.get_stats(),
+            'event_bus': self.event_bus.get_stats() if hasattr(self.event_bus, 'get_stats') else {}
+        }
+    
+    def __enter__(self):
+        return self
+    
+    async def __aenter__(self):
+        await self.start()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop()
+
+
+# Configuration file generator
+def generate_sample_config(output_path: str = "ao_sub_config.yaml"):
+    """Generate a sample configuration file"""
+    sample_config = {
+        'endpoints': [
+            {
+                'name': 'virustotal_api',
+                'base_url': 'https://www.virustotal.com/vtapi/v2/',
+                'auth_type': 'api_key',
+                'api_key': 'your_virustotal_api_key_here',
+                'timeout': 30.0,
+                'max_retries': 3,
+                'retry_backoff': 1.0,
+                'rate_limit': {
+                    'strategy': 'token_bucket',
+                    'rate': 4,  # 4 requests per second
+                    'capacity': 20
+                },
+                'health_check_path': '/file/report',
+                'enabled': True,
+                'tags': ['security', 'malware_scan']
+            },
+            {
+                'name': 'shodan_api',
+                'base_url': 'https://api.shodan.io/',
+                'auth_type': 'api_key',
+                'api_key': 'your_shodan_api_key_here',
+                'timeout': 20.0,
+                'max_retries': 2,
+                'rate_limit': {
+                    'strategy': 'sliding_window',
+                    'capacity': 100,
+                    'window_size': 60
+                },
+                'enabled': True,
+                'tags': ['reconnaissance', 'network_scan']
+            },
+            {
+                'name': 'internal_ghost_api',
+                'base_url': 'https://internal.ghost.local/api/v1/',
+                'auth_type': 'bearer',
+                'bearer_token': 'your_internal_token_here',
+                'timeout': 10.0,
+                'max_retries': 1,
+                'health_check_path': '/status',
+                'enabled': True,
+                'priority': 1,
+                'tags': ['internal', 'ghost_native']
+            }
+        ],
+        'rate_limiting': {
+            'global_default': {
+                'strategy': 'token_bucket',
+                'rate': 10,
+                'capacity': 50
+            }
+        },
+        'transformers': {
+            'virustotal': {
+                'type': 'json',
+                'custom_fields': ['response_code', 'verbose_msg', 'scans']
+            },
+            'shodan': {
+                'type': 'json',
+                'custom_fields': ['ip_str', 'port', 'org', 'hostnames']
+            }
+        },
+        'health_monitoring': {
+            'check_interval': 300,
+            'timeout': 10,
+            'failure_threshold': 3
+        },
+        'logging': {
+            'level': 'INFO',
+            'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        }
+    }
+    
+    with open(output_path, 'w') as f:
+        yaml.dump(sample_config, f, default_flow_style=False, indent=2)
+    
+    print(f"Sample configuration generated at {output_path}")
+
+
+# CLI Interface
+async def main():
+    """Main CLI interface for AO-SUB"""
+    parser = argparse.ArgumentParser(
+        description="Ghost AO-SUB (API Orchestration Subsystem)"
+    )
+    
+    parser.add_argument(
+        '--config', '-c',
+        default='ao_sub_config.yaml',
+        help='Configuration file path'
+    )
+    
+    parser.add_argument(
+        '--generate-config',
+        action='store_true',
+        help='Generate sample configuration file'
+    )
+    
+    parser.add_argument(
+        '--test-endpoints',
+        action='store_true',
+        help='Test all configured endpoints'
+    )
+    
+    parser.add_argument(
+        '--stats',
+        action='store_true',
+        help='Show current statistics'
+    )
+    
+    parser.add_argument(
+        '--daemon', '-d',
+        action='store_true',
+        help='Run as daemon'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Logging level'
+    )
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Generate config if requested
+    if args.generate_config:
+        generate_sample_config(args.config)
+        return
+    
+    # Check if config exists
+    if not Path(args.config).exists():
+        print(f"Configuration file {args.config} not found.")
+        print("Generate one with: python ao_sub.py --generate-config")
+        return
+    
+    # Initialize AO-SUB
+    ao_sub = AOSubsystem(args.config)
+    
+    try:
+        await ao_sub.start()
+        
+        if args.test_endpoints:
+            await test_endpoints(ao_sub)
+        elif args.stats:
+            show_stats(ao_sub)
+        elif args.daemon:
+            await run_daemon(ao_sub)
+        else:
+            await run_interactive(ao_sub)
+    
+    except KeyboardInterrupt:
+        print("\nShutdown requested by user")
+    finally:
+        await ao_sub.stop()
+
+
+async def test_endpoints(ao_sub: AOSubsystem):
+    """Test all configured endpoints"""
+    print("🧪 Testing API endpoints...\n")
+    
+    for endpoint_name, endpoint in ao_sub.client_manager.endpoints.items():
+        if not endpoint.enabled:
+            print(f"⏭️  Skipping {endpoint_name} (disabled)")
+            continue
+        
+        print(f"🔍 Testing {endpoint_name}...")
+        
+        try:
+            # Simple health check request
+            response = await ao_sub.make_request_sync(
+                endpoint_name=endpoint_name,
+                path=endpoint.health_check_path,
+                method=APIMethod.GET
+            )
+            
+            if response.error:
+                print(f"❌ {endpoint_name}: {response.error}")
+            else:
+                print(f"✅ {endpoint_name}: {response.status_code} "
+                      f"({response.response_time:.2f}s)")
+        
+        except Exception as e:
+            print(f"❌ {endpoint_name}: {e}")
+        
+        print()
+
+
+def show_stats(ao_sub: AOSubsystem):
+    """Show comprehensive statistics"""
+    stats = ao_sub.get_comprehensive_stats()
+    
+    print("📊 AO-SUB Statistics\n")
+    
+    # AO-SUB status
+    ao_status = stats['ao_sub']
+    print(f"Status: {'🟢 Running' if ao_status['is_running'] else '🔴 Stopped'}")
+    print(f"Queue Size: {ao_status['queue_size']}")
+    print(f"Callbacks: {ao_status['registered_callbacks']}")
+    print()
+    
+    # Endpoints
+    endpoints = stats['client_manager']['endpoints']
+    print(f"📡 Endpoints ({len(endpoints)}):")
+    for name, endpoint_stats in endpoints.items():
+        status = "🟢" if endpoint_stats['enabled'] else "🔴"
+        print(f"  {status} {name}: {endpoint_stats['base_url']}")
+    print()
+    
+    # Health status
+    health_stats = stats['client_manager']['health']
+    print(f"🏥 Health Status:")
+    for endpoint, health in health_stats.items():
+        status_icon = {
+            'healthy': '🟢',
+            'degraded': '🟡', 
+            'unhealthy': '🔴',
+            'unknown': '⚪'
+        }.get(health['status'], '⚪')
+        print(f"  {status_icon} {endpoint}: {health['status']} "
+              f"({health['recent_success_rate']:.1f}% success)")
+    print()
+    
+    # Rate limiters
+    rate_limiters = stats['client_manager']['rate_limiters']
+    if rate_limiters:
+        print(f"🚦 Rate Limiters:")
+        for name, limiter_stats in rate_limiters.items():
+            utilization = limiter_stats.get('utilization', 0) * 100
+            print(f"  {name}: {limiter_stats['strategy']} "
+                  f"({utilization:.1f}% utilized)")
+        print()
+
+
+async def run_daemon(ao_sub: AOSubsystem):
+    """Run AO-SUB as a daemon"""
+    print("🚀 Starting AO-SUB daemon...")
+    print("Press Ctrl+C to stop")
+    
+    try:
+        # Keep running until interrupted
+        while True:
+            await asyncio.sleep(10)
+            
+            # Periodic health check
+            stats = ao_sub.get_comprehensive_stats()
+            if not stats['ao_sub']['is_running']:
+                print("⚠️  AO-SUB stopped unexpectedly, restarting...")
+                await ao_sub.start()
+    
+    except KeyboardInterrupt:
+        print("\n🛑 Daemon shutdown requested")
+
+
+async def run_interactive(ao_sub: AOSubsystem):
+    """Run AO-SUB in interactive mode"""
+    print("🎮 AO-SUB Interactive Mode")
+    print("Commands:")
+    print("  stats    - Show statistics")
+    print("  test     - Test endpoints") 
+    print("  request  - Make API request")
+    print("  quit     - Exit")
+    print()
+    
+    while True:
+        try:
+            command = input("AO-SUB> ").strip().lower()
+            
+            if command == 'quit' or command == 'exit':
+                break
+            elif command == 'stats':
+                show_stats(ao_sub)
+            elif command == 'test':
+                await test_endpoints(ao_sub)
+            elif command == 'request':
+                await interactive_request(ao_sub)
+            elif command == 'help':
+                print("Available commands: stats, test, request, quit")
+            else:
+                print("Unknown command. Type 'help' for available commands.")
+        
+        except (EOFError, KeyboardInterrupt):
+            break
+
+
+async def interactive_request(ao_sub: AOSubsystem):
+    """Interactive API request builder"""
+    try:
+        # Show available endpoints
+        endpoints = list(ao_sub.client_manager.endpoints.keys())
+        print("Available endpoints:")
+        for i, endpoint in enumerate(endpoints, 1):
+            print(f"  {i}. {endpoint}")
+        
+        # Get endpoint selection
+        choice = input("Select endpoint (number or name): ").strip()
+        
+        if choice.isdigit():
+            choice = int(choice) - 1
+            if 0 <= choice < len(endpoints):
+                endpoint_name = endpoints[choice]
+            else:
+                print("Invalid selection")
+                return
+        else:
+            endpoint_name = choice
+        
+        if endpoint_name not in ao_sub.client_manager.endpoints:
+            print("Endpoint not found")
+            return
+        
+        # Get path
+        path = input("Path (e.g., /api/users): ").strip()
+        
+        # Get method
+        method = input("Method [GET]: ").strip().upper() or "GET"
+        
+        # Make the request
+        print(f"\n🚀 Making {method} request to {endpoint_name}{path}...")
+        
+        response = await ao_sub.make_request_sync(
+            endpoint_name=endpoint_name,
+            path=path,
+            method=APIMethod(method)
+        )
+        
+        # Show response
+        print(f"\n📨 Response:")
+        print(f"Status: {response.status_code}")
+        print(f"Time: {response.response_time:.2f}s")
+        
+        if response.error:
+            print(f"Error: {response.error}")
+        else:
+            print("Data:", json.dumps(response.data, indent=2)[:500] + "..." 
+                  if len(str(response.data)) > 500 else json.dumps(response.data, indent=2))
+    
+    except Exception as e:
+        print(f"Request failed: {e}")
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        traceback.print_exc()
+        sys.exit(1) logging.getLogger(f"{self.__class__.__name__}")
+    
+    async def acquire(self, tokens: int = 1, key: Optional[str] = None) -> bool:
+        """Acquire tokens for rate limiting"""
+        with self._lock:
+            current_time = time.time()
+            
+            if self.strategy == RateLimitStrategy.TOKEN_BUCKET:
+                return self._token_bucket_acquire(tokens, current_time)
+            elif self.strategy == RateLimitStrategy.LEAKY_BUCKET:
+                return self._leaky_bucket_acquire(tokens, current_time)
+            elif self.strategy == RateLimitStrategy.SLIDING_WINDOW:
+                return self._sliding_window_acquire(tokens, current_time)
+            
+            return True
+    
+    def _token_bucket_acquire(self, tokens: int, current_time: float) -> bool:
+        """Token bucket algorithm"""
+        # Add tokens based on elapsed time
+        elapsed = current_time - self.last_update
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+        self.last_update = current_time
+        
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        
+        return False
+    
+    def _leaky_bucket_acquire(self, tokens: int, current_time: float) -> bool:
+        """Leaky bucket algorithm"""
+        # Similar to token bucket but with constant leak rate
+        elapsed = current_time - self.last_update
+        leaked = elapsed * self.rate
+        self.tokens = max(0, self.tokens - leaked)
+        self.last_update = current_time
+        
+        if self.tokens + tokens <= self.capacity:
+            self.tokens += tokens
+            return True
+        
+        return False
+    
+    def _sliding_window_acquire(self, tokens: int, current_time: float) -> bool:
+        """Sliding window algorithm"""
+        # Remove old requests outside the window
+        cutoff = current_time - self.window_size
+        self.requests = [req_time for req_time in self.requests if req_time > cutoff]
+        
+        if len(self.requests) + tokens <= self.capacity:
+            for _ in range(tokens):
+                self.requests.append(current_time)
+            return True
+        
+        return False
+    
+    def get_stats(self) -> Dict:
+        """Get rate limiter statistics"""
+        with self._lock:
+            current_time = time.time()
+            
+            if self.strategy == RateLimitStrategy.TOKEN_BUCKET:
+                elapsed = current_time - self.last_update
+                available = min(self.capacity, self.tokens + elapsed * self.rate)
+                return {
+                    'strategy': self.strategy.value,
+                    'available_tokens': available,
+                    'capacity': self.capacity,
+                    'rate': self.rate,
+                    'utilization': (self.capacity - available) / self.capacity
+                }
+            elif self.strategy == RateLimitStrategy.SLIDING_WINDOW:
+                cutoff = current_time - self.window_size
+                active_requests = [r for r in self.requests if r > cutoff]
+                return {
+                    'strategy': self.strategy.value,
+                    'active_requests': len(active_requests),
+                    'capacity': self.capacity,
+                    'window_size': self.window_size,
+                    'utilization': len(active_requests) / self.capacity
+                }
+            
+            return {'strategy': self.strategy.value}
+
+
+class DataTransformer:
+    """Transforms data between external APIs and Ghost native format"""
+    
+    def __init__(self):
+        self.transformers: Dict[str, Callable] = {}
+        self.reverse_transformers: Dict[str, Callable] = {}
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+    
+    def register_transformer(self, data_type: str, 
+                           to_ghost: Callable[[Any], Dict],
+                           from_ghost: Callable[[Dict], Any] = None):
+        """Register data transformation functions"""
+        self.transformers[data_type] = to_ghost
+        if from_ghost:
+            self.reverse_transformers[data_type] = from_ghost
+        
+        self.logger.debug(f"Registered transformer for {data_type}")
+    
+    def to_ghost_format(self, data: Any, data_type: str = "json") -> Dict:
+        """Transform external data to Ghost native format"""
+        try:
+            if data_type in self.transformers:
+                return self.transformers[data_type](data)
+            
+            # Default transformations
+            if data_type == "json":
+                return self._json_to_ghost(data)
+            elif data_type == "yaml":
+                return self._yaml_to_ghost(data)
+            elif data_type == "xml":
+                return self._xml_to_ghost(data)
+            else:
+                return self._generic_to_ghost(data)
+                
+        except Exception as e:
+            self.logger.error(f"Transformation error for {data_type}: {e}")
+            return self._error_response(data, str(e))
+    
+    def from_ghost_format(self, data: Dict, data_type: str = "json") -> Any:
+        """Transform Ghost native format to external format"""
+        try:
+            if data_type in self.reverse_transformers:
+                return self.reverse_transformers[data_type](data)
+            
+            # Default reverse transformations
+            if data_type == "json":
+                return self._ghost_to_json(data)
+            elif data_type == "yaml":
+                return self._ghost_to_yaml(data)
+            else:
+                return data
+                
+        except Exception as e:
+            self.logger.error(f"Reverse transformation error for {data_type}: {e}")
+            return data
+    
+    def _json_to_ghost(self, data: Any) -> Dict:
+        """Transform JSON to Ghost format"""
+        return {
+            'data_type': 'json',
+            'payload': data,
+            'timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'source': 'external_api',
+                'format': 'json'
+            }
+        }
+    
+    def _yaml_to_ghost(self, data: str) -> Dict:
+        """Transform YAML to Ghost format"""
+        parsed = yaml.safe_load(data) if isinstance(data, str) else data
+        return {
+            'data_type': 'yaml',
+            'payload': parsed,
+            'timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'source': 'external_api',
+                'format': 'yaml'
+            }
+        }
+    
+    def _xml_to_ghost(self, data: str) -> Dict:
+        """Basic XML to Ghost format (would need xml library in production)"""
+        return {
+            'data_type': 'xml',
+            'payload': {'raw_xml': data},
+            'timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'source': 'external_api',
+                'format': 'xml',
+                'note': 'Basic XML parsing - extend with xml.etree or lxml'
+            }
+        }
+    
+    def _generic_to_ghost(self, data: Any) -> Dict:
+        """Generic transformation for unknown data types"""
+        return {
+            'data_type': 'generic',
+            'payload': str(data) if not isinstance(data, (dict, list)) else data,
+            'timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'source': 'external_api',
+                'format': 'generic',
+                'original_type': type(data).__name__
+            }
+        }
+    
+    def _ghost_to_json(self, data: Dict) -> Any:
+        """Transform Ghost format to JSON"""
+        return data.get('payload', data)
+    
+    def _ghost_to_yaml(self, data: Dict) -> str:
+        """Transform Ghost format to YAML"""
+        payload = data.get('payload', data)
+        return yaml.dump(payload, default_flow_style=False)
+    
+    def _error_response(self, original_data: Any, error: str) -> Dict:
+        """Generate error response in Ghost format"""
+        return {
+            'data_type': 'error',
+            'payload': {
+                'error': error,
+                'original_data': str(original_data)[:1000]  # Truncate large data
+            },
+            'timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'source': 'ao_sub_transformer',
+                'format': 'error'
+            }
+        }
+
+
+class APIHealthMonitor:
+    """Monitors API endpoint health and manages fallbacks"""
+    
+    def __init__(self, check_interval: int = 300):
+        self.check_interval = check_interval
+        self.endpoint_status: Dict[str, APIStatus] = {}
+        self.health_history: Dict[str, List[Tuple[datetime, bool]]] = {}
+        self.fallback_endpoints: Dict[str, List[str]] = {}
+        self._monitoring_task = None
+        self._is_running = False
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+    
+    def add_endpoint(self, endpoint: APIEndpoint, fallbacks: List[str] = None):
+        """Add endpoint for health monitoring"""
+        self.endpoint_status[endpoint.name] = APIStatus.UNKNOWN
+        self.health_history[endpoint.name] = []
+        if fallbacks:
+            self.fallback_endpoints[endpoint.name] = fallbacks
+        
+        self.logger.info(f"Added endpoint {endpoint.name} for monitoring")
+    
+    def start_monitoring(self, client_manager):
+        """Start health monitoring background task"""
+        if not self._is_running:
+            self._is_running = True
+            loop = asyncio.get_event_loop()
+            self._monitoring_task = loop.create_task(
+                self._monitoring_loop(client_manager)
+            )
+            self.logger.info("Health monitoring started")
+    
+    async def stop_monitoring(self):
+        """Stop health monitoring"""
+        if self._is_running:
+            self._is_running = False
+            if self._monitoring_task:
+                self._monitoring_task.cancel()
+                try:
+                    await self._monitoring_task
+                except asyncio.CancelledError:
+                    pass
+            self.logger.info("Health monitoring stopped")
+    
+    async def _monitoring_loop(self, client_manager):
+        """Main monitoring loop"""
+        while self._is_running:
+            try:
+                for endpoint_name in self.endpoint_status.keys():
+                    await self._check_endpoint_health(endpoint_name, client_manager)
+                
+                await asyncio.sleep(self.check_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Health monitoring error: {e}")
+                await asyncio.sleep(min(self.check_interval, 60))
+    
+    async def _check_endpoint_health(self, endpoint_name: str, client_manager):
+        """Check health of a specific endpoint"""
+        try:
+            endpoint = client_manager.get_endpoint(endpoint_name)
+            if not endpoint or not endpoint.enabled:
+                return
+            
+            # Perform health check
+            start_time = time.time()
+            
+            health_url = urljoin(endpoint.base_url, endpoint.health_check_path)
+            
+            async with client_manager._session.get(
+                health_url,
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers=client_manager._get_auth_headers(endpoint)
+            ) as response:
+                response_time = time.time() - start_time
+                is_healthy = 200 <= response.status < 400
+                
+                # Update status
+                if is_healthy and response_time < 5.0:
+                    self.endpoint_status[endpoint_name] = APIStatus.HEALTHY
+                elif is_healthy:
+                    self.endpoint_status[endpoint_name] = APIStatus.DEGRADED
+                else:
+                    self.endpoint_status[endpoint_name] = APIStatus.UNHEALTHY
+                
+                # Record history
+                self.health_history[endpoint_name].append(
+                    (datetime.now(), is_healthy)
+                )
+                
+                # Keep only last 100 checks
+                if len(self.health_history[endpoint_name]) > 100:
+                    self.health_history[endpoint_name] = \
+                        self.health_history[endpoint_name][-100:]
+                
+                self.logger.debug(
+                    f"Health check {endpoint_name}: "
+                    f"{self.endpoint_status[endpoint_name].value} "
+                    f"({response_time:.2f}s)"
+                )
+                
+        except Exception as e:
+            self.endpoint_status[endpoint_name] = APIStatus.UNHEALTHY
+            self.health_history[endpoint_name].append(
+                (datetime.now(), False)
+            )
+            self.logger.warning(f"Health check failed for {endpoint_name}: {e}")
+    
+    def get_healthy_endpoint(self, primary_endpoint: str) -> Optional[str]:
+        """Get healthy endpoint, including fallbacks"""
+        # Check primary endpoint
+        if (self.endpoint_status.get(primary_endpoint) in 
+            [APIStatus.HEALTHY, APIStatus.DEGRADED]):
+            return primary_endpoint
+        
+        # Check fallbacks
+        fallbacks = self.fallback_endpoints.get(primary_endpoint, [])
+        for fallback in fallbacks:
+            if (self.endpoint_status.get(fallback) in 
+                [APIStatus.HEALTHY, APIStatus.DEGRADED]):
+                return fallback
+        
+        # Return primary if no healthy fallbacks (let it fail with proper error)
+        return primary_endpoint
+    
+    def get_health_stats(self) -> Dict:
+        """Get health statistics for all endpoints"""
+        stats = {}
+        for endpoint_name, status in self.endpoint_status.items():
+            history = self.health_history.get(endpoint_name, [])
+            recent_checks = [check for check in history 
+                           if check[0] > datetime.now() - timedelta(hours=1)]
+            
+            success_rate = 0
+            if recent_checks:
+                successful = sum(1 for _, success in recent_checks if success)
+                success_rate = successful / len(recent_checks) * 100
+            
+            stats[endpoint_name] = {
+                'status': status.value,
+                'total_checks': len(history),
+                'recent_success_rate': success_rate,
+                'last_check': history[-1][0].isoformat() if history else None
+            }
+        
+        return stats
+
+
+class APIClientManager:
+    """Manages external API clients with advanced features"""
+    
+    def __init__(self, config_path: Optional[str] = None):
+        self.endpoints: Dict[str, APIEndpoint] = {}
+        self.rate_limiters: Dict[str, RateLimiter] = {}
+        self.transformer = DataTransformer()
+        self.health_monitor = APIHealthMonitor()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._is_initialized = False
+        
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+        
+        # Load configuration if provided
+        if config_path:
+            self.load_config(config_path)
+    
+    def load_config(self, config_path: str):
+        """Load configuration from YAML file"""
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            # Load endpoints
+            for endpoint_config in config.get('endpoints', []):
+                endpoint = APIEndpoint(**endpoint_config)
+                self.add_endpoint(endpoint)
+            
+            # Load rate limiting configs
+            rate_configs = config.get('rate_limiting', {})
+            for endpoint_name, rate_config in rate_configs.items():
+                if endpoint_name in self.endpoints:
+                    strategy = RateLimitStrategy(
+                        rate_config.get('strategy', 'token_bucket')
+                    )
+                    limiter = RateLimiter(
+                        strategy=strategy,
+                        rate=rate_config.get('rate', 10),
+                        capacity=rate_config.get('capacity', 100),
+                        window_size=rate_config.get('window_size', 60)
+                    )
+                    self.rate_limiters[endpoint_name] = limiter
+            
+            # Load transformer configs
+            transformers = config.get('transformers', {})
+            for data_type, transform_config in transformers.items():
+                # This would load custom transformer functions
+                # For now, we use built-in transformations
+                pass
+            
+            self.logger.info(f"Loaded configuration from {config_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load config from {config_path}: {e}")
+            raise
+    
+    async def initialize(self):
+        """Initialize the API client manager"""
+        if not self._is_initialized:
+            # Create aiohttp session with appropriate settings
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=20,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
+            )
+            
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={'User-Agent': 'Ghost-AO-SUB/1.0'}
+            )
+            
+            # Start health monitoring
+            for endpoint in self.endpoints.values():
+                self.health_monitor.add_endpoint(endpoint)
+            
+            self.health_monitor.start_monitoring(self)
+            
+            self._is_initialized = True
+            self.logger.info("API Client Manager initialized")
+    
+    async def shutdown(self):
+        """Shutdown the API client manager"""
+        if self._is_initialized:
+            await self.health_monitor.stop_monitoring()
+            
+            if self._session:
+                await self._session.close()
+            
+            self._is_initialized = False
+            self.logger.info("API Client Manager shutdown")
+    
+    def add_endpoint(self, endpoint: APIEndpoint):
+        """Add an API endpoint"""
+        self.endpoints[endpoint.name] = endpoint
+        
+        # Create rate limiter if specified
+        if endpoint.rate_limit:
+            strategy = RateLimitStrategy(
+                endpoint.rate_limit.get('strategy', 'token_bucket')
+            )
+            limiter = RateLimiter(
+                strategy=strategy,
+                rate=endpoint.rate_limit.get('rate', 10),
+                capacity=endpoint.rate_limit.get('capacity', 100)
+            )
+            self.rate_limiters[endpoint.name] = limiter
+        
+        self.logger.info(f"Added endpoint: {endpoint.name}")
+    
+    def get_endpoint(self, name: str) -> Optional[APIEndpoint]:
+        """Get endpoint by name"""
+        return self.endpoints.get(name)
+    
+    def _get_auth_headers(self, endpoint: APIEndpoint) -> Dict[str, str]:
+        """Get authentication headers for endpoint"""
+        headers = endpoint.headers.copy()
+        
+        if endpoint.auth_type == APIAuthType.API_KEY and endpoint.api_key:
+            headers['X-API-Key'] = endpoint.api_key
+        elif endpoint.auth_type == APIAuthType.BEARER and endpoint.bearer_token:
+            headers['Authorization'] = f'Bearer {endpoint.bearer_token}'
+        elif (endpoint.auth_type == APIAuthType.BASIC and 
+              endpoint.username and endpoint.password):
+            credentials = f"{endpoint.username}:{endpoint.password}"
+            encoded = base64.b64encode(credentials.encode()).decode()
+            headers['Authorization'] = f'Basic {encoded}'
+        
+        return headers
+    
+    async def make_request(self, request: APIRequest) -> APIResponse:
+        """Make an API request with full feature support"""
+        if not self._is_initialized:
+            await self.initialize()
+        
+        start_time = time.time()
+        endpoint_name = request.endpoint_name
+        
+        try:
+            # Get healthy endpoint (includes fallback logic)
+            actual_endpoint_name = self.health_monitor.get_healthy_endpoint(
+                endpoint_name
+            )
+            endpoint = self.endpoints.get(actual_endpoint_name)
+            
+            if not endpoint or not endpoint.enabled:
+                raise ValueError(f"Endpoint {endpoint_name} not found or disabled")
+            
+            # Apply rate limiting
+            if endpoint_name in self.rate_limiters:
+                limiter = self.rate_limiters[endpoint_name]
+                if not await limiter.acquire():
+                    raise Exception("Rate limit exceeded")
+            
+            # Prepare request
+            url = urljoin(endpoint.base_url, request.path.lstrip('/'))
+            headers = self._get_auth_headers(endpoint)
+            
+            if request.headers:
+                headers.update(request.headers)
+            
+            timeout = aiohttp.ClientTimeout(
+                total=request.timeout or endpoint.timeout
+            )
+            
+            # Make the request with retries
+            response = await self._make_request_with_retries(
+                request, endpoint, url, headers, timeout, start_time
+            )
+            
+            return response
+            
+        except Exception as e:
+            response_time = time.time() - start_time
+            self.logger.error(f"Request {request.request_id} failed: {e}")
+            
+            return APIResponse(
+                request_id=request.request_id,
+                endpoint_name=endpoint_name,
+                status_code=0,
+                error=str(e),
+                response_time=response_time,
+                retry_count=request.retry_count
+            )
+    
+    async def _make_request_with_retries(self, request: APIRequest, 
+                                       endpoint: APIEndpoint, url: str,
+                                       headers: Dict, timeout: aiohttp.ClientTimeout,
+                                       start_time: float) -> APIResponse:
+        """Make request with exponential backoff retries"""
+        last_error = None
+        
+        for attempt in range(endpoint.max_retries + 1):
+            try:
+                # Prepare request data
+                request_kwargs = {
+                    'url': url,
+                    'method': request.method.value,
+                    'headers': headers,
+                    'timeout': timeout,
+                    'params': request.params
+                }
+                
+                if request.data is not None:
+                    if request.method in [APIMethod.POST, APIMethod.PUT, 
+                                        APIMethod.PATCH]:
+                        if isinstance(request.data, (dict, list)):
+                            request_kwargs['json'] = request.data
+                        else:
+                            request_kwargs['data'] = request.data
+                
+                # Make the actual request
+                async with self._session.request(**request_kwargs) as response:
+                    response_time = time.time() - start_time
+                    
+                    # Read response data
+                    try:
+                        if response.content_type == 'application/json':
+                            data = await response.json()
+                        else:
+                            data = await response.text()
+                    except:
+                        data = None
+                    
+                    # Transform response data
+                    if data is not None:
+                        content_type = response.content_type or 'json'
+                        if 'json' in content_type:
+                            data = self.transformer.to_ghost_format(data, 'json')
+                        elif 'yaml' in content_type:
+                            data = self.transformer.to_ghost_format(data, 'yaml')
+                        else:
+                            data = self.transformer.to_ghost_format(data, 'generic')
+                    
+                    return APIResponse(
+                        request_id=request.request_id,
+                        endpoint_name=request.endpoint_name,
+                        status_code=response.status,
+                        data=data,
+                        headers=dict(response.headers),
+                        response_time=response_time,
+                        retry_count=attempt
+                    )
+                    
+            except Exception as e:
+                last_error = e
+                
+                # Don't retry on certain errors
+                if isinstance(e, aiohttp.ClientError):
+                    if hasattr(e, 'status') and 400 <= e.status < 500:
+                        break  # Client errors shouldn't be retried
+                
+                if attempt < endpoint.max_retries:
+                    # Exponential backoff
+                    backoff_time = endpoint.retry_backoff * (2 ** attempt)
+                    await asyncio.sleep(backoff_time)
+                    self.logger.warning(
+                        f"Request {request.request_id} attempt {attempt + 1} failed: {e}. "
+                        f"Retrying in {backoff_time:.1f}s"
+                    )
+        
+        # All retries exhausted
+        response_time = time.time() - start_time
+        raise Exception(f"All {endpoint.max_retries + 1} attempts failed. "
+                       f"Last error: {last_error}")
+    
+    def get_stats(self) -> Dict:
+        """Get comprehensive API client statistics"""
+        stats = {
+            'endpoints': {},
+            'rate_limiters': {},
+            'health': self.health_monitor.get_health_stats()
+        }
+        
+        # Endpoint stats
+        for name, endpoint in self.endpoints.items():
+            stats['endpoints'][name] = {
+                'enabled': endpoint.enabled,
+                'base_url': endpoint.base_url,
+                'auth_type': endpoint.auth_type.value,
+                'max_retries': endpoint.max_retries,
+                'timeout': endpoint.timeout
+            }
+        
+        # Rate limiter stats
+        for name, limiter in self.rate_limiters.items():
+            stats['rate_limiters'][name] = limiter.get_stats()
+        
+        return stats
+
+
+class AOSubsystem:
+    """Main AO-SUB (API Orchestration Subsystem) class"""
+    
+    def __init__(self, config_path: str = "ao_sub_config.yaml"):
+        self.config_path = config_path
+        self.client_manager = APIClientManager(config_path)
+        self.event_bus = GhostSubsystemBus("AO-SUB")
+        self.request_queue = asyncio.Queue()
+        self.response_callbacks: Dict[str, Callable] = {}
+        
+        self._is_running = False
+        self._processor_task = None
+        
+        self.logger =

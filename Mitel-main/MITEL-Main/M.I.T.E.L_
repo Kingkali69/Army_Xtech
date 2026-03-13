@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+
+import asyncio
+import json
+import logging
+import hashlib
+import time
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.exceptions import InvalidSignature
+import psutil
+import platform
+import subprocess
+import os
+import yaml
+
+@dataclass
+class DeviceFingerprint:
+    mac_address: str
+    serial_number: str
+    vendor_id: str
+    product_id: str
+    device_type: str
+    hardware_signature: str
+    electrical_profile: Dict[str, float]
+    timing_characteristics: Dict[str, float]
+
+@dataclass
+class TrustCertificate:
+    device_id: str
+    public_key: bytes
+    certificate_chain: List[str]
+    issue_date: datetime
+    expiry_date: datetime
+    trust_level: int
+    revocation_status: bool
+
+@dataclass
+class BehavioralProfile:
+    keystroke_timing: Dict[str, float]
+    mouse_patterns: Dict[str, List[float]]
+    command_frequency: Dict[str, int]
+    usage_patterns: Dict[str, Any]
+    anomaly_score: float
+    last_updated: datetime
+
+@dataclass
+class ThreatEvent:
+    timestamp: datetime
+    device_id: str
+    threat_type: str
+    severity: str
+    description: str
+    response_action: str
+    investigation_data: Dict[str, Any]
+
+class MITELSubsystem:
+    def __init__(self, config: Dict[str, Any], event_bus=None):
+        self.config = config
+        self.event_bus = event_bus
+        self.logger = logging.getLogger(f"{__name__}.MITELSubsystem")
+        
+        # Core components
+        self.registered_devices: Dict[str, DeviceFingerprint] = {}
+        self.trust_certificates: Dict[str, TrustCertificate] = {}
+        self.behavioral_profiles: Dict[str, BehavioralProfile] = {}
+        self.threat_events: List[ThreatEvent] = []
+        
+        # State management
+        self.is_running = False
+        self.monitoring_thread = None
+        self.quarantined_devices: set = set()
+        
+        # AI Models (placeholder for neural network integration)
+        self.behavioral_analyzer = None
+        self.anomaly_detector = None
+        
+        # POS specific components
+        self.pos_mode = config.get('pos_mode', False)
+        self.payment_devices: Dict[str, Any] = {}
+        
+        # Initialize crypto components
+        self._init_crypto_system()
+        
+    def _init_crypto_system(self):
+        """Initialize cryptographic components for device authentication"""
+        try:
+            # Generate or load root CA key pair
+            self.root_private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048
+            )
+            self.root_public_key = self.root_private_key.public_key()
+            
+            self.logger.info("Cryptographic system initialized")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize crypto system: {e}")
+            raise
+
+    async def initialize(self):
+        """Initialize M.I.T.E.L. subsystem"""
+        try:
+            self.logger.info("Initializing M.I.T.E.L. subsystem")
+            
+            # Load existing device registrations
+            await self._load_device_registry()
+            
+            # Load behavioral profiles
+            await self._load_behavioral_profiles()
+            
+            # Initialize AI components
+            await self._init_ai_components()
+            
+            # Setup device monitoring
+            await self._setup_device_monitoring()
+            
+            # Initialize POS components if enabled
+            if self.pos_mode:
+                await self._init_pos_components()
+            
+            self.logger.info("M.I.T.E.L. subsystem initialized successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize M.I.T.E.L.: {e}")
+            return False
+
+    async def start(self):
+        """Start M.I.T.E.L. monitoring and protection"""
+        try:
+            if self.is_running:
+                self.logger.warning("M.I.T.E.L. already running")
+                return True
+                
+            self.logger.info("Starting M.I.T.E.L. protection")
+            self.is_running = True
+            
+            # Start device monitoring thread
+            self.monitoring_thread = threading.Thread(
+                target=self._monitor_devices,
+                daemon=True
+            )
+            self.monitoring_thread.start()
+            
+            # Start behavioral analysis
+            await self._start_behavioral_analysis()
+            
+            # Send startup event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    'type': 'mitel_started',
+                    'subsystem': 'M.I.T.E.L.',
+                    'timestamp': datetime.now().isoformat(),
+                    'status': 'active'
+                })
+            
+            self.logger.info("M.I.T.E.L. protection started successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start M.I.T.E.L.: {e}")
+            self.is_running = False
+            return False
+
+    async def stop(self):
+        """Stop M.I.T.E.L. monitoring"""
+        try:
+            self.logger.info("Stopping M.I.T.E.L. protection")
+            self.is_running = False
+            
+            # Wait for monitoring thread to finish
+            if self.monitoring_thread and self.monitoring_thread.is_alive():
+                self.monitoring_thread.join(timeout=5.0)
+            
+            # Save current state
+            await self._save_device_registry()
+            await self._save_behavioral_profiles()
+            
+            self.logger.info("M.I.T.E.L. protection stopped")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error stopping M.I.T.E.L.: {e}")
+            return False
+
+    def _monitor_devices(self):
+        """Background thread for continuous device monitoring"""
+        while self.is_running:
+            try:
+                # Scan for new devices
+                current_devices = self._scan_connected_devices()
+                
+                for device in current_devices:
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_device_event(device),
+                        asyncio.get_event_loop()
+                    )
+                
+                time.sleep(1.0)  # Check every second
+                
+            except Exception as e:
+                self.logger.error(f"Device monitoring error: {e}")
+                time.sleep(5.0)
+
+    def _scan_connected_devices(self) -> List[Dict[str, Any]]:
+        """Scan for currently connected input devices"""
+        devices = []
+        
+        try:
+            if platform.system() == "Linux":
+                devices.extend(self._scan_linux_devices())
+            elif platform.system() == "Windows":
+                devices.extend(self._scan_windows_devices())
+            elif platform.system() == "Darwin":
+                devices.extend(self._scan_macos_devices())
+                
+        except Exception as e:
+            self.logger.error(f"Device scan error: {e}")
+            
+        return devices
+
+    def _scan_linux_devices(self) -> List[Dict[str, Any]]:
+        """Scan Linux input devices"""
+        devices = []
+        
+        try:
+            # Use /proc/bus/input/devices for input device enumeration
+            if os.path.exists('/proc/bus/input/devices'):
+                with open('/proc/bus/input/devices', 'r') as f:
+                    content = f.read()
+                    
+                # Parse device information
+                device_blocks = content.split('\n\n')
+                for block in device_blocks:
+                    if 'N: Name=' in block:
+                        device = self._parse_linux_device_block(block)
+                        if device:
+                            devices.append(device)
+                            
+        except Exception as e:
+            self.logger.debug(f"Linux device scan error: {e}")
+            
+        return devices
+
+    def _scan_windows_devices(self) -> List[Dict[str, Any]]:
+        """Scan Windows input devices"""
+        devices = []
+        
+        try:
+            # Use PowerShell to enumerate PnP devices
+            cmd = [
+                'powershell', '-Command',
+                'Get-PnpDevice | Where-Object {$_.Class -eq "HIDClass" -or $_.Class -eq "Keyboard" -or $_.Class -eq "Mouse"} | ConvertTo-Json'
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                device_data = json.loads(result.stdout)
+                if isinstance(device_data, list):
+                    for device in device_data:
+                        devices.append(self._parse_windows_device(device))
+                        
+        except Exception as e:
+            self.logger.debug(f"Windows device scan error: {e}")
+            
+        return devices
+
+    def _scan_macos_devices(self) -> List[Dict[str, Any]]:
+        """Scan macOS input devices"""
+        devices = []
+        
+        try:
+            # Use system_profiler for USB device enumeration
+            cmd = ['system_profiler', 'SPUSBDataType', '-json']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                usb_data = json.loads(result.stdout)
+                devices.extend(self._parse_macos_usb_data(usb_data))
+                
+        except Exception as e:
+            self.logger.debug(f"macOS device scan error: {e}")
+            
+        return devices
+
+    async def _process_device_event(self, device: Dict[str, Any]):
+        """Process a device connection/activity event"""
+        try:
+            device_id = device.get('device_id')
+            if not device_id:
+                return
+                
+            # Check if device is registered
+            if device_id not in self.registered_devices:
+                await self._handle_unknown_device(device)
+                return
+                
+            # Authenticate registered device
+            auth_result = await self._authenticate_device(device_id, device)
+            
+            if not auth_result['success']:
+                await self._handle_authentication_failure(device_id, auth_result)
+                return
+                
+            # Perform behavioral analysis
+            await self._analyze_device_behavior(device_id, device)
+            
+        except Exception as e:
+            self.logger.error(f"Device event processing error: {e}")
+
+    async def _handle_unknown_device(self, device: Dict[str, Any]):
+        """Handle connection of unregistered device"""
+        device_id = device.get('device_id')
+        
+        # Immediately quarantine unknown device
+        self.quarantined_devices.add(device_id)
+        
+        # Create threat event
+        threat_event = ThreatEvent(
+            timestamp=datetime.now(),
+            device_id=device_id,
+            threat_type="unauthorized_device",
+            severity="high",
+            description=f"Unknown device attempted connection: {device.get('name', 'Unknown')}",
+            response_action="quarantine",
+            investigation_data=device
+        )
+        
+        self.threat_events.append(threat_event)
+        
+        # Send security alert
+        if self.event_bus:
+            await self.event_bus.publish({
+                'type': 'security_alert',
+                'subsystem': 'M.I.T.E.L.',
+                'severity': 'high',
+                'threat_type': 'unauthorized_device',
+                'device_id': device_id,
+                'timestamp': datetime.now().isoformat(),
+                'action_taken': 'quarantine'
+            })
+        
+        self.logger.warning(f"Quarantined unknown device: {device_id}")
+
+    async def _authenticate_device(self, device_id: str, device: Dict[str, Any]) -> Dict[str, Any]:
+        """Authenticate a registered device"""
+        try:
+            # Get stored fingerprint and certificate
+            fingerprint = self.registered_devices.get(device_id)
+            certificate = self.trust_certificates.get(device_id)
+            
+            if not fingerprint or not certificate:
+                return {'success': False, 'reason': 'missing_credentials'}
+            
+            # Verify hardware fingerprint
+            current_fingerprint = self._generate_device_fingerprint(device)
+            if not self._verify_fingerprint(fingerprint, current_fingerprint):
+                return {'success': False, 'reason': 'fingerprint_mismatch'}
+            
+            # Verify trust certificate
+            if not self._verify_trust_certificate(certificate):
+                return {'success': False, 'reason': 'invalid_certificate'}
+            
+            # Check certificate expiry
+            if certificate.expiry_date < datetime.now():
+                return {'success': False, 'reason': 'certificate_expired'}
+            
+            # Check revocation status
+            if certificate.revocation_status:
+                return {'success': False, 'reason': 'certificate_revoked'}
+            
+            return {'success': True, 'trust_level': certificate.trust_level}
+            
+        except Exception as e:
+            self.logger.error(f"Device authentication error: {e}")
+            return {'success': False, 'reason': 'authentication_error'}
+
+    async def register_device(self, device: Dict[str, Any], user_approval: bool = False) -> bool:
+        """Register a new trusted device"""
+        try:
+            device_id = device.get('device_id')
+            if not device_id:
+                return False
+            
+            # Generate device fingerprint
+            fingerprint = self._generate_device_fingerprint(device)
+            
+            # Generate trust certificate
+            certificate = self._generate_trust_certificate(device_id, fingerprint)
+            
+            # Create behavioral profile
+            profile = BehavioralProfile(
+                keystroke_timing={},
+                mouse_patterns={},
+                command_frequency={},
+                usage_patterns={},
+                anomaly_score=0.0,
+                last_updated=datetime.now()
+            )
+            
+            # Store registration
+            self.registered_devices[device_id] = fingerprint
+            self.trust_certificates[device_id] = certificate
+            self.behavioral_profiles[device_id] = profile
+            
+            # Remove from quarantine if present
+            self.quarantined_devices.discard(device_id)
+            
+            # Save to persistent storage
+            await self._save_device_registry()
+            
+            self.logger.info(f"Device registered successfully: {device_id}")
+            
+            # Send registration event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    'type': 'device_registered',
+                    'subsystem': 'M.I.T.E.L.',
+                    'device_id': device_id,
+                    'timestamp': datetime.now().isoformat()
+                })
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Device registration error: {e}")
+            return False
+
+    def _generate_device_fingerprint(self, device: Dict[str, Any]) -> DeviceFingerprint:
+        """Generate cryptographic fingerprint for device"""
+        # Extract device characteristics
+        mac_address = device.get('mac_address', '')
+        serial_number = device.get('serial_number', '')
+        vendor_id = device.get('vendor_id', '')
+        product_id = device.get('product_id', '')
+        device_type = device.get('device_type', 'unknown')
+        
+        # Generate hardware signature
+        hw_data = f"{mac_address}{serial_number}{vendor_id}{product_id}"
+        hardware_signature = hashlib.sha256(hw_data.encode()).hexdigest()
+        
+        # Collect electrical and timing characteristics
+        electrical_profile = device.get('electrical_profile', {})
+        timing_characteristics = device.get('timing_characteristics', {})
+        
+        return DeviceFingerprint(
+            mac_address=mac_address,
+            serial_number=serial_number,
+            vendor_id=vendor_id,
+            product_id=product_id,
+            device_type=device_type,
+            hardware_signature=hardware_signature,
+            electrical_profile=electrical_profile,
+            timing_characteristics=timing_characteristics
+        )
+
+    def _generate_trust_certificate(self, device_id: str, fingerprint: DeviceFingerprint) -> TrustCertificate:
+        """Generate cryptographic trust certificate for device"""
+        # Generate device key pair
+        device_private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048
+        )
+        device_public_key = device_private_key.public_key()
+        
+        # Serialize public key
+        public_key_bytes = device_public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        
+        # Create certificate
+        issue_date = datetime.now()
+        expiry_date = issue_date + timedelta(days=365)  # 1 year validity
+        
+        return TrustCertificate(
+            device_id=device_id,
+            public_key=public_key_bytes,
+            certificate_chain=[],  # Simplified for this implementation
+            issue_date=issue_date,
+            expiry_date=expiry_date,
+            trust_level=5,  # Default trust level
+            revocation_status=False
+        )
+
+    async def _analyze_device_behavior(self, device_id: str, device: Dict[str, Any]):
+        """Analyze device behavior for anomalies"""
+        try:
+            profile = self.behavioral_profiles.get(device_id)
+            if not profile:
+                return
+            
+            # Collect current behavior data
+            current_behavior = self._collect_behavior_data(device)
+            
+            # Analyze for anomalies
+            anomaly_score = self._calculate_anomaly_score(profile, current_behavior)
+            
+            # Update behavioral profile
+            self._update_behavioral_profile(profile, current_behavior)
+            
+            # Check for suspicious behavior
+            if anomaly_score > self.config.get('anomaly_threshold', 0.8):
+                await self._handle_behavioral_anomaly(device_id, anomaly_score, current_behavior)
+                
+        except Exception as e:
+            self.logger.error(f"Behavioral analysis error: {e}")
+
+    async def get_status(self) -> Dict[str, Any]:
+        """Get current M.I.T.E.L. status"""
+        return {
+            'subsystem': 'M.I.T.E.L.',
+            'status': 'running' if self.is_running else 'stopped',
+            'registered_devices': len(self.registered_devices),
+            'quarantined_devices': len(self.quarantined_devices),
+            'threat_events': len(self.threat_events),
+            'pos_mode': self.pos_mode,
+            'monitoring_active': self.monitoring_thread is not None and self.monitoring_thread.is_alive()
+        }
+
+    async def _load_device_registry(self):
+        """Load device registry from persistent storage"""
+        try:
+            registry_file = self.config.get('device_registry_file', 'mitel_devices.yaml')
+            if os.path.exists(registry_file):
+                with open(registry_file, 'r') as f:
+                    data = yaml.safe_load(f)
+                    
+                # Load registered device

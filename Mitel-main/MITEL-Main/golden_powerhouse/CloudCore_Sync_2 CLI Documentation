@@ -1,0 +1,406 @@
+# CloudCore_Sync_2 CLI Documentation
+
+## Overview
+
+**CloudCore_Sync_2** is a production-grade, modular cybersecurity framework designed for enterprise deployment. The framework provides a plugin-based sync pipeline with CRDT-based conflict resolution, offline-first synchronization, and encrypted peer discovery.
+
+## Architecture
+
+### Core Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CloudCore_Sync_2 Framework                   │
+├─────────────────────────────────────────────────────────────────┤
+│  CLI Launcher (cloudcore_cli.py)                               │
+│  ├── Interactive Mode                                          │
+│  ├── Command Mode                                              │
+│  └── Status Monitoring                                         │
+├─────────────────────────────────────────────────────────────────┤
+│  Engine Core (engine_core.py)                                  │
+│  ├── Subsystem Manager                                         │
+│  ├── Event Bus Integration                                     │
+│  ├── Configuration Management                                  │
+│  └── Lifecycle Control                                         │
+├─────────────────────────────────────────────────────────────────┤
+│  SP Subsystem v5 (sp_subsystem_v5_complete.py)                │
+│  ├── CRDT Synchronization                                      │
+│  ├── Peer Discovery                                            │
+│  ├── Offline Queue Management                                  │
+│  └── Delta Engine                                              │
+├─────────────────────────────────────────────────────────────────┤
+│  Other Subsystems (scaffolds/implementations)                  │
+│  ├── SC-SUB (Session Control)                                  │
+│  ├── AUTH-SUB (Authentication)                                 │
+│  ├── SEC-SUB (Security)                                        │
+│  └── AO-SUB (Advanced Operations)                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## File Structure
+
+### Essential Files
+
+- **`cloudcore_cli.py`** - Production CLI launcher (this file)
+- **`engine_core.py`** - Main engine runtime with subsystem management
+- **`sp_subsystem_v5_complete.py`** - Complete synchronization protocol implementation
+- **`cli_test_runner.py`** - Development/testing CLI utility
+- **`subsystem_scaffolds.py`** - Interface definitions for other subsystems
+- **`sync_coordinator.py`** - Synchronization orchestration logic
+
+### Configuration Files
+
+- **`config/engine_config.yaml`** - Main engine configuration
+- **`config/sp_config.yaml`** - SP subsystem configuration
+- **`config/node_id`** - Persistent node identifier
+- **`logs/`** - Application logs directory
+- **`data/`** - Runtime data and state files
+
+## Quick Start
+
+### 1. Basic Setup
+
+```bash
+# Ensure you have the core files
+ls -la engine_core.py sp_subsystem_v5_complete.py cloudcore_cli.py
+
+# Create required directories
+mkdir -p config logs data
+
+# Make CLI executable
+chmod +x cloudcore_cli.py
+```
+
+### 2. Start Interactive Mode
+
+```bash
+python3 cloudcore_cli.py interactive
+```
+
+### 3. Basic Engine Operations
+
+```bash
+# Start the engine
+CloudCore[OFF|NO-SYNC]> start
+
+# Check status
+CloudCore[ON|SYNC]> status
+
+# Stop the engine
+CloudCore[ON|SYNC]> stop
+```
+
+## CLI Commands
+
+### Engine Management
+
+#### Start Engine
+```bash
+# Command mode
+python3 cloudcore_cli.py start [--config config/engine_config.yaml]
+
+# Interactive mode
+CloudCore[OFF|NO-SYNC]> start [config=path/to/config.yaml]
+```
+
+#### Stop Engine
+```bash
+# Command mode
+python3 cloudcore_cli.py stop
+
+# Interactive mode
+CloudCore[ON|SYNC]> stop
+```
+
+#### System Status
+```bash
+# Command mode
+python3 cloudcore_cli.py status [--json]
+
+# Interactive mode
+CloudCore[ON|SYNC]> status
+```
+
+### Synchronization Operations
+
+#### Perform Sync
+```bash
+# Command mode
+python3 cloudcore_cli.py sync [--peers ip1,ip2,ip3] [--dry-run]
+
+# Interactive mode
+CloudCore[ON|SYNC]> sync [peers=192.168.1.100,192.168.1.101] [dry_run]
+```
+
+#### Discover Peers
+```bash
+# Command mode
+python3 cloudcore_cli.py discover
+
+# Interactive mode
+CloudCore[ON|SYNC]> discover
+```
+
+#### Create Test Delta
+```bash
+# Command mode
+python3 cloudcore_cli.py test-delta [--user-id test_user]
+
+# Interactive mode
+CloudCore[ON|SYNC]> test-delta [user_id=test_user_001]
+```
+
+### Subsystem Management
+
+#### List Subsystems
+```bash
+# Command mode
+python3 cloudcore_cli.py subsystems
+
+# Interactive mode
+CloudCore[ON|SYNC]> subsystems
+```
+
+## Subsystem Overview
+
+### SP-SUB (Synchronization Protocol Subsystem)
+
+**Purpose**: Handles all synchronization operations between nodes using CRDT-based conflict resolution.
+
+**Key Features**:
+- Mesh networking with peer discovery
+- Offline-first operation with queue management  
+- CRDT models for conflict-free synchronization
+- Encrypted peer-to-peer communication
+- Automatic retry and error handling
+
+**Status Indicators**:
+- `SYNC`: SP subsystem active and connected to engine
+- `NO-SYNC`: No synchronization capability available
+
+### EB-SUB (Event Bus Subsystem)
+
+**Purpose**: Central message routing for inter-subsystem communication.
+
+**Key Features**:
+- Publish/subscribe messaging
+- Event filtering and routing
+- Performance monitoring
+- Memory-efficient event handling
+
+### SC-SUB (Session Control Subsystem)
+
+**Purpose**: Manages user sessions and access control.
+
+**Status**: Scaffold implementation available
+
+### AUTH-SUB (Authentication Subsystem)
+
+**Purpose**: Handles authentication and authorization.
+
+**Status**: Scaffold implementation available
+
+### SEC-SUB (Security Subsystem)
+
+**Purpose**: Security monitoring and threat detection.
+
+**Status**: Scaffold implementation available
+
+### AO-SUB (Advanced Operations Subsystem)
+
+**Purpose**: Complex operational tasks and automation.
+
+**Status**: Scaffold implementation available
+
+## Configuration
+
+### Engine Configuration (`config/engine_config.yaml`)
+
+```yaml
+engine:
+  name: "CloudCore Ghost Engine"
+  version: "1.0.0"
+  log_level: "INFO"
+  health_check_interval: 30
+
+subsystems:
+  sp_sub:
+    enabled: true
+    config_path: "config/sp_config.yaml"
+    critical: true
+  
+  # Other subsystems...
+
+node:
+  id: null  # Auto-generated if not set
+  persistent_id: true
+
+monitoring:
+  enabled: true
+  metrics_interval: 60
+```
+
+### SP Configuration (`config/sp_config.yaml`)
+
+```yaml
+sync:
+  interval_seconds: 300
+  batch_size: 100
+  max_retries: 3
+  timeout_seconds: 30
+  offline_mode: true
+
+protocol:
+  mode: "mesh"
+  listen_port: 8443
+  discovery_port: 8444
+  max_connections: 50
+  heartbeat_interval: 60
+
+storage:
+  data_dir: "data/sp_sub"
+  max_storage_mb: 1024
+  cleanup_interval: 3600
+```
+
+## Operation Modes
+
+### Interactive Mode (Recommended)
+
+Interactive mode provides:
+- Real-time status updates in the prompt
+- Command completion and help
+- Continuous system monitoring
+- Easy command execution without repeated startup
+
+```bash
+python3 cloudcore_cli.py interactive
+```
+
+### Command Mode
+
+Single command execution for scripting and automation:
+
+```bash
+# Start engine and keep running
+python3 cloudcore_cli.py start
+
+# One-time sync operation  
+python3 cloudcore_cli.py sync --peers 192.168.1.100 --dry-run
+
+# Get JSON status for monitoring
+python3 cloudcore_cli.py status --json
+```
+
+### Daemon Mode
+
+Background operation (Linux/macOS):
+
+```bash
+# Start as daemon
+python3 cloudcore_cli.py start --daemon
+
+# Check if running
+python3 cloudcore_cli.py status
+
+# Stop daemon
+python3 cloudcore_cli.py stop
+```
+
+## Troubleshooting
+
+### Common Issues
+
+#### "Engine core not available"
+- Ensure `engine_core.py` exists in the current directory
+- Check for Python import errors in the engine core file
+
+#### "SP Subsystem not available" 
+- Ensure `sp_subsystem_v5_complete.py` exists in the current directory
+- Verify all dependencies are installed
+
+#### "No peers available for sync"
+- Check network connectivity
+- Verify peer discovery is enabled
+- Manually add peers if needed
+
+#### Configuration errors
+- Validate YAML syntax in configuration files
+- Check file permissions in config directories
+- Ensure all required directories exist
+
+### Debug Mode
+
+Enable verbose logging:
+
+```bash
+python3 cloudcore_cli.py --verbose interactive
+```
+
+### Log Files
+
+Check logs in:
+- `logs/cloudcore_cli.log` - CLI operations
+- `logs/engine.log` - Engine operations (if configured)
+- Console output for real-time monitoring
+
+## Development and Integration
+
+### Adding New Subsystems
+
+1. Implement subsystem following the lifecycle interface
+2. Add import and availability check in `engine_core.py`
+3. Add configuration section in engine config
+4. Update CLI commands as needed
+
+### Custom Commands
+
+Extend the CLI by adding methods to `CloudCoreCLI` class:
+
+```python
+async def cmd_custom(self, args) -> Dict[str, Any]:
+    """Custom command implementation"""
+    # Implementation here
+    return {'status': 'success', 'message': 'Custom command executed'}
+```
+
+### API Integration
+
+The CLI can be used as a library:
+
+```python
+from cloudcore_cli import CloudCoreCLI
+
+cli = CloudCoreCLI()
+result = await cli.cmd_start(args)
+```
+
+## Production Deployment
+
+### System Requirements
+
+- Python 3.8+
+- Network connectivity for peer discovery
+- Sufficient disk space for data storage
+- Appropriate firewall configuration for sync ports
+
+### Monitoring
+
+- Use `status --json` for programmatic monitoring
+- Monitor log files for errors and performance
+- Track sync operations and peer connectivity
+- Set up alerts for subsystem failures
+
+### Security Considerations
+
+- Configure firewall rules for sync ports (8443, 8444)
+- Use encrypted communication for peer-to-peer sync
+- Regularly update node credentials
+- Monitor for unauthorized peer connections
+
+## Support and Documentation
+
+For additional documentation and support:
+- Repository: `https://github.com/Kingkali69/cloud-core-sync2`
+- Architecture diagrams: `g_legion_architecture.mermaid.txt`
+- Development CLI: `cli_test_runner.py`

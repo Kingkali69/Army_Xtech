@@ -1,0 +1,2945 @@
+#!/usr/bin/env python3
+"""
+GhostOps Unified Core Engine
+Shared backend functionality for all platforms (Linux/Windows/Android)
+"""
+
+import os
+import sys
+import io
+
+# Fix Windows encoding issues - MUST be before any print statements
+if sys.platform == 'win32':
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        _buffer = getattr(_stream, "buffer", None)
+        if (
+            _stream is None
+            or _buffer is None
+            or getattr(_stream, "encoding", "").lower() == "utf-8"
+        ):
+            continue
+        try:
+            _wrapper = io.TextIOWrapper(_buffer, encoding="utf-8", errors="replace")
+            try:
+                _wrapper.reconfigure(write_through=True)
+            except AttributeError:
+                pass
+            setattr(sys, _stream_name, _wrapper)
+        except ValueError:
+            continue
+
+import socket
+import json
+import time
+import threading
+from io import BytesIO
+import cgi
+import platform
+import base64
+
+# Security modules for path traversal prevention
+# Add core directory to path for imports
+import os
+import sys
+core_dir = os.path.dirname(os.path.abspath(__file__))
+if core_dir not in sys.path:
+    sys.path.insert(0, core_dir)
+
+try:
+    from safe_path import validate_file_path, log_blocked_access, create_allowed_directories
+    from file_handler import SafeFileHandler
+    from upload_handler import UploadHandler
+    from sync_validator import SyncValidator
+    SECURITY_MODULES_AVAILABLE = True
+    # Create allowed directories on startup
+    create_allowed_directories()
+except ImportError as e:
+    print(f"[!] WARNING: Security modules not available: {e}")
+    print("[!] File operations will use legacy (VULNERABLE) methods")
+    SECURITY_MODULES_AVAILABLE = False
+
+# Optional plugin manager
+try:
+    import plugin_manager as pm
+except Exception:
+    pm = None
+
+def detect_platform():
+    """Auto-detect the current operating system"""
+    system = platform.system().lower()
+    # Check multiple Android indicators (mobile Python often reports as Linux)
+    android_indicators = [
+        'android' in system,
+        'android' in os.environ.get('ANDROID_ROOT', '').lower(),
+        'android' in os.environ.get('ANDROID_DATA', '').lower(),
+        'android' in os.environ.get('ANDROID_STORAGE', '').lower(),
+        os.path.exists('/system/build.prop'),  # Android system file
+        os.path.exists('/system/etc/hosts'),  # Android system file
+        'termux' in os.environ.get('PREFIX', '').lower(),  # Termux (Android terminal)
+    ]
+    if any(android_indicators):
+        return 'android'
+    elif system == 'linux':
+        return 'linux'
+    elif system == 'windows':
+        return 'windows'
+    else:
+        return 'unknown'
+
+class GhostOpsState:
+    """Unified state management for all platforms"""
+    def __init__(self):
+        self.nodes = {}
+        self.last_sync = 0
+        self.tool_state = None
+        self.page_state = 1
+        self.authority = None
+        self.authority_timestamp = 0  # PHASE 2: Timestamp for conflict resolution
+        self.authority_device_name = None  # PHASE 2: Human-readable name of authority holder
+        self.commands = []
+        self.tunnel_active = False
+        self.tunnel_status = {
+            'active': False,
+            'mesh_id': None,
+            'node_id': None,
+            'peers': {},
+            'uptime': 0
+        }
+        # Standalone mode support
+        self.connection_status = 'standalone'  # 'connected', 'standalone', 'connecting'
+        self.last_connection_attempt = 0
+        self.pending_sync_queue = []  # Queue of changes made while offline
+        self.pending_push_queue = []  # Queue of file pushes for offline master mode (Android)
+        self.standalone_mode = True  # Default to standalone
+        self.offline_master_mode = False  # Android can act as local master when offline
+        self.state_cache_file = None  # Will be set by engine
+
+        # Network mode detection (HOME_LAN vs AWAY)
+        self.network_mode = 'AWAY'  # 'HOME_LAN' or 'AWAY'
+        self.home_network_ssid = None  # Home WiFi SSID (if detected)
+        self.home_network_subnet = None  # Home network subnet (e.g., '192.168.1.')
+        self.last_network_check = 0
+        
+    def add_node(self, device_id, ip, platform, port=7890):
+        """Register a new node"""
+        # CRITICAL FIX: Remove duplicate nodes with same IP address
+        # This prevents multiple registrations of the same device
+        nodes_to_remove = []
+        for existing_id, existing_info in self.nodes.items():
+            if existing_info.get('ip') == ip and existing_info.get('port') == port:
+                # Same IP and port - remove old entry
+                if existing_id != device_id:
+                    nodes_to_remove.append(existing_id)
+        
+        for node_id in nodes_to_remove:
+            del self.nodes[node_id]
+            print(f"[CLEANUP] Removed duplicate node: {node_id} (same IP: {ip})")
+        
+        self.nodes[device_id] = {
+            'ip': ip,
+            'platform': platform,
+            'port': port,
+            'last_seen': time.time()
+        }
+        
+    def update_sync(self, timestamp=None):
+        """Update last sync time"""
+        self.last_sync = timestamp if timestamp else time.time()
+        
+    def add_command(self, cmd_type, source, **kwargs):
+        """Add command to history"""
+        self.commands.append({
+            'type': cmd_type,
+            'timestamp': time.time(),
+            'source': source,
+            **kwargs
+        })
+        
+    def cleanup_old_nodes(self, timeout=300):
+        """Remove nodes that haven't been seen in timeout seconds"""
+        now = time.time()
+        removed = []
+        for node_id in list(self.nodes.keys()):
+            if now - self.nodes[node_id].get('last_seen', 0) > timeout:
+                removed.append(node_id)
+                del self.nodes[node_id]
+        return removed
+    
+    def add_to_sync_queue(self, action, **kwargs):
+        """Add an action to the sync queue for later execution when connected"""
+        self.pending_sync_queue.append({
+            'action': action,
+            'timestamp': time.time(),
+            'kwargs': kwargs
+        })
+        # Limit queue size to prevent memory issues
+        if len(self.pending_sync_queue) > 1000:
+            self.pending_sync_queue = self.pending_sync_queue[-1000:]
+        self.save_state_cache()
+    
+    def clear_sync_queue(self):
+        """Clear the sync queue after successful sync"""
+        self.pending_sync_queue = []
+        self.save_state_cache()
+    
+    def save_state_cache(self):
+        """Save state to disk for offline persistence"""
+        if not self.state_cache_file:
+            return
+
+        try:
+            cache_data = {
+                'nodes': self.nodes,
+                'last_sync': self.last_sync,
+                'tool_state': self.tool_state,
+                'page_state': self.page_state,
+                'authority': self.authority,
+                'authority_timestamp': self.authority_timestamp,  # PHASE 2
+                'authority_device_name': self.authority_device_name,  # PHASE 2
+                'commands': self.commands[-100:],  # Keep last 100 commands
+                'pending_sync_queue': self.pending_sync_queue,
+                'connection_status': self.connection_status,
+                'network_mode': self.network_mode,
+                'home_network_ssid': self.home_network_ssid,
+                'home_network_subnet': self.home_network_subnet
+            }
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.state_cache_file), exist_ok=True)
+            
+            with open(self.state_cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+        except Exception as e:
+            print(f"[!] Failed to save state cache: {e}")
+    
+    def load_state_cache(self):
+        """Load state from disk cache"""
+        if not self.state_cache_file or not os.path.exists(self.state_cache_file):
+            return False
+
+        try:
+            with open(self.state_cache_file, 'r') as f:
+                cache_data = json.load(f)
+
+            # Restore state
+            self.nodes = cache_data.get('nodes', {})
+            self.last_sync = cache_data.get('last_sync', 0)
+            self.tool_state = cache_data.get('tool_state', None)
+            self.page_state = cache_data.get('page_state', 1)
+            self.authority = cache_data.get('authority', None)
+            self.authority_timestamp = cache_data.get('authority_timestamp', 0)  # PHASE 2
+            self.authority_device_name = cache_data.get('authority_device_name', None)  # PHASE 2
+            self.commands = cache_data.get('commands', [])
+            self.pending_sync_queue = cache_data.get('pending_sync_queue', [])
+            self.pending_push_queue = cache_data.get('pending_push_queue', [])
+            self.offline_master_mode = cache_data.get('offline_master_mode', False)
+            self.connection_status = cache_data.get('connection_status', 'standalone')
+            self.network_mode = cache_data.get('network_mode', 'AWAY')
+            self.home_network_ssid = cache_data.get('home_network_ssid', None)
+            self.home_network_subnet = cache_data.get('home_network_subnet', None)
+
+            return True
+        except Exception as e:
+            print(f"[!] Failed to load state cache: {e}")
+            return False
+
+
+class GhostOpsConfig:
+    """Configuration management"""
+    def __init__(self, platform='unknown', mode='peer'):
+        # Auto-detect platform if not specified
+        # IMPORTANT: If platform is explicitly set (not 'unknown'), keep it!
+        if platform == 'unknown':
+            platform = detect_platform()
+        # Force platform to stay as specified (don't override explicit settings)
+        self.platform = platform
+
+        # SECURITY FIX: Never use hardcoded auth key
+        # Load from environment or generate secure random key (MASTERS ONLY!)
+        self.auth_key = self._get_or_generate_auth_key(mode)
+
+        self.device_id = self._generate_device_id()
+        self.local_ip = socket.gethostbyname(socket.gethostname())
+        self.master_ip = None
+        self.master_port = 7890
+        self.local_port = self._get_default_port()
+        self.time_offset = 0.0  # Time offset from master for unified timestamps
+
+    def _get_or_generate_auth_key(self, mode='peer'):
+        """
+        SECURITY FIX: Get or generate secure authentication key
+        CRITICAL: Peers MUST NOT generate keys - only masters can!
+
+        Args:
+            mode: 'master' or 'peer' - determines if key generation is allowed
+        """
+        import secrets
+
+        # 1. Check environment variable (highest priority)
+        env_key = os.environ.get('GHOSTOPS_AUTH_KEY')
+        if env_key and len(env_key) >= 16:
+            print("[AUTH] [OK] Using auth key from GHOSTOPS_AUTH_KEY environment variable")
+            return env_key
+
+        # 2. Check config file
+        config_dir = os.path.expanduser("~/.ghostops")
+        auth_key_file = os.path.join(config_dir, "auth_key")
+
+        if os.path.exists(auth_key_file):
+            try:
+                with open(auth_key_file, 'r') as f:
+                    stored_key = f.read().strip()
+                if stored_key and len(stored_key) >= 16:
+                    print(f"[AUTH] [OK] Loaded auth key from {auth_key_file}")
+                    return stored_key
+            except Exception as e:
+                print(f"[AUTH] [WARN]  Failed to load auth key: {e}")
+
+        # 3. Generate new secure random key - MASTERS ONLY!
+        if mode == 'master':
+            print("[AUTH] 🔑 Generating new secure authentication key (MASTER MODE)...")
+            new_key = secrets.token_urlsafe(32)  # 32 bytes = 256 bits of entropy
+
+            # Save to file for persistence
+            try:
+                os.makedirs(config_dir, exist_ok=True)
+                with open(auth_key_file, 'w') as f:
+                    f.write(new_key)
+                # Secure permissions (user read/write only)
+                os.chmod(auth_key_file, 0o600)
+                print(f"[AUTH] [OK] Generated and saved new auth key to {auth_key_file}")
+                print("")
+                print("=" * 70)
+                print("[AUTH] 🔑 AUTHENTICATION KEY (COPY THIS FOR ANDROID/WINDOWS):")
+                print("=" * 70)
+                print(f"[AUTH] {new_key}")
+                print("=" * 70)
+                print("[AUTH] [WARN]  IMPORTANT: Share this key with peer nodes securely!")
+                print(f"[AUTH] [WARN]  To use on Android/Windows: export GHOSTOPS_AUTH_KEY='{new_key}'")
+                print("=" * 70)
+                print("")
+            except Exception as e:
+                print(f"[AUTH] [WARN]  Failed to save auth key: {e}")
+                print("[AUTH] [WARN]  Key will not persist across restarts!")
+
+            return new_key
+        else:
+            # PEER MODE - Use simple default password (no key required)
+            print("[AUTH] ℹ️  Peer mode - using default password 'ghostops' for control switching")
+            print("[AUTH] ℹ️  No key required to start - password only needed when taking control")
+            return "ghostops"  # Simple default password for control switching
+
+    def _generate_device_id(self):
+        """Generate device ID based on platform"""
+        import random
+        hostname = socket.gethostname()
+        if self.platform == 'linux':
+            return f"linux_{hostname}"
+        elif self.platform == 'windows':
+            return f"win_{hostname}"
+        elif self.platform == 'android':
+            return f"android_{hostname}_{random.randint(1000,9999)}"
+        else:
+            return f"unknown_{hostname}"
+            
+    def _get_default_port(self):
+        """Get default port based on platform"""
+        if self.platform == 'linux':
+            return 7890
+        elif self.platform == 'windows':
+            return 7891
+        elif self.platform == 'android':
+            return 5000
+        return 8000
+
+    def _load_auth_key(self):
+        """
+        Load authentication key from secure key manager
+        If not found, prompts user to run setup wizard
+
+        Returns:
+            str: Authentication key
+        """
+        try:
+            from key_manager import KeyManager
+            km = KeyManager()
+
+            # Check if key exists
+            if not km.key_exists():
+                print("[!] =" * 35)
+                print("[!] SECURITY WARNING: No admin key found!")
+                print("[!] =" * 35)
+                print("[!] GhostOps requires secure authentication setup.")
+                print("[!] Please run the setup wizard:")
+                print("[!]   python3 setup_wizard.py")
+                print("[!] =" * 35)
+                print()
+                # Generate temporary key for this session only
+                print("[!] Generating TEMPORARY key for this session...")
+                print("[!] This key will NOT persist across restarts!")
+                temp_key = km.generate_key()
+                print(f"[!] Temporary key: {temp_key}")
+                return temp_key
+
+            # Load key from file
+            key_data = km.load_key()
+            if key_data and 'admin_key' in key_data:
+                print("[+] Admin key loaded successfully")
+                return key_data['admin_key']
+            else:
+                print("[!] Admin key file corrupted. Please run setup wizard.")
+                # Generate temporary key
+                temp_key = km.generate_key()
+                print(f"[!] Using temporary key: {temp_key}")
+                return temp_key
+
+        except ImportError:
+            print("[!] WARNING: Authentication modules not available")
+            print("[!] Falling back to temporary key")
+            import secrets
+            return secrets.token_urlsafe(32)
+        except Exception as e:
+            print(f"[!] Error loading admin key: {e}")
+            print("[!] Using temporary key for this session")
+            import secrets
+            return secrets.token_urlsafe(32)
+
+
+class GhostOpsHTTPHandler:
+    """Base HTTP request handler with CORS support"""
+    
+    @staticmethod
+    def send_cors_headers():
+        """Get CORS headers"""
+        return {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+        }
+    
+    @staticmethod
+    def send_json_handler(wfile, data, cors_headers=None):
+        """Send JSON response"""
+        if cors_headers is None:
+            cors_headers = GhostOpsHTTPHandler.send_cors_headers()
+        
+        response_data = json.dumps(data).encode()
+        headers = {
+            'Content-type': 'application/json',
+            **cors_headers
+        }
+        
+        return response_data, headers
+    
+    @staticmethod
+    def read_json(rfile, content_length):
+        """Read JSON from request"""
+        if content_length > 0:
+            post_data = rfile.read(content_length)
+            return json.loads(post_data.decode())
+        return {}
+    
+    @staticmethod
+    def parse_multipart(rfile, headers):
+        """Parse multipart/form-data for file uploads"""
+        try:
+            content_type = headers.get('Content-Type', '')
+            if 'multipart/form-data' not in content_type:
+                return None, "Invalid content type"
+            
+            # Get content length and check file size limit (50MB)
+            content_length = int(headers.get('Content-Length', 0))
+            if content_length == 0:
+                return None, "No data received"
+            if content_length > 50 * 1024 * 1024:  # 50MB limit
+                return None, "File too large (max 50MB)"
+            
+            # Parse the multipart form data
+            form = cgi.FieldStorage(
+                fp=rfile,
+                headers=headers,
+                environ={
+                    'REQUEST_METHOD': 'POST',
+                    'CONTENT_TYPE': content_type,
+                    'CONTENT_LENGTH': content_length
+                }
+            )
+            
+            files = {}
+            fields = {}
+            
+            for key in form.keys():
+                item = form[key]
+                if item.filename:
+                    # It's a file
+                    files[key] = {
+                        'filename': item.filename,
+                        'data': item.file.read(),
+                        'content_type': item.type
+                    }
+                else:
+                    # It's a regular field
+                    fields[key] = item.value
+            
+            return {'files': files, 'fields': fields}, None
+        except Exception as e:
+            return None, f"Error parsing upload: {str(e)}"
+
+
+class GhostOpsAuthentication:
+    """
+    Authentication management
+    SECURITY FIX: Integrated with secure authentication system
+    """
+
+    # Singleton instance of authentication system
+    _auth_system = None
+    _lock = threading.Lock()
+
+    @staticmethod
+    def get_auth_system():
+        """
+        Get singleton instance of authentication system
+
+        Returns:
+            AuthenticationSystem: Singleton auth system instance
+        """
+        if GhostOpsAuthentication._auth_system is None:
+            with GhostOpsAuthentication._lock:
+                if GhostOpsAuthentication._auth_system is None:
+                    try:
+                        from authentication import AuthenticationSystem
+                        GhostOpsAuthentication._auth_system = AuthenticationSystem()
+                    except ImportError:
+                        print("[!] WARNING: Authentication system not available")
+                        return None
+        return GhostOpsAuthentication._auth_system
+
+    @staticmethod
+    def authenticate(auth_key, provided_key):
+        """
+        Verify authentication key
+
+        Args:
+            auth_key: Expected auth key
+            provided_key: Provided auth key
+
+        Returns:
+            bool: True if keys match
+        """
+        import secrets
+        # Use constant-time comparison to prevent timing attacks
+        try:
+            return secrets.compare_digest(auth_key, provided_key)
+        except:
+            # Fallback to regular comparison if secrets not available
+            return auth_key == provided_key
+
+    @staticmethod
+    def authenticate_session(session_token):
+        """
+        Authenticate using session token
+
+        Args:
+            session_token: Session token to validate
+
+        Returns:
+            dict: Session data if valid, None otherwise
+        """
+        auth_system = GhostOpsAuthentication.get_auth_system()
+        if auth_system:
+            return auth_system.verify_session(session_token)
+        return None
+
+    @staticmethod
+    def login(username, password):
+        """
+        Authenticate user with username and password
+
+        Args:
+            username: Username
+            password: Password
+
+        Returns:
+            tuple: (success: bool, message: str, session_token: str or None)
+        """
+        auth_system = GhostOpsAuthentication.get_auth_system()
+        if auth_system:
+            return auth_system.login(username, password)
+        return False, "Authentication system not available", None
+
+    @staticmethod
+    def logout(session_token):
+        """
+        Log out user (invalidate session)
+
+        Args:
+            session_token: Session token to invalidate
+
+        Returns:
+            bool: True if logout successful
+        """
+        auth_system = GhostOpsAuthentication.get_auth_system()
+        if auth_system:
+            return auth_system.logout(session_token)
+        return False
+
+    @staticmethod
+    def generate_token():
+        """
+        Generate authentication token (DEPRECATED - use session tokens instead)
+
+        Returns:
+            str: Cryptographically secure random token
+        """
+        import secrets
+        return secrets.token_urlsafe(32)
+
+    @staticmethod
+    def is_authenticated_request(headers):
+        """
+        Check if HTTP request is authenticated
+
+        Args:
+            headers: HTTP headers dict
+
+        Returns:
+            bool: True if authenticated
+        """
+        # Check for session token in Authorization header
+        auth_header = headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]  # Remove 'Bearer ' prefix
+            session = GhostOpsAuthentication.authenticate_session(token)
+            return session is not None
+
+        # Check for API key in X-API-Key header
+        api_key = headers.get('X-API-Key', '')
+        if api_key:
+            # Load expected key
+            try:
+                from key_manager import KeyManager
+                km = KeyManager()
+                key_data = km.load_key()
+                if key_data and 'admin_key' in key_data:
+                    return GhostOpsAuthentication.authenticate(key_data['admin_key'], api_key)
+            except:
+                pass
+
+        return False
+
+
+class GhostOpsNetwork:
+    """Network communication utilities"""
+    
+    @staticmethod
+    def _create_lan_proxy_handler():
+        """
+        Create a proxy handler that bypasses proxies for LAN traffic
+        This fixes issues with TORSOCKS and other proxy tools interfering with LAN discovery
+        """
+        import urllib.request
+
+        # Check if proxy environment variables are set
+        proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy',
+                      'ALL_PROXY', 'all_proxy']
+        has_proxy = any(os.environ.get(var) for var in proxy_vars)
+
+        if has_proxy:
+            print("[LAN FIX] Proxy detected - bypassing for LAN traffic")
+            # Force NO proxy for LAN connections by using ProxyHandler with empty dict
+            return urllib.request.ProxyHandler({})
+
+        return None
+
+    @staticmethod
+    def _is_lan_address(ip):
+        """Check if IP is a LAN address (private network)"""
+        if not ip:
+            return False
+
+        # Check for private IP ranges
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return False
+
+        try:
+            first_octet = int(parts[0])
+            second_octet = int(parts[1])
+            
+            # 10.0.0.0/8
+            if first_octet == 10:
+                return True
+            # 172.16.0.0/12
+            if first_octet == 172 and 16 <= second_octet <= 31:
+                return True
+            # 192.168.0.0/16
+            if first_octet == 192 and second_octet == 168:
+                return True
+            # 127.0.0.0/8 (localhost)
+            if first_octet == 127:
+                return True
+        except ValueError:
+            return False
+
+        return False
+    
+    @staticmethod
+    def connect_to_master(master_ip, master_port, device_id, platform, local_port=7890):
+        """Connect to master node and register"""
+        import urllib.request
+        try:
+            data = {
+                'device_id': device_id,
+                'platform': platform,
+                'port': local_port,  # Tell master what port we listen on
+                'last_seen': time.time()
+            }
+            request = urllib.request.Request(
+                f"http://{master_ip}:{master_port}/sync/discover",
+                data=json.dumps(data).encode(),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            # LAN FIX: Bypass proxy for LAN connections
+            proxy_handler = GhostOpsNetwork._create_lan_proxy_handler()
+            if proxy_handler and GhostOpsNetwork._is_lan_address(master_ip):
+                opener = urllib.request.build_opener(proxy_handler)
+                response = opener.open(request)
+            else:
+                response = urllib.request.urlopen(request)
+            
+            with response:
+                result = json.loads(response.read().decode())
+                print(f"[+] Successfully registered with master: {device_id}")
+                return result
+        except Exception as e:
+            print(f"[!] Registration failed: {e}")
+            return None
+    
+    @staticmethod
+    def sync_with_master(master_ip, master_port, engine=None):
+        """Sync state with master node and calculate time offset for unified timestamps"""
+        import urllib.request
+        try:
+            local_time_before = time.time()
+            # LAN FIX: Bypass proxy for LAN connections
+            proxy_handler = GhostOpsNetwork._create_lan_proxy_handler()
+            if proxy_handler and GhostOpsNetwork._is_lan_address(master_ip):
+                opener = urllib.request.build_opener(proxy_handler)
+                response = opener.open(f"http://{master_ip}:{master_port}/status")
+            else:
+                response = urllib.request.urlopen(f"http://{master_ip}:{master_port}/status")
+            
+            local_time_after = time.time()
+            network_delay = (local_time_after - local_time_before) / 2.0  # Estimate half the round-trip
+            
+            with response:
+                data = json.loads(response.read().decode())
+                # Calculate time offset: master_time - (local_time + network_delay)
+                master_time = data.get('master_time')
+                if master_time and engine and hasattr(engine, 'config'):
+                    local_time_mid = local_time_before + network_delay
+                    engine.config.time_offset = master_time - local_time_mid
+                    print(f"[TIME SYNC] Offset calculated: {engine.config.time_offset:.3f}s (master ahead by {abs(engine.config.time_offset):.3f}s)")
+                return data
+        except Exception as e:
+            print(f"[!] Sync failed: {e}")
+            return None
+    
+    @staticmethod
+    def forward_to_master(master_ip, master_port, path, data):
+        """Forward request to master node"""
+        import urllib.request
+        try:
+            request = urllib.request.Request(
+                f"http://{master_ip}:{master_port}{path}",
+                data=json.dumps(data).encode(),
+                headers={'Content-Type': 'application/json'}
+            )
+            # LAN FIX: Bypass proxy for LAN connections
+            proxy_handler = GhostOpsNetwork._create_lan_proxy_handler()
+            if proxy_handler and GhostOpsNetwork._is_lan_address(master_ip):
+                opener = urllib.request.build_opener(proxy_handler)
+                response = opener.open(request)
+            else:
+                response = urllib.request.urlopen(request)
+            
+            with response:
+                result = json.loads(response.read().decode())
+                return result
+        except Exception as e:
+            return None
+
+
+class GhostOpsFileManager:
+    """File management utilities with security validation"""
+
+    # Initialize secure file handler (class-level)
+    _secure_handler = None
+
+    @classmethod
+    def _get_secure_handler(cls):
+        """Get or create secure file handler"""
+        if cls._secure_handler is None and SECURITY_MODULES_AVAILABLE:
+            # Android: Use sandbox path ~/ghost/ghost, others use current directory
+            current_platform = detect_platform()
+            if current_platform == 'android':
+                # Android needs sandbox path
+                allowed_dir = os.path.expanduser('~/ghost/ghost')
+                os.makedirs(allowed_dir, exist_ok=True)
+                cls._secure_handler = SafeFileHandler(allowed_base_dir=allowed_dir)
+            else:
+                cls._secure_handler = SafeFileHandler(allowed_base_dir='.')
+        return cls._secure_handler
+
+    @staticmethod
+    def get_file_version(file_path):
+        """Get file modification time as version"""
+        try:
+            if os.path.exists(file_path):
+                return os.path.getmtime(file_path)
+            return 0
+        except:
+            return 0
+
+    @staticmethod
+    def calculate_file_hash(file_path):
+        """Calculate SHA256 hash of file for integrity verification"""
+        import hashlib
+
+        # Use secure handler if available
+        if SECURITY_MODULES_AVAILABLE:
+            handler = GhostOpsFileManager._get_secure_handler()
+            if handler:
+                try:
+                    return handler.get_file_hash(file_path, source="file_manager")
+                except ValueError as e:
+                    print(f"[SECURITY] File access blocked: {e}")
+                    return None
+
+        # Fallback to legacy method (VULNERABLE - for backward compatibility only)
+        try:
+            if not os.path.exists(file_path):
+                return None
+            sha256_hash = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()
+        except Exception as e:
+            print(f"[!] Error calculating hash for {file_path}: {e}")
+            return None
+
+    @staticmethod
+    def get_file_content(file_path, source="unknown"):
+        """Read file content with security validation"""
+
+        # SECURITY FIX: Use secure handler if available
+        if SECURITY_MODULES_AVAILABLE:
+            handler = GhostOpsFileManager._get_secure_handler()
+            if handler:
+                try:
+                    return handler.read_file(file_path, source=source)
+                except ValueError as e:
+                    print(f"[SECURITY] File access blocked: {e}")
+                    log_blocked_access(file_path, str(e), source)
+                    return None
+
+        # LEGACY METHOD (VULNERABLE) - Only used if security modules unavailable
+        print(f"[!] WARNING: Using vulnerable file read for {file_path}")
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    return f.read()
+            return None
+        except:
+            return None
+    
+    @staticmethod
+    def save_file(file_path, content, is_base64=False, expected_hash=None, source="unknown"):
+        """Save file content with security validation and verification"""
+
+        # SECURITY FIX: Use secure handler if available
+        if SECURITY_MODULES_AVAILABLE:
+            handler = GhostOpsFileManager._get_secure_handler()
+            if handler:
+                try:
+                    # Verify hash if provided
+                    verify_hash = expected_hash if expected_hash else None
+
+                    result = handler.write_file(
+                        file_path,
+                        content,
+                        is_base64=is_base64,
+                        source=source,
+                        verify_hash=verify_hash
+                    )
+                    return result
+                except ValueError as e:
+                    print(f"[SECURITY] File write blocked: {e}")
+                    log_blocked_access(file_path, str(e), source)
+                    return False
+
+        # LEGACY METHOD (VULNERABLE) - Only used if security modules unavailable
+        print(f"[!] WARNING: Using vulnerable file write for {file_path}")
+        try:
+            # SECURITY: Define allowed base directory
+            base_dir = os.path.abspath('.')  # Current working directory
+
+            # SECURITY: Normalize and resolve the requested path
+            if not os.path.isabs(file_path):
+                file_path = os.path.join('.', file_path)
+            file_path = os.path.normpath(file_path)
+
+            # Ensure parent directory exists
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
+            # Decode base64 if needed
+            if is_base64:
+                if isinstance(content, str):
+                    content = base64.b64decode(content)
+                else:
+                    try:
+                        content = base64.b64decode(content.decode('utf-8'))
+                    except:
+                        content = base64.b64decode(content)
+
+            # Ensure content is bytes
+            if isinstance(content, str):
+                content = content.encode('utf-8')
+
+            # Save file with atomic write (write to temp then rename)
+            temp_path = file_path + '.tmp'
+            try:
+                with open(temp_path, 'wb') as f:
+                    f.write(content)
+                # Atomic replace
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                os.rename(temp_path, file_path)
+            except:
+                # Fallback to direct write
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                with open(file_path, 'wb') as f:
+                    f.write(content)
+
+            # VERIFY FILE WAS ACTUALLY SAVED
+            if not os.path.exists(file_path):
+                print(f"[!] VERIFICATION FAILED: File {file_path} does not exist after save")
+                return False
+
+            saved_size = os.path.getsize(file_path)
+            if saved_size != len(content):
+                print(f"[!] VERIFICATION FAILED: File size mismatch. Expected {len(content)}, got {saved_size}")
+                return False
+
+            # Verify content matches by reading back
+            with open(file_path, 'rb') as f:
+                read_back = f.read()
+            if read_back != content:
+                print(f"[!] VERIFICATION FAILED: File content mismatch")
+                return False
+
+            print(f"[FILE SYNC] [OK] File saved and verified: {file_path} ({saved_size} bytes)")
+            return True
+        except PermissionError as e:
+            print(f"[!] PERMISSION ERROR saving {file_path}: {e}")
+            print(f"[!] Check file permissions and write access")
+            return False
+        except Exception as e:
+            print(f"[!] Error saving file {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    @staticmethod
+    def get_core_files_info(base_dir='.'):
+        """Get version info for all core files (with checksums)"""
+        core_files = ['ghostops_core.py', 'ghostops_adapter.py', 'ex_api.py', 'file_sharing.py', 'kali.py', 'windows.py', 'android.py', 'ghost.sh']
+        files_info = {}
+        
+        for filename in core_files:
+            file_path = os.path.join(base_dir, filename)
+            if os.path.exists(file_path):
+                file_hash = GhostOpsFileManager.calculate_file_hash(file_path)
+                files_info[filename] = {
+                    'version': GhostOpsFileManager.get_file_version(file_path),
+                    'size': os.path.getsize(file_path),
+                    'hash': file_hash  # SHA256 hash for integrity
+                }
+            else:
+                # File doesn't exist - mark with version 0
+                files_info[filename] = {
+                    'version': 0,
+                    'size': 0,
+                    'hash': None
+                }
+        
+        return files_info
+    
+    @staticmethod
+    def save_uploaded_file(file_info, upload_dir='~/.ghostops/uploads', source="unknown"):
+        """Save uploaded file to disk with security validation"""
+
+        # SECURITY FIX: Use secure upload handler if available
+        if SECURITY_MODULES_AVAILABLE:
+            try:
+                upload_handler = UploadHandler(upload_dir=upload_dir, max_size_mb=50)
+                result = upload_handler.handle_upload(file_info, source=source)
+                return {
+                    'name': result['saved_name'],
+                    'size': result['size'],
+                    'path': result['path']
+                }
+            except ValueError as e:
+                print(f"[SECURITY] File upload blocked: {e}")
+                log_blocked_access(file_info.get('filename', 'unknown'), str(e), source)
+                return None
+
+        # LEGACY METHOD (VULNERABLE) - Only used if security modules unavailable
+        print(f"[!] WARNING: Using vulnerable file upload")
+        filename = file_info.get('filename', '')
+        if not filename:
+            return None
+
+        # Sanitize filename
+        filename = os.path.basename(filename)
+        if not filename or filename.startswith('.'):
+            print(f"[SECURITY] [ERROR] Invalid filename blocked: {filename}")
+            return None
+
+        # Expand upload directory
+        upload_dir = os.path.expanduser(upload_dir)
+
+        # Create upload directory
+        os.makedirs(upload_dir, exist_ok=True)
+
+        # Save file
+        file_path = os.path.join(upload_dir, filename)
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(file_data)
+            print(f"[UPLOAD] [OK] File saved: {filename} ({len(file_data)} bytes)")
+            return {
+                'name': filename,
+                'size': len(file_data),
+                'path': file_path
+            }
+        except Exception as e:
+            print(f"[UPLOAD] [ERROR] Failed to save file: {e}")
+            return None
+
+
+class GhostOpsMasterLogic:
+    """Master node specific logic"""
+    
+    @staticmethod
+    def handle_discover(state, device_id, platform, client_ip, port=7890):
+        """Handle node discovery"""
+        state.add_node(device_id, client_ip, platform, port)
+        print(f"[NODE] Registered {device_id} at {client_ip}:{port} ({platform})")
+
+        # Get auth key from config (loaded from secure key manager)
+        auth_key = None
+        if hasattr(state, 'config'):
+            auth_key = state.config.auth_key
+        else:
+            # Fallback: generate temporary key if config not available
+            print("[!] WARNING: Config not available, generating temporary auth key")
+            import secrets
+            auth_key = secrets.token_urlsafe(32)
+
+        return {
+            'status': 'discovered',
+            'node_count': len(state.nodes),
+            'nodes': list(state.nodes.keys()),
+            'auth_key': auth_key
+        }
+    
+    @staticmethod
+    def handle_sync_all(state, source_id, force_full_sync=False):
+        """
+        Handle sync all request
+        
+        Args:
+            state: GhostOpsState instance
+            source_id: Device ID requesting sync
+            force_full_sync: If True, forces full download (proximity sync mode)
+        """
+        platform = "unknown"
+        if source_id.startswith("android_"):
+            platform = "Android"
+        elif source_id.startswith("win_"):
+            platform = "Windows"
+        elif source_id.startswith("linux_"):
+            platform = "Linux"
+        
+        state.update_sync()
+        state.add_command('sync_all', source_id, platform=platform)
+        
+        if force_full_sync:
+            print(f"[SYNC] [PROXIMITY SYNC] Full sync requested by {source_id} - all files will be downloaded")
+        
+        return {
+            'status': 'synced',
+            'timestamp': state.last_sync,
+            'force_full_sync': force_full_sync,
+            'files_synced': 0  # Will be populated by actual file sync mechanism
+        }
+    
+    @staticmethod
+    def handle_authority(state, device_id, has_authority, timestamp=None):
+        """
+        Handle authority change with timestamp-based conflict resolution
+        PHASE 2: Enhanced with conflict resolution and device name tracking
+        """
+        print(f"[AUTHORITY] handle_authority called: device_id={device_id}, has_authority={has_authority}")
+        print(f"[AUTHORITY] Current authority: {state.authority} (timestamp: {state.authority_timestamp})")
+        print(f"[AUTHORITY] State has config: {hasattr(state, 'config')}")
+        if hasattr(state, 'config'):
+            print(f"[AUTHORITY] State.config.device_id: {state.config.device_id}")
+
+        # Handle 'local_device' mapping to actual device_id
+        if device_id == 'local_device' and hasattr(state, 'config'):
+            actual_device_id = state.config.device_id
+            print(f"[AUTHORITY] Mapping 'local_device' to actual device_id: {actual_device_id}")
+            device_id = actual_device_id
+
+        # Get timestamp for conflict resolution
+        request_timestamp = timestamp if timestamp else time.time()
+
+        # Extract device name from device_id (e.g., "linux_Desktop" -> "Linux-Desktop")
+        device_name = device_id.replace('_', '-').title()
+
+        if has_authority:
+            # Check for conflicts - newest timestamp wins
+            if state.authority and state.authority != device_id:
+                if request_timestamp < state.authority_timestamp:
+                    # Reject - existing authority is newer
+                    print(f"[AUTHORITY] CONFLICT: Request denied (older timestamp)")
+                    print(f"[AUTHORITY] Current: {state.authority} @ {state.authority_timestamp}")
+                    print(f"[AUTHORITY] Request: {device_id} @ {request_timestamp}")
+                    return {
+                        'status': 'authority_conflict',
+                        'device_id': device_id,
+                        'has_authority': False,
+                        'current_authority': state.authority,
+                        'current_authority_name': state.authority_device_name,
+                        'authority_timestamp': state.authority_timestamp,
+                        'is_master': False,
+                        'message': f'Authority held by {state.authority_device_name}'
+                    }
+                else:
+                    # Accept - this request is newer
+                    print(f"[AUTHORITY] CONFLICT RESOLVED: Newer timestamp wins")
+                    print(f"[AUTHORITY] Replacing {state.authority} with {device_id}")
+
+            # Grant authority
+            state.authority = device_id
+            state.authority_timestamp = request_timestamp
+            state.authority_device_name = device_name
+            print(f"[AUTHORITY] Authority GRANTED to: {device_id} ({device_name}) @ {request_timestamp}")
+        else:
+            # Revoke authority
+            if state.authority == device_id:
+                state.authority = None
+                state.authority_timestamp = 0
+                state.authority_device_name = None
+                print(f"[AUTHORITY] Authority REVOKED from: {device_id}")
+            else:
+                print(f"[AUTHORITY] Authority revocation skipped (not current authority)")
+
+        print(f"[AUTHORITY] Final authority: {state.authority}")
+
+        state.add_command('authority', device_id, has_authority=has_authority, timestamp=request_timestamp)
+
+        return {
+            'status': 'authority_updated',
+            'device_id': device_id,
+            'has_authority': has_authority,
+            'current_authority': state.authority,
+            'current_authority_name': state.authority_device_name,
+            'authority_timestamp': state.authority_timestamp,
+            'is_master': state.authority == device_id or state.authority == 'local_device'
+        }
+    
+    @staticmethod
+    def handle_tool_activate(state, tool, source):
+        """Handle tool activation"""
+        state.tool_state = tool
+        state.add_command('tool_activate', source, tool=tool)
+        
+        return {
+            'status': 'tool_activated',
+            'tool': tool
+        }
+    
+    @staticmethod
+    def handle_page_change(state, page, source):
+        """Handle page change"""
+        state.page_state = page
+        state.add_command('page_change', source, page=page)
+        
+        return {
+            'status': 'page_changed',
+            'page': page
+        }
+    
+    @staticmethod
+    def handle_file_upload(state, upload_result, source):
+        """Handle file upload"""
+        if not upload_result or 'saved_files' not in upload_result:
+            return None
+        
+        saved_files = upload_result['saved_files']
+        state.add_command('file_upload', source, files=saved_files)
+        
+        return {
+            'status': 'success',
+            'message': f'Successfully uploaded {len(saved_files)} file(s)',
+            'files': saved_files
+        }
+    
+    @staticmethod
+    def handle_sync_files(state, peer_files_info, source="unknown"):
+        """Handle file sync request with security validation"""
+        try:
+            # SECURITY FIX: Use sync validator if available
+            if SECURITY_MODULES_AVAILABLE:
+                sync_validator = SyncValidator(strict_mode=True)
+                # Validate all incoming peer file paths
+                # REMOVED: Fake validation messages - only log on actual validation errors
+                peer_files_info = sync_validator.validate_file_info(peer_files_info, source=source)
+
+            master_files_info = GhostOpsFileManager.get_core_files_info()
+            files_to_sync = {}
+            
+            # Master -> Peer: Send files where master is newer OR missing on peer
+            # ONLY log when files ACTUALLY need syncing (not just checking)
+            for filename, peer_info in peer_files_info.items():
+                try:
+                    # FIX: Normalize absolute paths to relative filenames
+                    if os.path.isabs(filename):
+                        filename = os.path.basename(filename)
+                    
+                    # Log validation attempt with peer identity
+                    print(f"[SYNC] Validating sync request: {filename} from {source}")
+                    
+                    # SECURITY: Validate filename before processing
+                    if SECURITY_MODULES_AVAILABLE:
+                        try:
+                            sync_validator.validate_sync_request(filename, source=source)
+                            # Get target path for logging
+                            target_path = os.path.join(state.project_dir, filename) if hasattr(state, 'project_dir') else filename
+                            print(f"[SYNC] ✓ Sync validated: {filename} → {target_path}")
+                        except ValueError as e:
+                            print(f"[FILE SYNC] [ERROR] Skipping invalid file {filename}: {e}")
+                            continue
+
+                    if filename in master_files_info:
+                        master_version = master_files_info[filename]['version']
+                        peer_version = peer_info.get('version', 0)
+                        master_size = master_files_info[filename].get('size', 0)
+
+                        # If master is newer OR peer file is missing (version 0)
+                        if master_version > peer_version or peer_version == 0:
+                            file_content = GhostOpsFileManager.get_file_content(filename, source="sync")
+                            if file_content and len(file_content) > 0:
+                                # Encode as base64 for JSON transport
+                                try:
+                                    encoded_content = base64.b64encode(file_content).decode('utf-8')
+                                    files_to_sync[filename] = {
+                                        'version': master_version,
+                                        'content': encoded_content,
+                                        'size': len(file_content)
+                                    }
+                                    reason = "newer version" if master_version > peer_version else "missing on peer"
+                                    print(f"[FILE SYNC] 📤 {filename}: master v{master_version:.2f} > peer v{peer_version:.2f} ({reason}) - SENDING ({len(file_content)} bytes)")
+                                except Exception as e:
+                                    print(f"[FILE SYNC] [ERROR] Failed to encode {filename}: {e}")
+                            else:
+                                print(f"[FILE SYNC] [WARN] {filename}: No content available to send")
+                except Exception as e:
+                    print(f"[FILE SYNC] [ERROR] Error processing {filename}: {e}")
+                    continue
+            
+            # Also check for files that peer doesn't have at all
+            for filename in master_files_info:
+                try:
+                    # FIX: Normalize absolute paths to relative filenames
+                    if os.path.isabs(filename):
+                        filename = os.path.basename(filename)
+                    
+                    # SECURITY: Validate filename before processing
+                    if SECURITY_MODULES_AVAILABLE:
+                        try:
+                            sync_validator.validate_sync_request(filename, source=source)
+                        except ValueError as e:
+                            print(f"[FILE SYNC] [ERROR] Skipping invalid file {filename}: {e}")
+                            continue
+
+                    if filename not in peer_files_info:
+                        file_content = GhostOpsFileManager.get_file_content(filename, source="sync")
+                        if file_content and len(file_content) > 0:
+                            try:
+                                encoded_content = base64.b64encode(file_content).decode('utf-8')
+                                files_to_sync[filename] = {
+                                    'version': master_files_info[filename]['version'],
+                                    'content': encoded_content,
+                                    'size': len(file_content)
+                                }
+                                print(f"[FILE SYNC] 📤 {filename}: missing on peer - SENDING ({len(file_content)} bytes)")
+                            except Exception as e:
+                                print(f"[FILE SYNC] [ERROR] Failed to encode {filename}: {e}")
+                except Exception as e:
+                    print(f"[FILE SYNC] [ERROR] Error processing missing file {filename}: {e}")
+                    continue
+            
+            # Peer -> Master: Bidirectional sync - peer can update master
+            for filename, peer_info in peer_files_info.items():
+                try:
+                    # FIX: Normalize absolute paths to relative filenames
+                    if os.path.isabs(filename):
+                        filename = os.path.basename(filename)
+                    
+                    # SECURITY: Validate filename before processing
+                    if SECURITY_MODULES_AVAILABLE:
+                        try:
+                            sync_validator.validate_sync_request(filename, source=source)
+                        except ValueError as e:
+                            print(f"[FILE SYNC] [ERROR] Skipping invalid peer file {filename}: {e}")
+                            continue
+
+                    if filename in master_files_info:
+                        master_version = master_files_info[filename]['version']
+                        peer_version = peer_info.get('version', 0)
+
+                        # If peer has newer version AND provides content, save to master
+                        if peer_version > master_version and peer_info.get('content'):
+                            try:
+                                content_str = peer_info['content']
+                                content = base64.b64decode(content_str)
+
+                                # Verify we got content
+                                if len(content) > 0:
+                                    if GhostOpsFileManager.save_file(filename, content, is_base64=False, source="peer_sync"):
+                                        # Verify file was saved (os already imported at module level)
+                                        if os.path.exists(filename):
+                                            saved_size = os.path.getsize(filename)
+                                            if saved_size == len(content):
+                                                print(f"[FILE SYNC] 📥 {filename} synced FROM peer to master ({saved_size} bytes) - VERIFIED")
+                                                state.save_state_cache()
+                                            else:
+                                                print(f"[FILE SYNC] [ERROR] Size mismatch after peer sync: {filename}")
+                                        else:
+                                            print(f"[FILE SYNC] [ERROR] File missing after peer sync: {filename}")
+                                else:
+                                    print(f"[FILE SYNC] [WARN] Empty content from peer for {filename}")
+                            except Exception as e:
+                                print(f"[FILE SYNC] [ERROR] Failed to save {filename} from peer: {e}")
+                                import traceback
+                                traceback.print_exc()
+                except Exception as e:
+                    print(f"[FILE SYNC] [ERROR] Error in bidirectional sync for {filename}: {e}")
+                    continue
+            
+            sync_count = len(files_to_sync)
+            if sync_count > 0:
+                total_size = sum(f.get('size', 0) for f in files_to_sync.values())
+                print(f"[FILE SYNC] [OK] Ready to send {sync_count} file(s) to peer (total: {total_size} bytes)")
+                for fname in files_to_sync.keys():
+                    print(f"      - {fname} ({files_to_sync[fname]['size']} bytes)")
+                
+                # Limit response size - if too large, split into multiple syncs
+                # 5MB limit per response
+                MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB
+                if total_size > MAX_RESPONSE_SIZE:
+                    print(f"[FILE SYNC] [WARN] Response too large ({total_size} bytes), will sync in chunks")
+                    # Send largest files first, limit to 5MB
+                    sorted_files = sorted(files_to_sync.items(), key=lambda x: x[1]['size'], reverse=True)
+                    files_to_sync = {}
+                    current_size = 0
+                    for fname, finfo in sorted_files:
+                        if current_size + finfo['size'] < MAX_RESPONSE_SIZE:
+                            files_to_sync[fname] = finfo
+                            current_size += finfo['size']
+                        else:
+                            print(f"[FILE SYNC] [WARN] Skipping {fname} (too large), will sync in next request")
+            else:
+                print(f"[FILE SYNC] ✓ All files up to date")
+            
+            return {
+                'status': 'sync_ready',
+                'files': files_to_sync
+            }
+        except Exception as e:
+            print(f"[FILE SYNC] [ERROR] CRITICAL ERROR in handle_sync_files: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return empty sync to prevent crash
+            return {
+                'status': 'error',
+                'message': f'Sync error: {str(e)}',
+                'files': {}
+            }
+
+
+class GhostOpsTunnelManager:
+    """Manages tunnel functionality"""
+    def __init__(self, engine):
+        self.engine = engine
+        self.tunnel_activator = None
+        self.tunnel_sub = None
+        self.mesh_manager = None
+        self.ex_api = None  # Socket-based API layer
+        self._initialize_components()
+    
+    def _initialize_components(self):
+        """Initialize tunnel components - BASIC SOCKETS ONLY"""
+        print("[TUNNEL] ========== TUNNEL INITIALIZATION ==========")
+        print("[TUNNEL] Using BASIC SOCKET tunnel only (no WireGuard)")
+        
+        # Always initialize tunnel activator (works on all platforms)
+        try:
+            from activate_tunnel import TunnelActivator
+            self.tunnel_activator = TunnelActivator()
+            print("[TUNNEL] [OK] Tunnel activator initialized")
+        except Exception as e:
+            print(f"[TUNNEL] [WARN] Tunnel activator failed: {e}")
+            self.tunnel_activator = None
+        
+        # NO WireGuard - REMOVED ALL REFERENCES
+        self.tunnel_sub = None
+        
+        # EX API (basic socket tunnel)
+        try:
+            from ex_api import EXAPI
+            self.ex_api = EXAPI(engine=self.engine)
+            print("[TUNNEL] [OK] EX API loaded (basic socket tunnel)")
+        except Exception as e:
+            print(f"[TUNNEL] [WARN] EX API not available: {e}")
+            self.ex_api = None
+        
+        # Mesh manager (optional)
+        try:
+            import mesh_manager
+            mesh_manager.load_mesh_modules()
+            self.mesh_manager = mesh_manager
+            print("[TUNNEL] [OK] Mesh manager loaded")
+        except Exception as e:
+            print(f"[TUNNEL] [WARN] Mesh manager not available: {e}")
+            self.mesh_manager = None
+        
+        print("[TUNNEL] Initialization complete:")
+        print(f"[TUNNEL]   tunnel_activator: {self.tunnel_activator is not None}")
+        print(f"[TUNNEL]   ex_api (socket): {self.ex_api is not None}")
+        print("[TUNNEL] ==========================================")
+    
+    def start_tunnel(self):
+        """Start the tunnel service - BASIC SOCKETS ONLY"""
+        print("[TUNNEL] ========== STARTING TUNNEL ==========")
+        try:
+            # Ensure tunnel activator exists
+            if not self.tunnel_activator:
+                try:
+                    from activate_tunnel import TunnelActivator
+                    self.tunnel_activator = TunnelActivator()
+                except Exception as e:
+                    print(f"[TUNNEL] [ERROR] Failed to create tunnel activator: {e}")
+                    return {'ok': False, 'message': f'Failed to initialize tunnel activator: {e}'}
+            
+            # Start tunnel activator (basic mode)
+            try:
+                self.tunnel_activator.start_tunnel()
+                self.tunnel_activator.tunnel_active = True
+                if not hasattr(self.tunnel_activator, 'start_time') or self.tunnel_activator.start_time is None:
+                    self.tunnel_activator.start_time = time.time()
+                print("[TUNNEL] [OK] Tunnel activator started")
+            except Exception as e:
+                print(f"[TUNNEL] [WARN] Tunnel activator error: {e}")
+                # Force activate anyway
+                self.tunnel_activator.tunnel_active = True
+                if not hasattr(self.tunnel_activator, 'start_time'):
+                    self.tunnel_activator.start_time = time.time()
+                print("[TUNNEL] [OK] Tunnel force-activated")
+            
+            # Start socket tunnel (PRIMARY - basic sockets only)
+            socket_tunnel_started = False
+            if self.ex_api:
+                try:
+                    print("[TUNNEL] Starting socket tunnel on port 51820...")
+                    result = self.ex_api.start_tunnel(port=51820)
+                    if result.get('ok'):
+                        socket_tunnel_started = True
+                        print(f"[TUNNEL] [OK] Socket tunnel ACTIVE: {result.get('message')}")
+                    else:
+                        print(f"[TUNNEL] [WARN] Socket tunnel start failed: {result.get('message')}")
+                except Exception as e:
+                    print(f"[TUNNEL] [WARN] Socket tunnel error: {e}")
+            
+            # Update engine state
+            self.engine.state.tunnel_active = True
+            try:
+                if self.ex_api and socket_tunnel_started:
+                    status = self.ex_api.get_tunnel_status()
+                    self.engine.state.tunnel_status = status
+                else:
+                    # Fallback status from activator
+                    status = self.tunnel_activator.get_status()
+                    self.engine.state.tunnel_status = status
+            except:
+                # Basic status
+                self.engine.state.tunnel_status = {
+                    'active': True,
+                    'mesh_id': getattr(self.tunnel_activator, 'mesh_id', 'default'),
+                    'node_id': getattr(self.tunnel_activator, 'node_id', 'node'),
+                    'peers': getattr(self.tunnel_activator, 'peers', {}),
+                    'uptime': 0,
+                    'type': 'socket'
+                }
+            
+            # Build status message
+            if socket_tunnel_started:
+                msg = 'Tunnel ACTIVE (Socket on port 51820)'
+                print(f"[TUNNEL] [OK] {msg}")
+            else:
+                msg = 'Tunnel ACTIVE (Basic mode)'
+                print(f"[TUNNEL] [OK] {msg}")
+            
+            print("[TUNNEL] =====================================")
+            return {'ok': True, 'message': msg, 'wireguard': False, 'socket_tunnel': socket_tunnel_started}
+            
+        except Exception as e:
+            error_msg = f"Tunnel start error: {str(e)}"
+            print(f"[TUNNEL] [ERROR] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            return {'ok': False, 'message': error_msg}
+    
+    def stop_tunnel(self):
+        """Stop the tunnel service - BASIC SOCKETS ONLY"""
+        print("[TUNNEL] ========== STOPPING TUNNEL ==========")
+        try:
+            # Stop socket tunnel
+            if self.ex_api and self.ex_api.socket_tunnel:
+                try:
+                    result = self.ex_api.stop_tunnel()
+                    print(f"[TUNNEL] [OK] Socket tunnel stopped: {result.get('message')}")
+                except Exception as e:
+                    print(f"[TUNNEL] [WARN] Socket tunnel stop error: {e}")
+            
+            # Stop tunnel activator
+            if self.tunnel_activator:
+                try:
+                    self.tunnel_activator.stop_tunnel()
+                    print("[TUNNEL] [OK] Tunnel activator stopped")
+                except Exception as e:
+                    print(f"[TUNNEL] [WARN] Tunnel activator stop error: {e}")
+            
+            # Update state
+            self.engine.state.tunnel_active = False
+            self.engine.state.tunnel_status = {
+                'active': False,
+                'mesh_id': None,
+                'node_id': None,
+                'peers': {},
+                'uptime': 0
+            }
+            
+            print("[TUNNEL] [OK] TUNNEL STOPPED")
+            print("[TUNNEL] =====================================")
+            return {'ok': True, 'message': 'Tunnel STOPPED'}
+            
+        except Exception as e:
+            error_msg = f"Tunnel stop error: {str(e)}"
+            print(f"[TUNNEL] [ERROR] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            # Force stop anyway
+            self.engine.state.tunnel_active = False
+            return {'ok': True, 'message': 'Tunnel stopped (with errors)'}
+    
+    def get_tunnel_status(self):
+        """Get current tunnel status"""
+        if self.engine.state.tunnel_active:
+            # Prioritize EX API status if available
+            if self.ex_api:
+                try:
+                    ex_status = self.ex_api.get_tunnel_status()
+                    if ex_status.get('active'):
+                        self.engine.state.tunnel_status = {
+                            'active': True,
+                            'mesh_id': ex_status.get('mesh_id'),
+                            'node_id': ex_status.get('node_id'),
+                            'peers': ex_status.get('peers', {}),
+                            'uptime': 0,
+                            'type': 'socket'
+                        }
+                except Exception as e:
+                    print(f"[!] Error getting EX API status: {e}")
+            
+            # Fallback to tunnel activator
+            if not self.engine.state.tunnel_status.get('active') and self.tunnel_activator:
+                try:
+                    status = self.tunnel_activator.get_status()
+                    self.engine.state.tunnel_status = status
+                except Exception as e:
+                    print(f"[!] Error getting tunnel activator status: {e}")
+            
+            # Fallback to tunnel sub
+            # No WireGuard - socket tunnel only
+        
+        return self.engine.state.tunnel_status
+
+
+class GhostOpsConnectionManager:
+    """Manages connection status and auto-reconnection with WiFi-style range detection"""
+    def __init__(self, engine):
+        self.engine = engine
+        self.reconnect_thread = None
+        # Optimized for fast failover: check every 50ms for sub-100ms promotion
+        self.reconnect_interval = 0.05  # 50ms checks for enterprise-grade failover
+        self.max_reconnect_interval = 1.0  # Max 1 second for fast recovery
+        self.reconnect_enabled = True
+        self.last_connection_time = None
+        self.last_successful_sync = None
+        self.connection_latency = None  # Track latency for range detection
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.last_status = None  # Track last status to only print on change
+
+        # Start network detection thread
+        self.network_check_thread = threading.Thread(target=self._network_detection_loop, daemon=True)
+        self.network_check_thread.start()
+        
+    def check_connection(self):
+        """Check if master is in range (WiFi-style detection)"""
+        if self.engine.is_master():
+            # Master is always "connected" in standalone sense
+            if self.engine.state.connection_status != 'connected':
+                self.engine.state.connection_status = 'connected'
+                self.engine.state.standalone_mode = False
+                self.engine.state.save_state_cache()
+            return True
+        
+        # For peer nodes, check if master is in range (like WiFi detection)
+        # _check_range() will auto-discover if master_ip is None
+        # Range detection: ping master to see if it's in range (auto-discovers if needed)
+        in_range = self._check_range()
+        
+        # If still no master after auto-discovery attempt, go standalone
+        if not self.engine.config.master_ip:
+            self.engine.state.connection_status = 'standalone'
+            self.engine.state.standalone_mode = True
+            return False
+        
+        if in_range:
+            # Device is IN RANGE - connect immediately (like WiFi auto-connect)
+            if self.engine.state.connection_status != 'connected':
+                self.engine.state.connection_status = 'connected'
+                self.engine.state.standalone_mode = False
+                self.engine.state.save_state_cache()
+                self.reconnect_interval = 0.1  # 100ms for infrastructure-level resilience
+                self.consecutive_failures = 0
+                self.consecutive_successes += 1
+                self.last_connection_time = time.time()
+                from datetime import datetime
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                msg1 = f"[+] 📶 Device IN RANGE - Auto-connected to master (like WiFi)"
+                msg2 = f"[+] 📡 Connection latency: {self.connection_latency*1000:.0f}ms"
+                print(f"[{ts}] {msg1}")
+                print(f"[{ts}] {msg2}")
+                # Log to unified monitoring
+                try:
+                    from ghostops_adapter import GhostOpsServer
+                    GhostOpsServer.add_log(msg1, self.engine.config.device_id)
+                    GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                except:
+                    pass
+                # Process pending sync queue and push queue immediately
+                self._process_sync_queue()
+                # Trigger immediate sync when coming back in range
+                self._trigger_immediate_sync()
+                # PROXIMITY SYNC: Auto-download ALL data when mobile node comes into range (like police car cameras)
+                if self.engine.platform == 'android':
+                    self._trigger_proximity_sync()
+                
+                # Replay offline buffer when reconnected
+                try:
+                    from offline_buffer import get_offline_buffer
+                    buffer = get_offline_buffer()
+                    if buffer.size() > 0:
+                        replay_count = buffer.replay_events(lambda event_type, data, device_id, timestamp: 
+                            GhostOpsServer.add_log(f"[REPLAY] {event_type}: {data}", device_id))
+                        ts_replay = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                        msg_replay = f"[OFFLINE BUFFER] Replayed {replay_count} buffered events"
+                        print(f"[{ts_replay}] {msg_replay}")
+                        GhostOpsServer.add_log(msg_replay, self.engine.config.device_id)
+                except:
+                    pass
+            return True
+        else:
+            # Device is OUT OF RANGE - switch to standalone (like mobile data)
+            if self.engine.state.connection_status == 'connected':
+                self.engine.state.connection_status = 'standalone'
+                self.engine.state.standalone_mode = True
+                self.engine.state.save_state_cache()
+                self.consecutive_successes = 0
+                self.consecutive_failures += 1
+                from datetime import datetime
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                msg1 = f"[!] [OUT OF RANGE] Device OUT OF RANGE - Switched to standalone mode (like Mobile Data)"
+                msg2 = f"[!] ⏳ Will auto-sync when back in range"
+                print(f"[{ts}] {msg1}")
+                print(f"[{ts}] {msg2}")
+                # Log to unified monitoring (show resilience)
+                try:
+                    from ghostops_adapter import GhostOpsServer
+                    GhostOpsServer.add_log(msg1, self.engine.config.device_id)
+                    GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                except:
+                    pass
+            return False
+    
+    def _check_range(self):
+        """Check if master is in range (WiFi-style ping detection) - with auto-discovery"""
+        # If no master IP configured, try auto-discovery
+        if not self.engine.config.master_ip:
+            discovered_ip = self._auto_discover_master()
+            if discovered_ip:
+                self.engine.config.master_ip = discovered_ip
+                print(f"[AUTO-DISCOVERY] [OK] Found master at {discovered_ip}, connecting...")
+            else:
+                return False
+        
+        try:
+            import urllib.request
+            start_time = time.time()
+
+            # Fast ping to check range (like WiFi signal detection)
+            with urllib.request.urlopen(
+                f"http://{self.engine.config.master_ip}:{self.engine.config.master_port}/status",
+                timeout=1  # Fast timeout for range detection
+            ) as response:
+                # Calculate latency
+                self.connection_latency = time.time() - start_time
+
+                # In range if latency < 500ms (like WiFi signal strength)
+                if self.connection_latency < 0.5:
+                    self.consecutive_failures = 0  # Reset failure counter on success
+                    return True
+                else:
+                    # High latency = out of range
+                    return False
+        except Exception as e:
+            # Connection failed = out of range - try auto-discovery to find new master
+            self.connection_latency = None
+            self.consecutive_failures += 1
+            
+            # AGGRESSIVE AUTO-DISCOVERY: If master is unreachable, try auto-discovery immediately
+            # Don't wait for 3 failures - master might have changed IP or restarted
+            error_str = str(e)
+            is_connection_refused = 'refused' in error_str.lower() or 'actively refused' in error_str.lower()
+            
+            if self.consecutive_failures >= 1:  # Try on first failure
+                print(f"[AUTO-DISCOVERY] Master {self.engine.config.master_ip} unreachable ({error_str[:50]}...), scanning for master...")
+                discovered_ip = self._auto_discover_master()
+                if discovered_ip:
+                    if discovered_ip != self.engine.config.master_ip:
+                        print(f"[AUTO-DISCOVERY] [OK] Found new master at {discovered_ip}, switching from {self.engine.config.master_ip}...")
+                        self.engine.config.master_ip = discovered_ip
+                        self.consecutive_failures = 0  # Reset on discovery
+                        # Try connecting immediately with new IP
+                        return self._check_range()  # Recursive call with new IP
+                    else:
+                        print(f"[AUTO-DISCOVERY] [WARN]  Same IP found but still unreachable - master may be restarting")
+                        # If connection refused, clear IP to force fresh discovery
+                        if is_connection_refused and self.consecutive_failures >= 3:
+                            print(f"[AUTO-DISCOVERY] Connection refused - clearing cached IP to force fresh discovery")
+                            old_ip = self.engine.config.master_ip
+                            self.engine.config.master_ip = None
+                            # Try discovery again immediately
+                            discovered_ip = self._auto_discover_master()
+                            if discovered_ip and discovered_ip != old_ip:
+                                print(f"[AUTO-DISCOVERY] [OK] Found master at {discovered_ip} after clearing cache")
+                                self.engine.config.master_ip = discovered_ip
+                                self.consecutive_failures = 0
+                                return self._check_range()
+                else:
+                    print(f"[AUTO-DISCOVERY] [ERROR] No master found on network - will keep scanning")
+                    # Clear master IP after 5 failures to force fresh discovery
+                    if self.consecutive_failures >= 5:
+                        print(f"[AUTO-DISCOVERY] [RESET] Clearing cached master IP to force fresh discovery")
+                        self.engine.config.master_ip = None
+            
+            # PHASE 2: Check for master failure and trigger failover
+            self._check_master_failure()
+            return False
+    
+    def _auto_discover_master(self):
+        """Auto-discover master node on local network using UDP broadcast + TCP fallback"""
+        import socket
+        import subprocess
+        import re
+        import threading
+        
+        DISCOVERY_PORT = 7891  # UDP port for discovery
+        MASTER_PORT = 7890     # TCP port for master HTTP
+        
+        def get_local_ip():
+            """Get local IP address - works completely offline (LAN-only)"""
+            # Method 1: Use ip route (Linux/Android) - works offline
+            try:
+                result = subprocess.run(['ip', 'route', 'get', '1'], 
+                                      capture_output=True, text=True, timeout=1)
+                match = re.search(r'src (\d+\.\d+\.\d+\.\d+)', result.stdout)
+                if match:
+                    ip = match.group(1)
+                    if not ip.startswith('127.'):
+                        return ip
+            except:
+                pass
+            
+            # Method 2: Use hostname (works offline, but may return 127.0.0.1)
+            try:
+                hostname = socket.gethostname()
+                ip = socket.gethostbyname(hostname)
+                if not ip.startswith('127.'):
+                    return ip
+            except:
+                pass
+            
+            # Method 3: Try network interfaces directly (offline)
+            try:
+                import netifaces
+                gateways = netifaces.gateways()
+                if 'default' in gateways and netifaces.AF_INET in gateways['default']:
+                    interface = gateways['default'][netifaces.AF_INET][1]
+                    addrs = netifaces.ifaddresses(interface)
+                    if netifaces.AF_INET in addrs:
+                        ip = addrs[netifaces.AF_INET][0]['addr']
+                        if not ip.startswith('127.'):
+                            return ip
+            except:
+                pass
+            
+            # Method 4: Fallback - try connecting to local network (offline)
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                for router_ip in ['192.168.1.1', '192.168.0.1', '10.0.0.1']:
+                    try:
+                        s.connect((router_ip, 1))
+                        ip = s.getsockname()[0]
+                        s.close()
+                        if not ip.startswith('127.'):
+                            return ip
+                    except:
+                        continue
+                s.close()
+            except:
+                pass
+            
+            return None
+        
+        def udp_broadcast_discovery():
+            """UDP broadcast discovery - fastest method"""
+            local_ip = get_local_ip()
+            if not local_ip:
+                return None
+            
+            try:
+                # Create UDP socket for broadcast
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(2.0)  # Wait 2 seconds for responses
+                
+                # Send discovery request
+                discovery_msg = json.dumps({
+                    'type': 'discover',
+                    'device_id': self.engine.config.device_id,
+                    'platform': self.engine.platform,
+                    'timestamp': time.time()
+                }).encode('utf-8')
+                
+                # Broadcast to all interfaces
+                subnet = '.'.join(local_ip.split('.')[:3])
+                broadcast_addrs = [
+                    f"{subnet}.255",      # Standard broadcast
+                    "255.255.255.255"     # Global broadcast
+                ]
+                
+                for broadcast_addr in broadcast_addrs:
+                    try:
+                        sock.sendto(discovery_msg, (broadcast_addr, DISCOVERY_PORT))
+                    except:
+                        pass
+                
+                # Listen for responses
+                start_time = time.time()
+                discovered_masters = []
+                
+                while time.time() - start_time < 2.0:
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                        response = json.loads(data.decode('utf-8'))
+                        
+                        if response.get('type') == 'master_announce':
+                            master_ip = response.get('ip')
+                            if master_ip and master_ip not in discovered_masters:
+                                discovered_masters.append(master_ip)
+                                print(f"[AUTO-DISCOVERY] [OK] Master found via UDP broadcast: {master_ip}")
+                    except socket.timeout:
+                        break
+                    except:
+                        continue
+                
+                sock.close()
+                
+                # Return first discovered master
+                if discovered_masters:
+                    return discovered_masters[0]
+                    
+            except Exception as e:
+                print(f"[AUTO-DISCOVERY] [WARN] UDP broadcast failed: {e}")
+            
+            return None
+        
+        def scan_port(ip, port, timeout=0.3):
+            """Check if port is open"""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                result = s.connect_ex((ip, port))
+                s.close()
+                return result == 0
+            except:
+                return False
+        
+        # METHOD 1: Try UDP broadcast first (fastest)
+        discovered = udp_broadcast_discovery()
+        if discovered:
+            return discovered
+        
+        # METHOD 2: Check known IPs (user provided or cached)
+        local_ip = get_local_ip()
+        if not local_ip:
+            return None
+        
+        # REMOVED HARDCODED IPs - Fully automatic discovery
+        # Check cached master IP first (if exists)
+        known_ips = []
+        if self.engine.config.master_ip:
+            known_ips.append(self.engine.config.master_ip)
+        
+        # Check cached nodes from state
+        if hasattr(self.engine.state, 'nodes') and self.engine.state.nodes:
+            for node_id, node_info in self.engine.state.nodes.items():
+                node_ip = node_info.get('ip') or node_info.get('address')
+                if node_ip and node_ip not in known_ips:
+                    known_ips.append(node_ip)
+        
+        for ip in known_ips:
+            if scan_port(ip, MASTER_PORT, timeout=0.5):
+                print(f"[AUTO-DISCOVERY] [OK] Master found at {ip} (known IP)")
+                return ip
+        
+        # METHOD 3: TCP port scan (slower fallback)
+        subnet = '.'.join(local_ip.split('.')[:3]) + '.'
+        
+        # Scan more thoroughly - check every 5th IP instead of every 10th
+        for i in range(1, 255, 5):
+            ip = subnet + str(i)
+            if ip == local_ip:
+                continue
+            if scan_port(ip, MASTER_PORT, timeout=0.2):
+                print(f"[AUTO-DISCOVERY] [OK] Master found at {ip} (port scan)")
+                return ip
+        
+        return None
+
+    def _check_master_failure(self):
+        """
+        PHASE 2: Detect master failure and trigger failover
+        If master is down for too long, oldest peer becomes new master
+        """
+        current_time = time.time()
+
+        # Track consecutive failures
+        self.consecutive_failures += 1
+
+        # Failover after 3 consecutive failures (optimized for sub-100ms promotion)
+        # Reduced from 5 to 3 for faster failover while maintaining stability
+        FAILOVER_THRESHOLD = 3
+
+        if self.consecutive_failures >= FAILOVER_THRESHOLD:
+            # Check if there's currently a master with authority
+            if self.engine.state.authority and self.engine.state.authority != self.engine.config.device_id:
+                print(f"[FAILOVER] Master failure detected: {self.engine.state.authority}")
+                print(f"[FAILOVER] {self.consecutive_failures} consecutive failures")
+
+                # Check if this peer should become master (oldest peer by device_id)
+                should_become_master = self._should_become_failover_master()
+
+                if should_become_master:
+                    from datetime import datetime
+                    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    print(f"")
+                    print(f"═══════════════════════════════════════════════════════════")
+                    print(f"[{ts}] [AUTO-FAILOVER] ⚠️  MASTER FAILURE DETECTED")
+                    print(f"[{ts}] [AUTO-FAILOVER] Previous master: {self.engine.state.authority}")
+                    print(f"[{ts}] [AUTO-FAILOVER] Consecutive failures: {self.consecutive_failures}")
+                    print(f"[{ts}] [AUTO-FAILOVER] This peer ({self.engine.platform}) is highest priority - AUTOMATICALLY TAKING CONTROL")
+                    print(f"═══════════════════════════════════════════════════════════")
+                    
+                    # Log to unified monitoring
+                    try:
+                        from ghostops_adapter import GhostOpsServer
+                        GhostOpsServer.add_log(f"[AUTO-FAILOVER] MASTER FAILURE - {self.engine.config.device_id} ({self.engine.platform}) taking control", 
+                                             self.engine.config.device_id)
+                    except:
+                        pass
+
+                    # Clear old authority
+                    old_authority = self.engine.state.authority
+                    self.engine.state.authority = None
+                    self.engine.state.authority_timestamp = 0
+                    self.engine.state.authority_device_name = None
+
+                    # Take control with new timestamp
+                    from ghostops_core import GhostOpsMasterLogic
+                    result = GhostOpsMasterLogic.handle_authority(
+                        self.engine.state,
+                        self.engine.config.device_id,
+                        True,
+                        current_time
+                    )
+
+                    # Update mode
+                    self.engine.mode = 'master'
+                    self.engine.state.save_state_cache()
+
+                    ts2 = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    print(f"")
+                    print(f"═══════════════════════════════════════════════════════════")
+                    print(f"[{ts2}] [AUTO-FAILOVER] ✅ FAILOVER COMPLETE")
+                    print(f"[{ts2}] [AUTO-FAILOVER] Old master: {old_authority}")
+                    print(f"[{ts2}] [AUTO-FAILOVER] New master: {self.engine.config.device_id} ({self.engine.platform})")
+                    print(f"[{ts2}] [AUTO-FAILOVER] This device is now MASTER")
+                    print(f"═══════════════════════════════════════════════════════════")
+                    
+                    # Log to unified monitoring
+                    try:
+                        from ghostops_adapter import GhostOpsServer
+                        GhostOpsServer.add_log(f"[AUTO-FAILOVER] ✅ FAILOVER COMPLETE - {self.engine.config.device_id} is now MASTER", 
+                                             self.engine.config.device_id)
+                    except:
+                        pass
+                    
+                    # Replay offline buffer if any events were buffered
+                    try:
+                        from offline_buffer import get_offline_buffer
+                        buffer = get_offline_buffer()
+                        if buffer.size() > 0:
+                            replay_count = buffer.replay_events(lambda event_type, data, device_id, timestamp: 
+                                GhostOpsServer.add_log(f"[REPLAY] {event_type}: {data}", device_id))
+                            print(f"[{ts2}] [OFFLINE BUFFER] Replayed {replay_count} buffered events")
+                    except:
+                        pass
+                    print(f"")
+
+                    # Reset failure counter
+                    self.consecutive_failures = 0
+                else:
+                    print(f"[AUTO-FAILOVER] ⏳ Waiting for oldest peer to take control")
+                    print(f"[AUTO-FAILOVER] This device: {self.engine.config.device_id}")
+                    print(f"[AUTO-FAILOVER] Available nodes: {list(self.engine.state.nodes.keys())}")
+                    print(f"[AUTO-FAILOVER] Master election in progress...")
+
+    def _get_node_hierarchy_priority(self, device_id: str, platform: str) -> int:
+        """
+        Get node priority for failover hierarchy
+        Returns: 1 (highest) = Linux, 2 = Windows, 3 = macOS, 4 = Android (lowest)
+        """
+        platform_lower = platform.lower() if platform else 'unknown'
+        
+        if 'linux' in platform_lower and 'android' not in platform_lower:
+            return 1  # Linux = primary master
+        elif 'windows' in platform_lower:
+            return 2  # Windows = secondary
+        elif 'darwin' in platform_lower or 'macos' in platform_lower or 'mac' in platform_lower:
+            return 3  # macOS = tertiary
+        elif 'android' in platform_lower:
+            return 4  # Android = fallback
+        else:
+            return 5  # Unknown = lowest priority
+    
+    def _should_become_failover_master(self):
+        """
+        PHASE 2: Determine if this peer should become master in failover
+        Uses hierarchy: Linux (primary) → Windows (secondary) → macOS (tertiary) → Android (fallback)
+        """
+        # Get all known peers (including self) with their platforms
+        all_peers = []
+        
+        # Add self
+        all_peers.append({
+            'device_id': self.engine.config.device_id,
+            'platform': self.engine.platform,
+            'priority': self._get_node_hierarchy_priority(self.engine.config.device_id, self.engine.platform)
+        })
+        
+        # Add other nodes
+        for device_id, node_info in self.engine.state.nodes.items():
+            if device_id == self.engine.state.authority:
+                continue  # Skip failed master
+            platform = node_info.get('platform', 'unknown')
+            all_peers.append({
+                'device_id': device_id,
+                'platform': platform,
+                'priority': self._get_node_hierarchy_priority(device_id, platform)
+            })
+        
+        if len(all_peers) == 0:
+            # No other peers - become master
+            return True
+        
+        # Sort by priority (lower number = higher priority), then by device_id
+        all_peers.sort(key=lambda x: (x['priority'], x['device_id']))
+        
+        # Highest priority peer becomes master
+        highest_priority_peer = all_peers[0]
+        is_highest_priority = highest_priority_peer['device_id'] == self.engine.config.device_id
+        
+        from datetime import datetime
+        ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        print(f"[{ts}] [FAILOVER] Hierarchy check:")
+        print(f"[{ts}] [FAILOVER]   Peers: {[(p['device_id'], p['platform'], f'priority={p['priority']}') for p in all_peers]}")
+        print(f"[{ts}] [FAILOVER]   Highest priority: {highest_priority_peer['device_id']} ({highest_priority_peer['platform']})")
+        print(f"[{ts}] [FAILOVER]   This device: {self.engine.config.device_id} ({self.engine.platform})")
+        print(f"[{ts}] [FAILOVER]   Should become master: {is_highest_priority}")
+        
+        # Log to unified monitoring
+        try:
+            from ghostops_adapter import GhostOpsServer
+            GhostOpsServer.add_log(f"[FAILOVER] Hierarchy: {highest_priority_peer['device_id']} ({highest_priority_peer['platform']}) should become master", 
+                                 self.engine.config.device_id)
+        except:
+            pass
+        
+        return is_highest_priority
+    
+    def _trigger_immediate_sync(self):
+        """Trigger immediate sync when coming back in range (like WiFi auto-sync)"""
+        try:
+            # Force immediate file sync when reconnecting
+            print(f"[+] [SYNC] Auto-syncing files (device back in range)...")
+            # The sync loop will pick this up automatically
+            self.last_successful_sync = time.time()
+        except Exception as e:
+            print(f"[!] Immediate sync error: {e}")
+    
+    def _trigger_proximity_sync(self):
+        """
+        PROXIMITY SYNC: Auto-download ALL data when mobile node comes into range
+        Like police car cameras uploading footage when driving past police station
+        
+        Downloads ALL files from master, not just changed ones - aggressive full sync
+        """
+        try:
+            if not self.engine.config.master_ip:
+                return
+            
+            print(f"[+] [PROXIMITY SYNC] 🚔 Mobile node IN RANGE - Downloading ALL data from master...")
+            print(f"[+] [PROXIMITY SYNC] 📥 Full system download initiated (like police car camera upload)")
+            
+            # Trigger aggressive full sync via sync endpoint
+            import urllib.request
+            import json
+            
+            sync_url = f"http://{self.engine.config.master_ip}:{self.engine.config.master_port}/sync/all"
+            sync_data = json.dumps({
+                'device_id': self.engine.config.device_id,
+                'force_full_sync': True,  # Force full download, not just changed files
+                'proximity_sync': True  # Flag for proximity sync
+            }).encode('utf-8')
+            
+            req = urllib.request.Request(
+                sync_url,
+                data=sync_data,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    files_synced = result.get('files_synced', 0)
+                    print(f"[+] [PROXIMITY SYNC] ✅ Download complete: {files_synced} files synced from master")
+                    
+                    # Log to unified monitoring
+                    try:
+                        from ghostops_adapter import GhostOpsServer
+                        GhostOpsServer.add_log(
+                            f"[PROXIMITY SYNC] ✅ Downloaded {files_synced} files from master (drive-by sync)",
+                            self.engine.config.device_id
+                        )
+                    except:
+                        pass
+            except Exception as e:
+                print(f"[!] [PROXIMITY SYNC] Error: {e}")
+                
+        except Exception as e:
+            print(f"[!] [PROXIMITY SYNC] Trigger error: {e}")
+    
+    def _process_sync_queue(self):
+        """Process pending sync queue when reconnected"""
+        # Process file pushes first (offline master mode)
+        if self.engine.state.pending_push_queue:
+            print(f"[+] [OFFLINE MASTER] Processing {len(self.engine.state.pending_push_queue)} queued file pushes...")
+            try:
+                # Trigger push via HTTP endpoint (internal call)
+                import urllib.request
+                import json
+                push_url = f"http://localhost:{self.engine.config.local_port}/file/force_push_all"
+                req = urllib.request.Request(
+                    push_url,
+                    data=json.dumps({'force': True}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    if result.get('status') == 'ok':
+                        print(f"[+] [OFFLINE MASTER] ✅ Executed queued push: {result.get('files_count', 0)} files")
+                        self.engine.state.pending_push_queue.clear()
+                        self.engine.state.save_state_cache()
+                    else:
+                        print(f"[!] [OFFLINE MASTER] Push execution failed: {result.get('error', 'Unknown')}")
+            except Exception as e:
+                print(f"[!] [OFFLINE MASTER] Error executing queued push: {e}")
+        
+        # Process sync operations
+        if not self.engine.state.pending_sync_queue:
+            return
+        
+        print(f"[+] Processing {len(self.engine.state.pending_sync_queue)} pending sync operations")
+        processed = 0
+        
+        for item in list(self.engine.state.pending_sync_queue):
+            try:
+                action = item['action']
+                kwargs = item.get('kwargs', {})
+                
+                # Re-execute the action
+                if action == 'sync_all':
+                    GhostOpsMasterLogic.handle_sync_all(self.engine.state, self.engine.config.device_id)
+                elif action == 'authority':
+                    GhostOpsMasterLogic.handle_authority(
+                        self.engine.state, 
+                        kwargs.get('device_id', self.engine.config.device_id),
+                        kwargs.get('has_authority', False)
+                    )
+                elif action == 'tool_activate':
+                    GhostOpsMasterLogic.handle_tool_activate(
+                        self.engine.state,
+                        kwargs.get('tool', 'unknown'),
+                        kwargs.get('source', self.engine.config.device_id)
+                    )
+                elif action == 'page_change':
+                    GhostOpsMasterLogic.handle_page_change(
+                        self.engine.state,
+                        kwargs.get('page', 1),
+                        kwargs.get('source', self.engine.config.device_id)
+                    )
+                
+                processed += 1
+            except Exception as e:
+                print(f"[!] Failed to process sync queue item: {e}")
+        
+        # Clear processed items
+        self.engine.state.clear_sync_queue()
+        print(f"[+] Processed {processed} sync operations")
+    
+    def start_reconnection_loop(self):
+        """Start background reconnection loop with WiFi-style continuous scanning"""
+        if self.reconnect_thread is not None:
+            return
+        
+        def reconnect_loop():
+            """Continuous range scanning (like WiFi constantly checking for networks)"""
+            while self.reconnect_enabled:
+                try:
+                    # Run for ALL peer nodes (even if master_ip is None - auto-discovery will find it)
+                    if not self.engine.is_master():
+                        # Continuous range check (like WiFi scanning every second)
+                        was_connected = (self.engine.state.connection_status == 'connected')
+                        # BUGFIX: Don't set to 'connecting' if already connected - breaks file sync!
+                        if not was_connected:
+                            self.engine.state.connection_status = 'connecting'
+                            # AGGRESSIVE: If no master IP OR in standalone mode, try auto-discovery immediately
+                            if not self.engine.config.master_ip or self.engine.state.standalone_mode:
+                                from datetime import datetime
+                                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                msg = f"[AUTO-DISCOVERY] 🔍 Scanning network for master..."
+                                print(f"[{ts}] {msg}")
+                                # Log to unified monitoring
+                                try:
+                                    from ghostops_adapter import GhostOpsServer
+                                    GhostOpsServer.add_log(msg, self.engine.config.device_id)
+                                except:
+                                    pass
+                                discovered = self._auto_discover_master()
+                                if discovered:
+                                    self.engine.config.master_ip = discovered
+                                    ts2 = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                    msg2 = f"[AUTO-DISCOVERY] [OK] Found master at {discovered}, connecting..."
+                                    print(f"[{ts2}] {msg2}")
+                                    try:
+                                        from ghostops_adapter import GhostOpsServer
+                                        GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                                    except:
+                                        pass
+                                    self.consecutive_failures = 0  # Reset on discovery
+
+                        # Check connection (will auto-discover if master_ip is None)
+                        if self.engine.config.master_ip:
+                            in_range = self.check_connection()
+                            
+                            if in_range:
+                                # In range - fast checks (WiFi-style continuous monitoring)
+                                self.reconnect_interval = 0.1  # 100ms for infrastructure-level resilience
+                                if not was_connected:
+                                    # Register with master when first connecting
+                                    from ghostops_core import GhostOpsNetwork
+                                    print(f"[CONNECTION] 🔗 Establishing client connection to master...")
+                                    result = GhostOpsNetwork.connect_to_master(
+                                        self.engine.config.master_ip,
+                                        self.engine.config.master_port,
+                                        self.engine.config.device_id,
+                                        self.engine.platform,
+                                        self.engine.config.local_port  # Tell master our port
+                                    )
+                                    from datetime import datetime
+                                    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                    if result and 'auth_key' in result:
+                                        self.engine.config.auth_key = result['auth_key']
+                                        msg1 = f"[+] [OK] Registered with master and got auth key"
+                                        msg2 = f"[+] [OK] Client connection established - mesh coordination active"
+                                        print(f"[{ts}] {msg1}")
+                                        print(f"[{ts}] {msg2}")
+                                        try:
+                                            from ghostops_adapter import GhostOpsServer
+                                            GhostOpsServer.add_log(msg1, self.engine.config.device_id)
+                                            GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                                        except:
+                                            pass
+                                    elif result:
+                                        msg = f"[+] [OK] Connected to master (mesh coordination active)"
+                                        print(f"[{ts}] {msg}")
+                                        try:
+                                            from ghostops_adapter import GhostOpsServer
+                                            GhostOpsServer.add_log(msg, self.engine.config.device_id)
+                                        except:
+                                            pass
+                                    else:
+                                        msg = f"[!] [WARN] Connection attempt failed, will retry..."
+                                        print(f"[{ts}] {msg}")
+                                        try:
+                                            from ghostops_adapter import GhostOpsServer
+                                            GhostOpsServer.add_log(msg, self.engine.config.device_id)
+                                        except:
+                                            pass
+                                    msg_conn = f"[+] 📶 CONNECTED to master at {self.engine.config.master_ip}:{self.engine.config.master_port}"
+                                    print(f"[{ts}] {msg_conn}")
+                                    try:
+                                        from ghostops_adapter import GhostOpsServer
+                                        GhostOpsServer.add_log(msg_conn, self.engine.config.device_id)
+                                    except:
+                                        pass
+                                    self.engine.state.connection_status = 'connected'
+                                    self.engine.state.standalone_mode = False
+                                    self.engine.state.save_state_cache()
+                            else:
+                                # Out of range - more aggressive scanning when in standalone
+                                if self.engine.state.standalone_mode:
+                                    self.reconnect_interval = 5  # 5 seconds (reduced CPU load - was 100ms)
+                                    # AGGRESSIVE: Try auto-discovery every time when in standalone
+                                    from datetime import datetime
+                                    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                    msg = f"[AUTO-DISCOVERY] 🔍 Standalone mode - scanning for master..."
+                                    print(f"[{ts}] {msg}")
+                                    # Log to unified monitoring (show continuous activity)
+                                    try:
+                                        from ghostops_adapter import GhostOpsServer
+                                        GhostOpsServer.add_log(msg, self.engine.config.device_id)
+                                    except:
+                                        pass
+                                    discovered = self._auto_discover_master()
+                                    if discovered:
+                                        ts2 = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                        msg2 = f"[AUTO-DISCOVERY] [OK] Found master at {discovered}, reconnecting..."
+                                        print(f"[{ts2}] {msg2}")
+                                        try:
+                                            from ghostops_adapter import GhostOpsServer
+                                            GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                                        except:
+                                            pass
+                                        self.engine.config.master_ip = discovered
+                                        self.consecutive_failures = 0
+                                        # Try connecting immediately
+                                        continue  # Skip sleep, check immediately
+                                else:
+                                    self.reconnect_interval = 0.1  # 100ms for infrastructure-level resilience
+                                if was_connected:
+                                    print(f"[!] [DISCONNECTED] DISCONNECTED - Standalone mode")
+                                    print(f"[!] ⏳ Will retry connection in {self.reconnect_interval}s...")
+                                    self.last_status = 'standalone'
+                        else:
+                            # No master IP - keep trying auto-discovery aggressively
+                            self.reconnect_interval = 0.1  # 100ms for infrastructure-level resilience
+                            from datetime import datetime
+                            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                            msg = f"[AUTO-DISCOVERY] 🔍 No master IP - scanning network..."
+                            print(f"[{ts}] {msg}")
+                            # Log to unified monitoring (show continuous activity)
+                            try:
+                                from ghostops_adapter import GhostOpsServer
+                                GhostOpsServer.add_log(msg, self.engine.config.device_id)
+                            except:
+                                pass
+                            discovered = self._auto_discover_master()
+                            if discovered:
+                                ts2 = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                msg2 = f"[AUTO-DISCOVERY] [OK] Found master at {discovered}, connecting..."
+                                print(f"[{ts2}] {msg2}")
+                                try:
+                                    from ghostops_adapter import GhostOpsServer
+                                    GhostOpsServer.add_log(msg2, self.engine.config.device_id)
+                                except:
+                                    pass
+                                self.engine.config.master_ip = discovered
+                                self.consecutive_failures = 0
+                                # Try connecting immediately
+                                continue  # Skip sleep, check immediately
+                            else:
+                                ts3 = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                msg3 = f"[AUTO-DISCOVERY] [ERROR] No master found, will retry in {self.reconnect_interval*1000:.0f}ms..."
+                                print(f"[{ts3}] {msg3}")
+                                # Log failed attempts too (show resilience)
+                                try:
+                                    from ghostops_adapter import GhostOpsServer
+                                    GhostOpsServer.add_log(msg3, self.engine.config.device_id)
+                                except:
+                                    pass
+                    
+                    time.sleep(self.reconnect_interval)
+                except Exception as e:
+                    print(f"[!] Error in reconnection loop: {e}")
+                    time.sleep(self.reconnect_interval)
+        
+        self.reconnect_thread = threading.Thread(target=reconnect_loop, daemon=True)
+        self.reconnect_thread.start()
+        print(f"[+] 📶 WiFi-style range detection started (scans every {self.reconnect_interval}s)")
+
+    def _network_detection_loop(self):
+        """
+        Continuously detect network mode (HOME_LAN vs AWAY)
+        Runs in background thread to automatically switch modes
+        """
+        while True:
+            try:
+                current_time = time.time()
+
+                # Check network every 5 seconds
+                if current_time - self.engine.state.last_network_check < 5:
+                    time.sleep(1)
+                    continue
+
+                self.engine.state.last_network_check = current_time
+
+                # Detect current network
+                network_mode = self._detect_network_mode()
+
+                # Check if mode changed
+                if network_mode != self.engine.state.network_mode:
+                    old_mode = self.engine.state.network_mode
+                    self.engine.state.network_mode = network_mode
+
+                    print(f"[NETWORK] Mode changed: {old_mode} → {network_mode}")
+
+                    if network_mode == 'HOME_LAN':
+                        print(f"[NETWORK] 🏠 On HOME network - Switching to LAN mode")
+                        print(f"[NETWORK] Subnet: {self.engine.state.home_network_subnet}")
+                        # Switch to connected mode if master is available
+                        if not self.engine.is_master():
+                            self.check_connection()
+                    else:
+                        print(f"[NETWORK] 🌐 AWAY from home - Standalone mode")
+                        # Remain standalone but keep trying to reconnect
+
+                    self.engine.state.save_state_cache()
+
+                time.sleep(1)
+            except Exception as e:
+                print(f"[!] Network detection error: {e}")
+                time.sleep(5)
+
+    def _detect_network_mode(self):
+        """
+        Detect if we're on home network or away
+        Returns: 'HOME_LAN' or 'AWAY'
+        """
+        try:
+            import socket
+            import subprocess
+
+            # Get current IP address (offline method)
+            local_ip = None
+            
+            # Method 1: Use ip route (Linux/Android) - works offline
+            try:
+                import subprocess
+                import re
+                result = subprocess.run(['ip', 'route', 'get', '1'], 
+                                      capture_output=True, text=True, timeout=1)
+                match = re.search(r'src (\d+\.\d+\.\d+\.\d+)', result.stdout)
+                if match:
+                    local_ip = match.group(1)
+            except:
+                pass
+            
+            # Method 2: Use hostname (works offline)
+            if not local_ip or local_ip.startswith('127.'):
+                try:
+                    local_ip = socket.gethostbyname(socket.gethostname())
+                except:
+                    pass
+            
+            # Method 3: Try network interfaces (offline)
+            if not local_ip or local_ip.startswith('127.'):
+                try:
+                    import netifaces
+                    gateways = netifaces.gateways()
+                    if 'default' in gateways and netifaces.AF_INET in gateways['default']:
+                        interface = gateways['default'][netifaces.AF_INET][1]
+                        addrs = netifaces.ifaddresses(interface)
+                        if netifaces.AF_INET in addrs:
+                            local_ip = addrs[netifaces.AF_INET][0]['addr']
+                except:
+                    pass
+            
+            # Method 4: Fallback - try local network router (offline)
+            if not local_ip or local_ip.startswith('127.'):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    for router_ip in ['192.168.1.1', '192.168.0.1', '10.0.0.1']:
+                        try:
+                            s.connect((router_ip, 1))
+                            local_ip = s.getsockname()[0]
+                            s.close()
+                            if not local_ip.startswith('127.'):
+                                break
+                        except:
+                            continue
+                    s.close()
+                except:
+                    pass
+
+            # Extract subnet (e.g., '192.168.1.' from '192.168.1.100')
+            subnet = '.'.join(local_ip.split('.')[:3]) + '.'
+
+            # First time detection - learn the home network
+            if self.engine.state.home_network_subnet is None:
+                # Check if other nodes are on same subnet
+                if self._check_for_peers_on_subnet(subnet):
+                    self.engine.state.home_network_subnet = subnet
+                    print(f"[NETWORK] 🏠 Detected HOME network subnet: {subnet}")
+                    return 'HOME_LAN'
+                else:
+                    # No peers detected - assume away
+                    return 'AWAY'
+            else:
+                # Check if current subnet matches home subnet
+                if subnet == self.engine.state.home_network_subnet:
+                    return 'HOME_LAN'
+                else:
+                    # Different subnet - we're away from home
+                    return 'AWAY'
+
+        except Exception as e:
+            print(f"[!] Network mode detection error: {e}")
+            return 'AWAY'
+
+    def _check_for_peers_on_subnet(self, subnet):
+        """
+        Check if any known peers or master are on this subnet
+        This helps identify the home network
+        """
+        try:
+            # Check master IP
+            if self.engine.config.master_ip:
+                if self.engine.config.master_ip.startswith(subnet):
+                    return True
+
+            # Check known nodes
+            for node in self.engine.state.nodes.values():
+                if node.get('ip', '').startswith(subnet):
+                    return True
+
+            # Try to ping master to verify it's on this network
+            if self.engine.config.master_ip:
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(
+                        f"http://{self.engine.config.master_ip}:{self.engine.config.master_port}/status",
+                        timeout=2
+                    ) as response:
+                        # Master is reachable on this network
+                        return True
+                except:
+                    pass
+
+            return False
+        except Exception as e:
+            print(f"[!] Peer check error: {e}")
+            return False
+
+    def stop_reconnection_loop(self):
+        """Stop reconnection loop"""
+        self.reconnect_enabled = False
+
+
+class GhostOpsEngine:
+    """Main unified engine that coordinates all subsystems"""
+    
+    def __init__(self, platform='unknown', mode='peer'):
+        """
+        Initialize the unified engine
+        
+        Args:
+            platform: 'linux', 'windows', 'android', None, or 'unknown' (auto-detects)
+            mode: 'master' or 'peer'
+        """
+        # Handle None platform
+        if platform is None:
+            platform = 'unknown'
+        # Store original platform before creating config
+        original_platform = platform
+        self.mode = mode
+        self.config = GhostOpsConfig(platform, mode)
+        self.state = GhostOpsState()
+        self.state.config = self.config  # Link config to state
+        # Use platform from config (which respects explicit platform or auto-detects)
+        # BUT: If platform was explicitly set (not 'unknown'), keep it
+        if original_platform != 'unknown':
+            self.platform = original_platform
+            # Also update config to match explicit platform
+            self.config.platform = original_platform
+            # Regenerate device_id with correct platform
+            self.config.device_id = self.config._generate_device_id()
+        else:
+            # Auto-detected - use detected value
+            self.platform = self.config.platform
+        
+        # REMOVED: Android auto-master bug - Android should be peer by default
+        # Android can take control via password, but doesn't auto-become master
+        
+        # Set up state cache file
+        cache_dir = os.path.expanduser("~/.ghostops")
+        os.makedirs(cache_dir, exist_ok=True)
+        self.state.state_cache_file = os.path.join(cache_dir, f"state_{self.config.device_id}.json")
+        
+        # Load cached state if available
+        if self.state.load_state_cache():
+            print(f"[+] Loaded cached state from {self.state.state_cache_file}")
+        
+        # CRITICAL FIX: Set authority for master nodes, clear for peers
+        if self.mode == 'master':
+            # Linux master by design - set authority immediately
+            if not self.state.authority or self.state.authority != self.config.device_id:
+                import time
+                print(f"[AUTHORITY] Setting master authority for {self.config.device_id} (Linux master by design)")
+                self.state.authority = self.config.device_id
+                self.state.authority_timestamp = time.time()
+                self.state.authority_device_name = self.config.device_id
+                self.state.save_state_cache()
+        elif self.mode == 'peer':
+            # If we're a peer, we should NOT have authority unless we're taking control
+            if self.state.authority == self.config.device_id:
+                print(f"[AUTHORITY FIX] Clearing incorrect cached authority for peer node")
+                self.state.authority = None
+                self.state.authority_timestamp = 0
+                self.state.authority_device_name = None
+                self.state.save_state_cache()
+        
+        # Initialize tunnel manager
+        self.tunnel_manager = GhostOpsTunnelManager(self)
+        
+        # Initialize connection manager
+        self.connection_manager = GhostOpsConnectionManager(self)
+        
+        # Initialize Unified Sync Authority (ONE transport, ONE authority)
+        try:
+            from unified_sync_authority import UnifiedSyncAuthority
+            self.sync_authority = UnifiedSyncAuthority(self)
+            self.sync_authority.start()
+            print("[GhostOps] [OK] Unified Sync Authority initialized (pull-based, HTTP only)")
+        except ImportError as e:
+            print(f"[GhostOps] [WARN] Unified Sync Authority not available: {e}")
+            self.sync_authority = None
+        except Exception as e:
+            print(f"[GhostOps] [WARN] Sync Authority error: {e}")
+            self.sync_authority = None
+        
+        # Initialize File Messenger (direct peer-to-peer file transfer)
+        try:
+            from ghost_file_messenger import GhostFileMessenger
+            project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.file_messenger = GhostFileMessenger(
+                node_id=self.config.device_id,
+                port=self.config.local_port,
+                project_dir=project_dir
+            )
+            print("[GhostOps] [OK] File Messenger initialized - Direct peer-to-peer file transfer enabled")
+        except ImportError as e:
+            print(f"[GhostOps] [WARN] File Messenger not available: {e}")
+            self.file_messenger = None
+        except Exception as e:
+            print(f"[GhostOps] [WARN] File Messenger initialization error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.file_messenger = None
+        
+        # Initialize Unified UI Engine (combines ui_mirror + ui_sync)
+        try:
+            from unified_ui_engine import UnifiedUIEngine
+            self.ui_sync = UnifiedUIEngine(self)
+            self.ui_mirror = self.ui_sync  # Compatibility alias
+            self.ui_sync.start()
+            print("[GhostOps] [OK] Unified UI Engine initialized (real-time + polling + file sync)")
+        except ImportError as e:
+            print(f"[GhostOps] [WARN] Unified UI Engine not available: {e}")
+            self.ui_sync = None
+            self.ui_mirror = None
+        except Exception as e:
+            print(f"[GhostOps] [WARN] UI Sync Engine error: {e}")
+            self.ui_sync = None
+        
+        # Initialize Subsystem Monitor
+        try:
+            from subsystem_monitor import get_subsystem_monitor
+            self.subsystem_monitor = get_subsystem_monitor()
+            print("[GhostOps] [OK] Subsystem Monitor initialized (SC-SUB, EB-SUB, SEC-SUB)")
+        except Exception as e:
+            print(f"[GhostOps] [WARN] Subsystem Monitor not available: {e}")
+            self.subsystem_monitor = None
+        
+        # Initialize Offline Buffer
+        try:
+            from offline_buffer import get_offline_buffer
+            self.offline_buffer = get_offline_buffer()
+            print("[GhostOps] [OK] Offline Buffer initialized")
+        except Exception as e:
+            print(f"[GhostOps] [WARN] Offline Buffer not available: {e}")
+            self.offline_buffer = None
+        
+        # Initialize OPAS (OmniPlatform AI Substrate) - Layer 12
+        try:
+            from opas_core import OPAS
+            work_dir = os.path.dirname(os.path.abspath(__file__))
+            self.opas = OPAS(work_dir=work_dir, node_id=self.config.device_id)
+            for device_id, node_info in self.state.nodes.items():
+                if device_id != self.config.device_id:
+                    self.opas.register_node(
+                        node_id=device_id,
+                        ip=node_info.get('ip', ''),
+                        port=node_info.get('port', 7890),
+                        platform=node_info.get('platform', 'unknown'),
+                        ssh_user=node_info.get('ssh_user'),
+                        ssh_port=node_info.get('ssh_port', 22)
+                    )
+            self.opas.start()
+            print("[GhostOps] [OK] OPAS Layer 12 initialized")
+        except ImportError:
+            self.opas = None
+        except Exception as e:
+            print(f"[GhostOps] [WARN] OPAS error: {e}")
+            self.opas = None
+        
+        # Auto-load all Kali Linux tools on startup
+        try:
+            from tool_registry import ToolRegistry
+            tools = ToolRegistry.load_kali_tools()
+            print(f"[GhostOps] [OK] Loaded {len(tools)} Kali Linux tools into registry")
+        except ImportError:
+            print("[GhostOps] [WARN]  Tool registry not available - tools will use legacy mode")
+        except Exception as e:
+            print(f"[GhostOps] [WARN]  Error loading tools: {e}")
+        
+        # Initialize connection status
+        if self.is_master():
+            # Master is always "connected" (can work standalone)
+            self.state.connection_status = 'connected'
+            self.state.standalone_mode = False
+            # Start UDP discovery listener for master
+            self._start_udp_discovery_listener()
+        else:
+            # Check if we can connect to master
+            self.connection_manager.check_connection()
+    
+    def _start_udp_discovery_listener(self):
+        """Start UDP listener to respond to discovery requests (master only)"""
+        import threading
+        import socket
+        
+        DISCOVERY_PORT = 7891
+        
+        def udp_listener():
+            """Listen for UDP discovery requests and respond"""
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(('0.0.0.0', DISCOVERY_PORT))
+                sock.settimeout(1.0)  # Non-blocking with timeout
+                
+                print(f"[AUTO-DISCOVERY] [OK] UDP discovery listener started on port {DISCOVERY_PORT}")
+                
+                while True:
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                        request = json.loads(data.decode('utf-8'))
+                        
+                        if request.get('type') == 'discover':
+                            # Respond with master announcement
+                            response = json.dumps({
+                                'type': 'master_announce',
+                                'ip': self.config.local_ip,
+                                'port': self.config.local_port,
+                                'device_id': self.config.device_id,
+                                'platform': self.platform,
+                                'timestamp': time.time()
+                            }).encode('utf-8')
+                            
+                            sock.sendto(response, addr)
+                            print(f"[AUTO-DISCOVERY] [OK] Responded to discovery from {addr[0]}")
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        # Silently ignore errors (firewall, etc.)
+                        continue
+            except Exception as e:
+                print(f"[AUTO-DISCOVERY] [WARN] UDP listener error: {e}")
+        
+        # Start listener in background thread
+        listener_thread = threading.Thread(target=udp_listener, daemon=True)
+        listener_thread.start()
+        
+    def get_status(self):
+        """Get current system status"""
+        # CRITICAL FIX: Clean up stale nodes before counting
+        # Remove nodes that haven't been seen in 5 minutes (300 seconds)
+        removed = self.state.cleanup_old_nodes(timeout=300)
+        if removed:
+            print(f"[CLEANUP] Removed {len(removed)} stale node(s): {', '.join(removed)}")
+            self.state.save_state_cache()
+        
+        # Update tunnel status
+        tunnel_status = self.tunnel_manager.get_tunnel_status() if hasattr(self, 'tunnel_manager') else {'active': False}
+
+        # Update connection status for peer nodes
+        if not self.is_master() and hasattr(self, 'connection_manager'):
+            self.connection_manager.check_connection()
+
+        # Determine if this device is master based on authority (not mode)
+        # Only check authority - if we have authority, we're master
+        # CRITICAL FIX: Only ONE device can be master at a time
+        is_master_now = (
+            self.state.authority == self.config.device_id or
+            (self.state.authority == 'local_device' and self.mode == 'master')
+        )
+        
+        # If we're in master mode but don't have authority, we're NOT master
+        if self.mode == 'master' and not is_master_now:
+            is_master_now = False
+
+        # For peers, include master info for file transfer
+        # FIX: Count all nodes properly
+        # Master sees all peers, peers see other peers + master
+        node_count = len(self.state.nodes)
+        if is_master_now:
+            # Master counts all peers it knows about
+            node_count = len(self.state.nodes)
+        else:
+            # Peer counts other peers + master (if master exists)
+            if self.state.authority and self.state.authority != self.config.device_id:
+                # There's a master - count it
+                node_count = len(self.state.nodes) + 1
+            else:
+                # No master or we're the master - just count peers
+                node_count = len(self.state.nodes)
+        
+        # Add master time for unified timestamp sync
+        master_time = time.time() if is_master_now else None
+        
+        result = {
+            'status': 'online',
+            'nodes': self.state.nodes,
+            'node_count': node_count,  # Explicit node count
+            'device_id': self.config.device_id,
+            'platform': self.platform,  # Add platform for OS display
+            'authority': self.state.authority,
+            'authority_timestamp': self.state.authority_timestamp,  # PHASE 2
+            'authority_device_name': self.state.authority_device_name,  # PHASE 2
+            'is_master': is_master_now,
+            'mode': self.mode,
+            'tool': self.state.tool_state,
+            'page': self.state.page_state,
+            'last_sync': self.state.last_sync,
+            'commands': self.state.commands,
+            'tunnel': tunnel_status,
+            'connection_status': self.state.connection_status,
+            'standalone_mode': self.state.standalone_mode,
+            'pending_sync': len(self.state.pending_sync_queue),
+            'network_mode': self.state.network_mode,  # HOME_LAN or AWAY
+            'home_network_subnet': self.state.home_network_subnet,
+            'master_time': master_time  # Master's current time for unified timestamps
+        }
+        
+        # If peer, include master device ID for file transfer targeting
+        # BUGFIX: Don't add master to nodes dict - causes double-counting!
+        # Instead, provide master info separately for file transfers
+        if not is_master_now and self.config.master_ip:
+            # Try to get master device ID from nodes or state
+            # Master's device ID might be in authority or we can derive it
+            # For now, if we're connected, the master should be the one with authority
+            if self.state.authority and self.state.authority != self.config.device_id:
+                result['master_device_id'] = self.state.authority
+                # Provide master info separately without modifying nodes dict
+                result['master_info'] = {
+                    'device_id': self.state.authority,
+                    'ip': self.config.master_ip,
+                    'platform': 'master',
+                    'last_seen': time.time()
+                }
+        
+        return result
+    
+    def is_master(self):
+        """Check if this is a master node - checks both mode AND authority"""
+        # Check if we have authority (actual master status)
+        has_authority = (self.state.authority == self.config.device_id or 
+                        self.state.authority == 'local_device')
+        # Also check mode for backward compatibility
+        return self.mode == 'master' or has_authority
+    
+    def cleanup_task(self, timeout=300):
+        """Background cleanup task"""
+        removed = self.state.cleanup_old_nodes(timeout)
+        for node_id in removed:
+            print(f"[+] Node removed due to inactivity: {node_id}")
+

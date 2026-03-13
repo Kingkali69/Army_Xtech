@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+GhostHUD v2.1 - Main Launcher
+Updated with Training Scenarios integration
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import sys
+import os
+
+# Import existing modules
+try:
+    from action_builder import ActionBuilder
+    from system_monitor import SystemMonitor
+    from config_manager import ConfigManager
+    # Import the new training scenarios module
+    from training_scenarios import TrainingApp
+except ImportError as e:
+    print(f"Error importing modules: {e}")
+    sys.exit(1)
+
+class GhostHUD:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("👻 GhostHUD v2.1 - Cybersecurity Toolkit")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#0a0a0a')
+        
+        # Configure dark theme
+        self.setup_theme()
+        
+        # Initialize components
+        self.config_manager = ConfigManager()
+        self.training_window = None  # Reference to training popup window
+        
+        # Create main interface
+        self.create_widgets()
+        
+    def setup_theme(self):
+        """Configure dark theme for the application"""
+        style = ttk.Style()
+        
+        # Configure notebook style
+        style.theme_use('clam')
+        style.configure('TNotebook', 
+                       background='#0a0a0a',
+                       borderwidth=2,
+                       relief='solid')
+        style.configure('TNotebook.Tab',
+                       background='#1a1a1a',
+                       foreground='#00ff88',
+                       padding=[20, 10],
+                       borderwidth=1)
+        style.map('TNotebook.Tab',
+                 background=[('selected', '#00ff88')],
+                 foreground=[('selected', '#000000')])
+        
+        # Configure frame style
+        style.configure('Dark.TFrame',
+                       background='#0a0a0a',
+                       relief='flat')
+        
+        # Configure button style
+        style.configure('Ghost.TButton',
+                       background='#1a1a1a',
+                       foreground='#00ff88',
+                       borderwidth=2,
+                       relief='solid',
+                       padding=[10, 5])
+        style.map('Ghost.TButton',
+                 background=[('active', '#00ff88')],
+                 foreground=[('active', '#000000')])
+
+    def create_widgets(self):
+        """Create the main GUI widgets"""
+        # Main container
+        main_frame = ttk.Frame(self.root, style='Dark.TFrame')
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill='both', expand=True)
+        
+        # Create tabs
+        self.create_action_tab()
+        self.create_monitor_tab()
+        self.create_training_tab()  # New training scenarios tab
+        self.create_settings_tab()
+        
+    def create_action_tab(self):
+        """Create Action HUD tab"""
+        action_frame = ttk.Frame(self.notebook, style='Dark.TFrame')
+        self.notebook.add(action_frame, text='🎯 Action HUD')
+        
+        try:
+            # Initialize ActionBuilder within the tab
+            self.action_builder = ActionBuilder(action_frame)
+        except Exception as e:
+            error_label = tk.Label(action_frame, 
+                                 text=f"Error loading Action HUD: {e}",
+                                 bg='#0a0a0a', fg='#ff4444',
+                                 font=('Courier', 12))
+            error_label.pack(expand=True)
+    
+    def create_monitor_tab(self):
+        """Create System Monitor tab"""
+        monitor_frame = ttk.Frame(self.notebook, style='Dark.TFrame')
+        self.notebook.add(monitor_frame, text='📊 System Monitor')
+        
+        try:
+            # Initialize SystemMonitor within the tab
+            self.system_monitor = SystemMonitor(monitor_frame)
+        except Exception as e:
+            error_label = tk.Label(monitor_frame,
+                                 text=f"Error loading System Monitor: {e}",
+                                 bg='#0a0a0a', fg='#ff4444',
+                                 font=('Courier', 12))
+            error_label.pack(expand=True)
+    
+    def create_training_tab(self):
+        """Create Training Scenarios tab"""
+        training_frame = ttk.Frame(self.notebook, style='Dark.TFrame')
+        self.notebook.add(training_frame, text='🎓 Training Scenarios')
+        
+        # Create training tab content
+        self.setup_training_content(training_frame)
+    
+    def setup_training_content(self, parent_frame):
+        """Setup the training scenarios tab content"""
+        # Title section
+        title_frame = tk.Frame(parent_frame, bg='#0a0a0a')
+        title_frame.pack(fill='x', padx=20, pady=20)
+        
+        title_label = tk.Label(title_frame,
+                              text="🎓 Cybersecurity Training Scenarios",
+                              font=('Courier', 18, 'bold'),
+                              bg='#0a0a0a', fg='#00ff88')
+        title_label.pack(anchor='w')
+        
+        subtitle_label = tk.Label(title_frame,
+                                 text="Interactive simulations for learning cybersecurity concepts",
+                                 font=('Courier', 12),
+                                 bg='#0a0a0a', fg='#88ff88')
+        subtitle_label.pack(anchor='w', pady=(5, 0))
+        
+        # Separator
+        separator = tk.Frame(parent_frame, height=2, bg='#00ff88')
+        separator.pack(fill='x', padx=20, pady=10)
+        
+        # Options frame
+        options_frame = tk.Frame(parent_frame, bg='#0a0a0a')
+        options_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Option 1: Launch as popup window (recommended)
+        popup_frame = tk.LabelFrame(options_frame,
+                                   text=" Launch Training Window ",
+                                   font=('Courier', 12, 'bold'),
+                                   bg='#0a0a0a', fg='#00ff88',
+                                   bd=2, relief='solid')
+        popup_frame.pack(fill='x', pady=(0, 20))
+        
+        popup_desc = tk.Label(popup_frame,
+                             text="Launch training scenarios in a separate window for better experience",
+                             font=('Courier', 10),
+                             bg='#0a0a0a', fg='#cccccc',
+                             wraplength=600)
+        popup_desc.pack(anchor='w', padx=15, pady=10)
+        
+        popup_button = ttk.Button(popup_frame,
+                                 text="🚀 Launch Training Scenarios",
+                                 style='Ghost.TButton',
+                                 command=self.launch_training_popup)
+        popup_button.pack(anchor='w', padx=15, pady=(0, 15))
+        
+        # Option 2: Embed in tab (alternative)
+        embed_frame = tk.LabelFrame(options_frame,
+                                   text=" Embedded Training ",
+                                   font=('Courier', 12, 'bold'),
+                                   bg='#0a0a0a', fg='#00ff88',
+                                   bd=2, relief='solid')
+        embed_frame.pack(fill='x', pady=(0, 20))
+        
+        embed_desc = tk.Label(embed_frame,
+                             text="Embed training interface directly in this tab (may be cramped)",
+                             font=('Courier', 10),
+                             bg='#0a0a0a', fg='#cccccc',
+                             wraplength=600)
+        embed_desc.pack(anchor='w', padx=15, pady=10)
+        
+        embed_button = ttk.Button(embed_frame,
+                                 text="📋 Embed Training Here",
+                                 style='Ghost.TButton',
+                                 command=lambda: self.embed_training(options_frame))
+        embed_button.pack(anchor='w', padx=15, pady=(0, 15))
+        
+        # Status frame
+        self.training_status_frame = tk.Frame(options_frame, bg='#0a0a0a')
+        self.training_status_frame.pack(fill='x', pady=10)
+        
+        self.training_status_label = tk.Label(self.training_status_frame,
+                                             text="Status: Ready to launch training scenarios",
+                                             font=('Courier', 10),
+                                             bg='#0a0a0a', fg='#88ff88')
+        self.training_status_label.pack(anchor='w')
+    
+    def launch_training_popup(self):
+        """Launch training scenarios in a separate popup window"""
+        try:
+            # Check if training window is already open
+            if self.training_window and self.training_window.winfo_exists():
+                self.training_window.lift()  # Bring to front
+                self.training_window.focus_force()
+                self.update_training_status("Training window brought to front", "info")
+                return
+            
+            # Update status
+            self.update_training_status("Launching training scenarios...", "loading")
+            
+            # Launch training window in a separate thread to avoid blocking
+            def launch_thread():
+                try:
+                    # Create new training window
+                    self.training_window = tk.Toplevel(self.root)
+                    self.training_window.transient(self.root)  # Stay on top of main window
+                    
+                    # Initialize training app in the new window
+                    training_app = TrainingApp(self.training_window)
+                    
+                    # Configure window close event
+                    def on_training_close():
+                        self.training_window = None
+                        self.update_training_status("Training window closed", "info")
+                    
+                    self.training_window.protocol("WM_DELETE_WINDOW", on_training_close)
+                    
+                    # Update status
+                    self.root.after(0, lambda: self.update_training_status("Training scenarios launched successfully!", "success"))
+                    
+                    # Run the training app
+                    training_app.run()
+                    
+                except Exception as e:
+                    error_msg = f"Error launching training scenarios: {str(e)}"
+                    self.root.after(0, lambda: self.update_training_status(error_msg, "error"))
+                    print(error_msg)
+            
+            # Start launch thread
+            thread = threading.Thread(target=launch_thread, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            self.update_training_status(f"Failed to launch: {str(e)}", "error")
+    
+    def embed_training(self, parent_frame):
+        """Embed training scenarios directly in the tab"""
+        try:
+            # Update status
+            self.update_training_status("Embedding training scenarios...", "loading")
+            
+            # Clear existing content (keep status frame)
+            for widget in parent_frame.winfo_children():
+                if widget != self.training_status_frame:
+                    widget.destroy()
+            
+            # Create embedded frame for training
+            embedded_frame = tk.Frame(parent_frame, bg='#0a0a0a')
+            embedded_frame.pack(fill='both', expand=True, pady=(0, 10))
+            
+            # Initialize training app in embedded mode
+            # Note: This requires modifying TrainingApp to accept a parent frame
+            # For now, we'll create a placeholder and recommend popup mode
+            
+            placeholder_label = tk.Label(embedded_frame,
+                                        text="⚠️  Embedded mode requires TrainingApp modification\n\n" +
+                                             "Please use 'Launch Training Window' for full functionality.\n" +
+                                             "Embedded mode coming in future update.",
+                                        font=('Courier', 12),
+                                        bg='#0a0a0a', fg='#ffaa00',
+                                        justify='center')
+            placeholder_label.pack(expand=True)
+            
+            # Add button to go back
+            back_button = ttk.Button(embedded_frame,
+                                   text="🔙 Back to Options",
+                                   style='Ghost.TButton',
+                                   command=lambda: self.reset_training_tab(parent_frame))
+            back_button.pack(pady=20)
+            
+            self.update_training_status("Embedded mode: Use popup window instead", "warning")
+            
+        except Exception as e:
+            self.update_training_status(f"Embedding failed: {str(e)}", "error")
+    
+    def reset_training_tab(self, parent_frame):
+        """Reset the training tab to original state"""
+        # Clear all content
+        for widget in parent_frame.winfo_children():
+            widget.destroy()
+        
+        # Recreate original content
+        self.setup_training_content(parent_frame)
+    
+    def update_training_status(self, message, status_type="info"):
+        """Update training status label"""
+        colors = {
+            "info": "#88ff88",
+            "success": "#44ff44", 
+            "warning": "#ffaa00",
+            "error": "#ff4444",
+            "loading": "#00aaff"
+        }
+        
+        color = colors.get(status_type, "#88ff88")
+        
+        if hasattr(self, 'training_status_label'):
+            self.training_status_label.config(text=f"Status: {message}", fg=color)
+    
+    def create_settings_tab(self):
+        """Create Settings tab"""
+        settings_frame = ttk.Frame(self.notebook, style='Dark.TFrame')
+        self.notebook.add(settings_frame, text='⚙️ Settings')
+        
+        # Settings content
+        settings_label = tk.Label(settings_frame,
+                                text="GhostHUD v2.1 Settings",
+                                font=('Courier', 16, 'bold'),
+                                bg='#0a0a0a', fg='#00ff88')
+        settings_label.pack(pady=20)
+        
+        # Add your settings content here
+        config_button = ttk.Button(settings_frame,
+                                  text="Open Config Manager",
+                                  style='Ghost.TButton',
+                                  command=self.open_config_manager)
+        config_button.pack(pady=10)
+    
+    def open_config_manager(self):
+        """Open configuration manager"""
+        try:
+            if hasattr(self, 'config_manager'):
+                self.config_manager.show()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open config manager: {e}")
+    
+    def on_closing(self):
+        """Handle application closing"""
+        try:
+            # Close training window if open
+            if self.training_window and self.training_window.winfo_exists():
+                self.training_window.destroy()
+                
+            # Stop any running monitors
+            if hasattr(self, 'system_monitor'):
+                self.system_monitor.stop()
+                
+            # Save configuration
+            if hasattr(self, 'config_manager'):
+                self.config_manager.save()
+                
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
+        finally:
+            self.root.quit()
+            self.root.destroy()
+
+def main():
+    """Main entry point"""
+    try:
+        # Create root window
+        root = tk.Tk()
+        
+        # Initialize GhostHUD
+        app = GhostHUD(root)
+        
+        # Configure close event
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+        
+        # Center window on screen
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
+        y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
+        root.geometry(f"+{x}+{y}")
+        
+        # Start main loop
+        root.mainloop()
+        
+    except KeyboardInterrupt:
+        print("\n👻 GhostHUD shutting down...")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

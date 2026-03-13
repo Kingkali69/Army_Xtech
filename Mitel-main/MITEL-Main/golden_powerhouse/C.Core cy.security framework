@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+# cloudcore_cli.py
+# CloudCore_Sync_2 Framework - Production CLI Launcher
+
+import asyncio
+import argparse
+import json
+import sys
+import os
+import logging
+import time
+import signal
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+
+# Import core framework components
+try:
+    from engine_core import EngineCore, SubsystemState
+    ENGINE_AVAILABLE = True
+except ImportError:
+    print("❌ engine_core.py not found - engine commands disabled")
+    ENGINE_AVAILABLE = False
+
+try:
+    from sp_subsystem_v5_complete import SyncCoordinator, EnhancedGhostSyncProtocol
+    SP_AVAILABLE = True
+except ImportError:
+    print("❌ sp_subsystem_v5_complete.py not found - sync commands disabled")
+    SP_AVAILABLE = False
+
+class CloudCoreCLI:
+    """Production-grade CLI launcher for CloudCore_Sync_2"""
+    
+    def __init__(self):
+        self.logger = self._setup_logging()
+        self.engine = None
+        self.standalone_coordinator = None
+        self.running = False
+        
+        # CLI state
+        self.prompt_prefix = "CloudCore"
+        self.last_command_time = None
+        
+    def _setup_logging(self, level: str = "INFO") -> logging.Logger:
+        """Setup structured logging for CLI"""
+        logging.basicConfig(
+            level=getattr(logging, level.upper()),
+            format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler('logs/cloudcore_cli.log', mode='a')
+            ] if os.path.exists('logs') or self._ensure_dir('logs') else [logging.StreamHandler(sys.stdout)]
+        )
+        return logging.getLogger("CloudCore.CLI")
+    
+    def _ensure_dir(self, path: str) -> bool:
+        """Ensure directory exists"""
+        try:
+            os.makedirs(path, exist_ok=True)
+            return True
+        except Exception:
+            return False
+    
+    def _print_banner(self):
+        """Print CloudCore banner"""
+        banner = """
+╔════════════════════════════════════════════════════════════════╗
+║                     CloudCore_Sync_2                           ║
+║              Enterprise Cybersecurity Framework                 ║
+║                    Production CLI v1.0                         ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+        print(banner)
+    
+    def _print_status_summary(self):
+        """Print system status summary"""
+        print("\n📊 SYSTEM STATUS")
+        print("=" * 60)
+        
+        # Engine status
+        if ENGINE_AVAILABLE and self.engine:
+            try:
+                status = self.engine.get_status()
+                engine_state = status.get('state', 'unknown')
+                subsystems = status.get('subsystems', {})
+                
+                print(f"🚀 Engine: {engine_state.upper()}")
+                print(f"🆔 Node ID: {status.get('node_id', 'unknown')}")
+                print(f"⏱️  Uptime: {status.get('uptime', 'unknown')}")
+                
+                print("\n📡 SUBSYSTEMS:")
+                for name, state in subsystems.items():
+                    icon = "✅" if state == "running" else "⚠️" if state == "ready" else "❌"
+                    print(f"   {icon} {name.upper()}: {state}")
+                    
+            except Exception as e:
+                print(f"❌ Engine: Error getting status - {e}")
+        elif ENGINE_AVAILABLE:
+            print("🚀 Engine: NOT STARTED")
+        else:
+            print("🚀 Engine: NOT AVAILABLE")
+        
+        # SP-SUB status
+        if self._get_sp_subsystem():
+            print(f"\n🔄 Sync Protocol: ACTIVE")
+            asyncio.create_task(self._print_sync_status_async())
+        elif SP_AVAILABLE:
+            print(f"\n🔄 Sync Protocol: AVAILABLE")
+        else:
+            print(f"\n🔄 Sync Protocol: NOT AVAILABLE")
+        
+        print("=" * 60)
+    
+    async def _print_sync_status_async(self):
+        """Print sync status asynchronously"""
+        try:
+            sp_sub = self._get_sp_subsystem()
+            if sp_sub:
+                status = await sp_sub.get_status()
+                peers = status.get('online_peers', 0)
+                last_sync = status.get('last_sync_time', 'Never')
+                print(f"   📡 Online Peers: {peers}")
+                print(f"   🕒 Last Sync: {last_sync}")
+        except Exception:
+            pass
+    
+    def _get_sp_subsystem(self):
+        """Get SP subsystem from engine or standalone"""
+        if self.engine and 'sp_sub' in self.engine.subsystems:
+            return self.engine.subsystems['sp_sub']
+        return self.standalone_coordinator
+    
+    async def cmd_start(self, args) -> Dict[str, Any]:
+        """Start the CloudCore engine"""
+        if not ENGINE_AVAILABLE:
+            return {
+                'status': 'error',
+                'message': 'Engine core not available. Check engine_core.py file.'
+            }
+        
+        if self.engine:
+            return {
+                'status': 'error',
+                'message': 'Engine already running. Use "stop" first.'
+            }
+        
+        try:
+            print("🚀 Starting CloudCore Engine...")
+            
+            # Create engine instance
+            config_path = getattr(args, 'config', 'config/engine_config.yaml')
+            self.engine = EngineCore(config_path)
+            
+            # Initialize
+            await self.engine.initialize()
+            print("   ✅ Engine initialized")
+            
+            # Start
+            await self.engine.start()
+            print("   ✅ Engine started")
+            
+            # Get final status
+            status = self.engine.get_status()
+            
+            return {
+                'status': 'success',
+                'message': 'CloudCore Engine started successfully',
+                'engine_status': status,
+                'node_id': status.get('node_id'),
+                'subsystems': len(status.get('subsystems', {}))
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Engine startup failed: {e}")
+            self.engine = None
+            return {
+                'status': 'error',
+                'message': f'Engine startup failed: {str(e)}'
+            }
+    
+    async def cmd_stop(self, args) -> Dict[str, Any]:
+        """Stop the CloudCore engine"""
+        if not self.engine:
+            return {
+                'status': 'warning',
+                'message': 'No engine running'
+            }
+        
+        try:
+            print("🛑 Stopping CloudCore Engine...")
+            await self.engine.stop()
+            self.engine = None
+            
+            return {
+                'status': 'success',
+                'message': 'CloudCore Engine stopped'
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Engine stop failed: {str(e)}'
+            }
+    
+    async def cmd_status(self, args) -> Dict[str, Any]:
+        """Get detailed system status"""
+        result = {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat(),
+            'components': {}
+        }
+        
+        # Engine status
+        if self.engine:
+            try:
+                status = self.engine.get_status()
+                result['components']['engine'] = {
+                    'state': status.get('state', 'unknown'),
+                    'node_id': status.get('node_id'),
+                    'uptime': status.get('uptime'),
+                    'subsystems': status.get('subsystems', {})
+                }
+            except Exception as e:
+                result['components']['engine'] = {'error': str(e)}
+        else:
+            result['components']['engine'] = {'state': 'not_running'}
+        
+        # SP-SUB status
+        sp_sub = self._get_sp_subsystem()
+        if sp_sub:
+            try:
+                sync_status = await sp_sub.get_status()
+                result['components']['sync_protocol'] = sync_status
+            except Exception as e:
+                result['components']['sync_protocol'] = {'error': str(e)}
+        else:
+            result['components']['sync_protocol'] = {'state': 'not_available'}
+        
+        return result
+    
+    async def cmd_sync(self, args) -> Dict[str, Any]:
+        """Perform synchronization operation"""
+        print("🔄 Starting sync operation...")
+        
+        # Get SP subsystem
+        sp_sub = self._get_sp_subsystem()
+        
+        # If no SP subsystem available, try to initialize standalone
+        if not sp_sub:
+            if not SP_AVAILABLE:
+                return {
+                    'status': 'error',
+                    'message': 'SP Subsystem not available. Check sp_subsystem_v5_complete.py'
+                }
+            
+            print("   🔧 Initializing standalone sync coordinator...")
+            try:
+                self.standalone_coordinator = SyncCoordinator()
+                await self.standalone_coordinator.initialize()
+                sp_sub = self.standalone_coordinator
+                print("   ✅ Standalone coordinator ready")
+            except Exception as e:
+                return {
+                    'status': 'error',
+                    'message': f'Failed to initialize sync coordinator: {e}'
+                }
+        
+        # Prepare sync parameters
+        peers = None
+        if hasattr(args, 'peers') and args.peers:
+            peers = [p.strip() for p in args.peers.split(',')]
+        
+        dry_run = getattr(args, 'dry_run', False)
+        
+        try:
+            # Perform sync
+            if hasattr(sp_sub, 'sync'):
+                # Direct sync method (EnhancedGhostSyncProtocol)
+                result = await sp_sub.sync(peers, dry_run)
+            elif hasattr(sp_sub, 'start_sync_cycle'):
+                # Coordinator method
+                result = await sp_sub.start_sync_cycle(peers, dry_run)
+            else:
+                return {
+                    'status': 'error',
+                    'message': 'SP subsystem does not support sync operations'
+                }
+            
+            return {
+                'status': 'success',
+                'sync_result': result,
+                'dry_run': dry_run
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Sync operation failed: {e}'
+            }
+    
+    async def cmd_discover(self, args) -> Dict[str, Any]:
+        """Discover available peers"""
+        sp_sub = self._get_sp_subsystem()
+        
+        if not sp_sub:
+            return {
+                'status': 'error',
+                'message': 'No sync protocol available'
+            }
+        
+        try:
+            print("🔍 Discovering peers...")
+            
+            if hasattr(sp_sub, 'coordinator') and sp_sub.coordinator:
+                protocol = sp_sub.coordinator.sync_protocol
+            elif hasattr(sp_sub, 'sync_protocol'):
+                protocol = sp_sub.sync_protocol
+            else:
+                return {
+                    'status': 'error',
+                    'message': 'Sync protocol not accessible'
+                }
+            
+            peers = await protocol.discover_peers()
+            protocol_status = await protocol.get_protocol_status()
+            
+            return {
+                'status': 'success',
+                'discovered_peers': peers,
+                'peer_count': len(peers),
+                'protocol_status': {
+                    'total_known_peers': protocol_status.get('total_known_peers', 0),
+                    'online_peers': protocol_status.get('online_peers', 0),
+                    'listening_port': protocol_status.get('listening_port'),
+                    'node_id': protocol_status.get('node_id')
+                }
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Peer discovery failed: {e}'
+            }
+    
+    async def cmd_test_delta(self, args) -> Dict[str, Any]:
+        """Create and queue test delta"""
+        sp_sub = self._get_sp_subsystem()
+        
+        if not sp_sub:
+            return {
+                'status': 'error',
+                'message': 'No sync protocol available'
+            }
+        
+        try:
+            user_id = getattr(args, 'user_id', None)
+            operation = getattr(args, 'operation', 'test')
+            
+            if hasattr(sp_sub, 'create_test_delta'):
+                delta = await sp_sub.create_test_delta(user_id)
+            elif hasattr(sp_sub, 'coordinator') and sp_sub.coordinator:
+                delta = await sp_sub.coordinator.create_test_delta(user_id, operation)
+            else:
+                return {
+                    'status': 'error',
+                    'message': 'Test delta creation not supported'
+                }
+            
+            return {
+                'status': 'success',
+                'delta': delta,
+                'message': f'Test delta created for {user_id or "auto-generated user"}'
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Test delta creation failed: {e}'
+            }
+    
+    async def cmd_subsystems(self, args) -> Dict[str, Any]:
+        """List and manage subsystems"""
+        if not self.engine:
+            return {
+                'status': 'error',
+                'message': 'Engine not running. Start engine first.'
+            }
+        
+        try:
+            status = self.engine.get_status()
+            subsystems = status.get('subsystems', {})
+            
+            detailed_info = {}
+            for name, state in subsystems.items():
+                subsystem_obj = self.engine.subsystems.get(name)
+                
+                info = {
+                    'state': state,
+                    'available': subsystem_obj is not None
+                }
+                
+                # Add specific info for SP-SUB
+                if name == 'sp_sub' and subsystem_obj:
+                    try:
+                        sp_status = await subsystem_obj.get_status()
+                        info['sync_status'] = sp_status
+                    except Exception:
+                        info['sync_status'] = 'error'
+                
+                detailed_info[name] = info
+            
+            return {
+                'status': 'success',
+                'subsystems': detailed_info,
+                'total_count': len(subsystems),
+                'running_count': len([s for s in subsystems.values() if s == 'running'])
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Failed to get subsystem info: {e}'
+            }
+    
+    def _format_result(self, result: Dict[str, Any], command: str) -> None:
+        """Format and print command result"""
+        print(f"\n{'='*60}")
+        print(f"📋 COMMAND: {command.upper()}")
+        print(f"🕒 TIME: {datetime.now().strftime('%H:%M:%S')}")
+        print("=" * 60)
+        
+        status = result.get('status', 'unknown')
+        
+        if status == 'success':
+            print("✅ SUCCESS")
+        elif status == 'warning':
+            print("⚠️ WARNING")
+        elif status == 'error':
+            print("❌ ERROR")
+        else:
+            print(f"ℹ️ STATUS: {status.upper()}")
+        
+        # Print message
+        if 'message' in result:
+            print(f"💬 {result['message']}")
+        
+        # Print detailed information
+        for key, value in result.items():
+            if key in ['status', 'message']:
+                continue
+                
+            if isinstance(value, dict):
+                print(f"\n📊 {key.replace('_', ' ').title()}:")
+                self._print_dict(value, indent=2)
+            elif isinstance(value, list):
+                print(f"\n📋 {key.replace('_', ' ').title()}: ({len(value)} items)")
+                for i, item in enumerate(value[:5]):  # Show first 5 items
+                    print(f"   {i+1}. {item}")
+                if len(value) > 5:
+                    print(f"   ... and {len(value) - 5} more")
+            else:
+                print(f"ℹ️ {key.replace('_', ' ').title()}: {value}")
+        
+        print("=" * 60)
+    
+    def _print_dict(self, data: dict, indent: int = 0) -> None:
+        """Print dictionary with indentation"""
+        prefix = " " * indent
+        for key, value in data.items():
+            if isinstance(value, dict):
+                print(f"{prefix}{key}:")
+                self._print_dict(value, indent + 2)
+            elif isinstance(value, list):
+                print(f"{prefix}{key}: [{len(value)} items]")
+                for item in value[:3]:  # Show first 3 items
+                    print(f"{prefix}  • {item}")
+                if len(value) > 3:
+                    print(f"{prefix}  ... and {len(value) - 3} more")
+            else:
+                print(f"{prefix}{key}: {value}")
+    
+    async def interactive_mode(self):
+        """Run interactive CLI mode"""
+        self._print_banner()
+        print("🎮 Interactive Mode - Type 'help' for commands or 'exit' to quit")
+        self._print_status_summary()
+        
+        while True:
+            try:
+                # Update prompt with system state
+                engine_state = "ON" if self.engine else "OFF"
+                sync_state = "SYNC" if self._get_sp_subsystem() else "NO-SYNC"
+                prompt = f"\n{self.prompt_prefix}[{engine_state}|{sync_state}]> "
+                
+                command_line = input(prompt).strip()
+                
+                if not command_line:
+                    continue
+                    
+                if command_line.lower() in ['exit', 'quit', 'q']:
+                    print("👋 Shutting down...")
+                    break
+                
+                if command_line.lower() in ['help', 'h', '?']:
+                    self._print_interactive_help()
+                    continue
+                
+                if command_line.lower() in ['clear', 'cls']:
+                    os.system('clear' if os.name != 'nt' else 'cls')
+                    self._print_banner()
+                    continue
+                
+                if command_line.lower() in ['status', 'st']:
+                    self._print_status_summary()
+                    continue
+                
+                # Parse and execute command
+                await self._execute_interactive_command(command_line)
+                
+            except KeyboardInterrupt:
+                print("\n👋 Exiting...")
+                break
+            except EOFError:
+                break
+            except Exception as e:
+                print(f"❌ Error: {e}")
+        
+        # Cleanup
+        await self._cleanup()
+    
+    async def _execute_interactive_command(self, command_line: str):
+        """Execute interactive command"""
+        parts = command_line.split()
+        if not parts:
+            return
+        
+        command = parts[0].lower()
+        
+        # Create args object for compatibility
+        class Args:
+            pass
+        
+        args = Args()
+        
+        # Parse basic arguments
+        if len(parts) > 1:
+            for part in parts[1:]:
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    setattr(args, key.lstrip('-'), value)
+                elif part.startswith('--'):
+                    setattr(args, part[2:], True)
+                elif part.startswith('-'):
+                    setattr(args, part[1:], True)
+        
+        # Execute command
+        if command == 'start':
+            result = await self.cmd_start(args)
+            self._format_result(result, 'start')
+        elif command == 'stop':
+            result = await self.cmd_stop(args)
+            self._format_result(result, 'stop')
+        elif command == 'sync':
+            result = await self.cmd_sync(args)
+            self._format_result(result, 'sync')
+        elif command == 'discover':
+            result = await self.cmd_discover(args)
+            self._format_result(result, 'discover')
+        elif command == 'test-delta':
+            result = await self.cmd_test_delta(args)
+            self._format_result(result, 'test-delta')
+        elif command == 'subsystems':
+            result = await self.cmd_subsystems(args)
+            self._format_result(result, 'subsystems')
+        else:
+            print(f"❌ Unknown command: {command}")
+            self._print_interactive_help()
+    
+    def _print_interactive_help(self):
+        """Print interactive mode help"""
+        help_text = """
+🎮 INTERACTIVE COMMANDS:
+
+🚀 ENGINE:
+   start [config=path]  - Start CloudCore engine
+   stop                 - Stop CloudCore engine
+   status / st         - Show system status summary
+   subsystems          - List all subsystems
+
+🔄 SYNCHRONIZATION:
+   sync [peers=a,b,c] [dry_run]  - Perform sync operation
+   discover                      - Discover available peers
+   test-delta [user_id=id]      - Create test delta
+
+🛠️  UTILITIES:
+   clear / cls         - Clear screen
+   help / h / ?        - Show this help
+   exit / quit / q     - Exit CLI
+
+📝 EXAMPLES:
+   start config=config/prod.yaml
+   sync peers=192.168.1.100,192.168.1.101 dry_run
+   test-delta user_id=test_user_001
+        """
+        print(help_text)
+    
+    async def _cleanup(self):
+        """Cleanup resources"""
+        try:
+            if self.engine:
+                print("🛑 Stopping engine...")
+                await self.engine.stop()
+            
+            if self.standalone_coordinator:
+                print("🛑 Stopping sync coordinator...")
+                await self.standalone_coordinator.stop()
+                
+        except Exception as e:
+            print(f"⚠️ Cleanup error: {e}")
+
+
+def create_parser():
+    """Create command line parser"""
+    parser = argparse.ArgumentParser(
+        description='CloudCore_Sync_2 - Enterprise Cybersecurity Framework CLI',
+        epilog='For more information, visit: https://github.com/Kingkali69/cloud-core-sync2'
+    )
+    
+    # Global options
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose logging')
+    parser.add_argument('--config', '-c', default='config/engine_config.yaml',
+                       help='Configuration file path')
+    
+    # Subcommands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Start command
+    start_parser = subparsers.add_parser('start', help='Start CloudCore engine')
+    start_parser.add_argument('--config', '-c', default='config/engine_config.yaml',
+                             help='Engine configuration file')
+    start_parser.add_argument('--daemon', '-d', action='store_true',
+                             help='Run in background daemon mode')
+    
+    # Stop command
+    subparsers.add_parser('stop', help='Stop CloudCore engine')
+    
+    # Status command
+    status_parser = subparsers.add_parser('status', help='Show system status')
+    status_parser.add_argument('--json', '-j', action='store_true',
+                              help='Output in JSON format')
+    
+    # Sync command
+    sync_parser = subparsers.add_parser('sync', help='Perform synchronization')
+    sync_parser.add_argument('--peers', '-p', 
+                            help='Comma-separated list of peer addresses')
+    sync_parser.add_argument('--dry-run', '-d', action='store_true',
+                            help='Perform dry run (no actual changes)')
+    sync_parser.add_argument('--timeout', '-t', type=int, default=30,
+                            help='Sync timeout in seconds')
+    
+    # Discover command
+    discover_parser = subparsers.add_parser('discover', help='Discover peers')
+    discover_parser.add_argument('--timeout', '-t', type=int, default=10,
+                                help='Discovery timeout in seconds')
+    
+    # Test delta command
+    test_parser = subparsers.add_parser('test-delta', help='Create test delta')
+    test_parser.add_argument('--user-id', '-u', help='User ID for test delta')
+    test_parser.add_argument('--operation', '-o', default='test',
+                            help='Operation type for test delta')
+    
+    # Subsystems command
+    subparsers.add_parser('subsystems', help='List subsystems')
+    
+    # Interactive mode
+    subparsers.add_parser('interactive', help='Start interactive CLI mode')
+    
+    return parser
+
+
+async def main():
+    """Main CLI entry point"""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Setup CLI instance
+    cli = CloudCoreCLI()
+    
+    # Set logging level
+    if args.verbose:
+        cli.logger.setLevel(logging.DEBUG)
+        cli.logger.debug("Verbose logging enabled")
+    
+    # Handle commands
+    try:
+        if not args.command or args.command == 'interactive':
+            await cli.interactive_mode()
+        
+        elif args.command == 'start':
+            result = await cli.cmd_start(args)
+            cli._format_result(result, 'start')
+            
+            # If successful and daemon mode not requested, keep running
+            if result.get('status') == 'success' and not getattr(args, 'daemon', False):
+                print("\n🔄 Engine running. Press Ctrl+C to stop...")
+                try:
+                    # Setup signal handler for graceful shutdown
+                    def signal_handler(signum, frame):
+                        print(f"\n📡 Received signal {signum}, stopping...")
+                        asyncio.create_task(cli.cmd_stop(args))
+                        sys.exit(0)
+                    
+                    signal.signal(signal.SIGINT, signal_handler)
+                    signal.signal(signal.SIGTERM, signal_handler)
+                    
+                    # Keep alive
+                    while True:
+                        await asyncio.sleep(1)
+                        
+                except KeyboardInterrupt:
+                    print("\n🛑 Stopping engine...")
+                    stop_result = await cli.cmd_stop(args)
+                    cli._format_result(stop_result, 'stop')
+        
+        elif args.command == 'stop':
+            result = await cli.cmd_stop(args)
+            cli._format_result(result, 'stop')
+        
+        elif args.command == 'status':
+            result = await cli.cmd_status(args)
+            if getattr(args, 'json', False):
+                print(json.dumps(result, indent=2))
+            else:
+                cli._format_result(result, 'status')
+        
+        elif args.command == 'sync':
+            result = await cli.cmd_sync(args)
+            cli._format_result(result, 'sync')
+        
+        elif args.command == 'discover':
+            result = await cli.cmd_discover(args)
+            cli._format_result(result, 'discover')
+        
+        elif args.command == 'test-delta':
+            result = await cli.cmd_test_delta(args)
+            cli._format_result(result, 'test-delta')
+        
+        elif args.command == 'subsystems':
+            result = await cli.cmd_subsystems(args)
+            cli._format_result(result, 'subsystems')
+            
+    except KeyboardInterrupt:
+        print("\n👋 Operation cancelled")
+    except Exception as e:
+        cli.logger.error(f"CLI error: {e}")
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+    finally:
+        await cli._cleanup()
+
+
+if __name__ == "__main__":
+    # Compatibility check
+    if not ENGINE_AVAILABLE and not SP_AVAILABLE:
+        print("❌ CRITICAL: Neither engine_core.py nor sp_subsystem_v5_complete.py found!")
+        print("Please ensure these files exist in the current directory.")
+        sys.exit(1)
+    
+    if not ENGINE_AVAILABLE:
+        print("⚠️  WARNING: engine_core.py not available - engine commands disabled")
+    
+    if not SP_AVAILABLE:
+        print("⚠️  WARNING: sp_subsystem_v5_complete.py not available - sync commands disabled")
+    
+    print("🚀 CloudCore_Sync_2 CLI Launcher v1.0")
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+        sys.exit(0)

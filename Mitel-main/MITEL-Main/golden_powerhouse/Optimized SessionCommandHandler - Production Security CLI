@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+G.Legion Cybersecurity Framework - Enhanced Session Command Handler
+Optimized for Production Red-Team Automation
+KK&GDevOps - Security-First CLI Implementation
+"""
+
+import asyncio
+import json
+import logging
+import re
+import ipaddress
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Union, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import shlex
+from tabulate import tabulate
+
+# Framework imports
+from session_control import SessionControlSubsystem, UserRole, Permission
+
+
+class CLIColors:
+    """Enhanced ANSI color codes for security-focused CLI output."""
+    # Standard colors
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+    # Security-specific colors
+    CRITICAL = '\033[41m\033[97m'    # Red background, white text
+    HIGH_RISK = '\033[31m\033[1m'    # Bright red, bold
+    MEDIUM_RISK = '\033[33m'         # Yellow
+    LOW_RISK = '\033[36m'            # Cyan
+    SUCCESS = '\033[32m\033[1m'      # Bright green, bold
+    
+    @classmethod
+    def threat_level_color(cls, level: str) -> str:
+        """Get color based on threat level."""
+        mapping = {
+            'high': cls.HIGH_RISK,
+            'medium': cls.MEDIUM_RISK,
+            'low': cls.LOW_RISK,
+            'critical': cls.CRITICAL
+        }
+        return mapping.get(level.lower(), cls.ENDC)
+
+
+@dataclass
+class CommandResult:
+    """Structured command execution result for better error handling."""
+    success: bool
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    error_code: Optional[str] = None
+    
+    def format_output(self) -> str:
+        """Format the result for CLI display."""
+        color = CLIColors.SUCCESS if self.success else CLIColors.FAIL
+        status = "âœ“" if self.success else "âœ—"
+        return f"{color}{status} {self.message}{CLIColors.ENDC}"
+
+
+class InputValidator:
+    """Comprehensive input validation for security CLI operations."""
+    
+    # Security patterns
+    SESSION_ID_PATTERN = re.compile(r'^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$')
+    USER_ID_PATTERN = re.compile(r'^[a-zA-Z0-9._-]{1,64}$')
+    SAFE_STRING_PATTERN = re.compile(r'^[a-zA-Z0-9\s._-]{0,256}$')
+    
+    @staticmethod
+    def validate_session_id(session_id: str) -> Tuple[bool, str]:
+        """Validate session ID format."""
+        if not session_id:
+            return False, "Session ID cannot be empty"
+        
+        if not InputValidator.SESSION_ID_PATTERN.match(session_id):
+            return False, "Invalid session ID format (expected UUID v4)"
+        
+        return True, ""
+    
+    @staticmethod
+    def validate_user_id(user_id: str) -> Tuple[bool, str]:
+        """Validate user ID format and security constraints."""
+        if not user_id:
+            return False, "User ID cannot be empty"
+        
+        if len(user_id) > 64:
+            return False, "User ID too long (max 64 characters)"
+        
+        if not InputValidator.USER_ID_PATTERN.match(user_id):
+            return False, "User ID contains invalid characters (alphanumeric, ., _, - only)"
+        
+        # Security: Prevent common injection attempts
+        dangerous_patterns = ['admin', 'root', 'system', '..', '//', 'DROP', 'SELECT', '<script']
+        user_lower = user_id.lower()
+        for pattern in dangerous_patterns:
+            if pattern.lower() in user_lower:
+                return False, f"User ID contains restricted pattern: {pattern}"
+        
+        return True, ""
+    
+    @staticmethod
+    def validate_ip_address(ip_str: str) -> Tuple[bool, str]:
+        """Validate IP address format."""
+        if not ip_str:
+            return True, ""  # Optional field
+        
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            
+            # Security checks
+            if ip.is_multicast:
+                return False, "Multicast IP addresses not allowed"
+            
+            if ip.is_loopback and not ip.is_private:
+                return False, "Loopback addresses not allowed in this context"
+            
+            return True, ""
+            
+        except ValueError:
+            return False, "Invalid IP address format"
+    
+    @staticmethod
+    def validate_reason(reason: str) -> Tuple[bool, str]:
+        """Validate revocation reason."""
+        if not reason:
+            return True, ""  # Optional field
+        
+        if len(reason) > 256:
+            return False, "Reason too long (max 256 characters)"
+        
+        if not InputValidator.SAFE_STRING_PATTERN.match(reason):
+            return False, "Reason contains invalid characters"
+        
+        return True, ""
+
+
+class SessionCommandHandler:
+    """
+    Enhanced Session Command Handler for G.Legion Security CLI
+    Optimized for red-team automation and production security operations.
+    """
+    
+    def __init__(self, engine, logger: logging.Logger):
+        self.engine = engine
+        self.logger = logger.getChild("SessionHandler")
+        self.sc_sub: Optional[SessionControlSubsystem] = None
+        self.validator = InputValidator()
+        
+        # Performance optimization: Cache command mappings
+        self.commands = {
+            'create': self._cmd_create_session,
+            'c': self._cmd_create_session,  # Alias for speed
+            'validate': self._cmd_validate_session,
+            'v': self._cmd_validate_session,  # Alias
+            'revoke': self._cmd_revoke_session,
+            'r': self._cmd_revoke_session,  # Alias
+            'status': self._cmd_session_status,
+            's': self._cmd_session_status,  # Alias
+            'list': self._cmd_list_sessions,
+            'ls': self._cmd_list_sessions,  # Unix-like alias
+            'anomalies': self._cmd_show_anomalies,
+            'a': self._cmd_show_anomalies,  # Alias
+            'help': self._cmd_help,
+            'h': self._cmd_help  # Alias
+        }
+        
+        # Role mappings with security levels
+        self.role_mappings = {
+            'guest': (UserRole.GUEST, 0),
+            'g': (UserRole.GUEST, 0),
+            'user': (UserRole.USER, 1),
+            'u': (UserRole.USER, 1),
+            'moderator': (UserRole.MODERATOR, 2),
+            'mod': (UserRole.MODERATOR, 2),
+            'm': (UserRole.MODERATOR, 2),
+            'admin': (UserRole.ADMIN, 3),
+            'a': (UserRole.ADMIN, 3),
+            'super_admin': (UserRole.SUPER_ADMIN, 4),
+            'superadmin': (UserRole.SUPER_ADMIN, 4),
+            'sa': (UserRole.SUPER_ADMIN, 4)
+        }
+        
+        # Command execution metrics for performance monitoring
+        self.command_metrics = {
+            'total_commands': 0,
+            'failed_commands': 0,
+            'avg_response_time': 0.0
+        }
+    
+    def set_sc_sub(self, sc_sub: SessionControlSubsystem):
+        """Set reference to the SessionControl subsystem with validation."""
+        if not isinstance(sc_sub, SessionControlSubsystem):
+            raise ValueError("Invalid SessionControl subsystem instance")
+        
+        self.sc_sub = sc_sub
+        self.logger.info("SessionControl subsystem reference established")
+    
+    async def handle_command(self, args: List[str]) -> bool:
+        """
+        Enhanced command routing with performance monitoring and security logging.
+        Returns True to continue CLI loop, False to exit.
+        """
+        start_time = datetime.utcnow()
+        self.command_metrics['total_commands'] += 1
+        
+        try:
+            if not args:
+                await self._cmd_help()
+                return True
+            
+            command = args[0].lower()
+            command_args = args[1:]
+            
+            # Security logging
+            self.logger.info(f"Executing session command: {command} with {len(command_args)} args")
+            
+            # Validate command
+            if command not in self.commands:
+                result = CommandResult(
+                    success=False,
+                    message=f"Unknown session command: {command}",
+                    error_code="INVALID_COMMAND"
+                )
+                print(result.format_output())
+                print(f"Type '{CLIColors.OKBLUE}session help{CLIColors.ENDC}' for available commands.")
+                return True
+            
+            # Check SC-SUB availability (except for help)
+            if command not in ['help', 'h'] and not self._check_sc_sub_availability():
+                return True
+            
+            # Execute command with error handling
+            try:
+                await self.commands[command](command_args)
+            except Exception as cmd_error:
+                self.logger.error(f"Command execution error: {str(cmd_error)}")
+                result = CommandResult(
+                    success=False,
+                    message=f"Command execution failed: {str(cmd_error)}",
+                    error_code="EXECUTION_ERROR"
+                )
+                print(result.format_output())
+                self.command_metrics['failed_commands'] += 1
+            
+            # Update performance metrics
+            execution_time = (datetime.utcnow() - start_time).total_seconds()
+            self.command_metrics['avg_response_time'] = (
+                (self.command_metrics['avg_response_time'] * (self.command_metrics['total_commands'] - 1) + execution_time) /
+                self.command_metrics['total_commands']
+            )
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Critical error in command handler: {str(e)}")
+            self.command_metrics['failed_commands'] += 1
+            print(f"{CLIColors.CRITICAL}CRITICAL ERROR: {str(e)}{CLIColors.ENDC}")
+            return True
+    
+    def _check_sc_sub_availability(self) -> bool:
+        """Enhanced SC-SUB availability check with detailed diagnostics."""
+        if not self.sc_sub:
+            print(f"{CLIColors.FAIL}âœ— Session Control Subsystem not initialized{CLIColors.ENDC}")
+            print(f"  {CLIColors.WARNING}Action required:{CLIColors.ENDC} Initialize SC-SUB before using session commands")
+            return False
+        
+        if not hasattr(self.sc_sub, '_running') or not self.sc_sub._running:
+            print(f"{CLIColors.FAIL}âœ— Session Control Subsystem not running{CLIColors.ENDC}")
+            print(f"  {CLIColors.WARNING}Action required:{CLIColors.ENDC} Use 'start sc-sub' to start the subsystem")
+            return False
+        
+        return True
+    
+    def _parse_user_role(self, role_str: str) -> Tuple[Optional[UserRole], int]:
+        """Enhanced role parsing with security level validation."""
+        role_mapping = self.role_mappings.get(role_str.lower())
+        if role_mapping:
+            return role_mapping[0], role_mapping[1]
+        return None, -1
+    
+    def _format_session_table(self, sessions: List[Dict], detailed: bool = False) -> str:
+        """Enhanced session table formatting with security context."""
+        if not sessions:
+            return f"{CLIColors.WARNING}No sessions found.{CLIColors.ENDC}"
+        
+        if detailed:
+            headers = ['Session ID', 'User ID', 'Role', 'Status', 'Created', 'Last Activity', 
+                      'Expires', 'IP Address', 'Permissions']
+        else:
+            headers = ['Session ID', 'User ID', 'Role', 'Status', 'Created', 'Expires', 'IP Address']
+        
+        rows = []
+        now = datetime.utcnow()
+        
+        for session in sessions:
+            # Security highlighting: expired or soon-to-expire sessions
+            session_id = session['session_id'][:8] + '...'
+            expires_str = session.get('expires_at', '')[:19] if session.get('expires_at') else 'N/A'
+            
+            # Color code based on session health
+            if session.get('status') == 'expired':
+                session_id = f"{CLIColors.FAIL}{session_id}{CLIColors.ENDC}"
+            elif session.get('status') == 'revoked':
+                session_id = f"{CLIColors.WARNING}{session_id}{CLIColors.ENDC}"
+            
+            row_data = [
+                session_id,
+                session.get('user_id', 'N/A'),
+                session.get('user_role', 'N/A'),
+                session.get('status', 'N/A'),
+                session.get('created_at', '')[:19] if session.get('created_at') else 'N/A',
+                expires_str,
+                session.get('ip_address', 'N/A')
+            ]
+            
+            if detailed:
+                row_data.insert(-1, session.get('last_activity', '')[:19] if session.get('last_activity') else 'N/A')
+                permissions = session.get('permissions', [])
+                perm_str = ', '.join(permissions[:3]) + ('...' if len(permissions) > 3 else '')
+                row_data.append(perm_str)
+            
+            rows.append(row_data)
+        
+        return tabulate(rows, headers=headers, tablefmt='grid')
+    
+    async def _cmd_create_session(self, args: List[str]):
+        """Enhanced session creation with comprehensive validation."""
+        if len(args) < 2:
+            print(f"{CLIColors.FAIL}Usage: session create <user_id> <role> [ip_address] [duration_hours]{CLIColors.ENDC}")
+            print(f"Roles: {', '.join([role for role in self.role_mappings.keys() if len(role) > 1])}")
+            return
+        
+        user_id = args[0]
+        role_str = args[1]
+        ip_address = args[2] if len(args) > 2 else None
+        duration_hours = None
+        
+        # Parse optional duration
+        if len(args) > 3:
+            try:
+                duration_hours = int(args[3])
+                if duration_hours < 1 or duration_hours > 168:  # Max 1 week
+                    print(f"{CLIColors.FAIL}Duration must be between 1 and 168 hours{CLIColors.ENDC}")
+                    return
+            except ValueError:
+                print(f"{CLIColors.FAIL}Invalid duration format (must be integer hours){CLIColors.ENDC}")
+                return
+        
+        # Comprehensive input validation
+        validations = [
+            self.validator.validate_user_id(user_id),
+            self.validator.validate_ip_address(ip_address) if ip_address else (True, "")
+        ]
+        
+        for is_valid, error_msg in validations:
+            if not is_valid:
+                print(f"{CLIColors.FAIL}Validation Error: {error_msg}{CLIColors.ENDC}")
+                return
+        
+        # Parse and validate role
+        user_role, security_level = self._parse_user_role(role_str)
+        if not user_role:
+            print(f"{CLIColors.FAIL}Invalid role: {role_str}{CLIColors.ENDC}")
+            print(f"Valid roles: {', '.join([role for role in self.role_mappings.keys() if len(role) > 1])}")
+            return
+        
+        # Security check: Log high-privilege session creation
+        if security_level >= 3:  # Admin or above
+            self.logger.warning(f"High-privilege session creation requested: user={user_id}, role={user_role.value}")
+        
+        print(f"Creating session for user '{CLIColors.OKBLUE}{user_id}{CLIColors.ENDC}' with role '{CLIColors.OKCYAN}{user_role.value}{CLIColors.ENDC}'...")
+        
+        try:
+            # Prepare session parameters
+            session_duration = timedelta(hours=duration_hours) if duration_hours else None
+            
+            session = await self.sc_sub.create_session(
+                user_id=user_id,
+                user_role=user_role,
+                ip_address=ip_address,
+                user_agent="G.Legion_CLI_v2.0",
+                session_duration=session_duration
+            )
+            
+            if session:
+                result = CommandResult(
+                    success=True,
+                    message="Session created successfully",
+                    data={
+                        'session_id': session.session_id,
+                        'expires': session.expires_at.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                        'permissions': [p.value for p in session.permissions]
+                    }
+                )
+                
+                print(result.format_output())
+                print(f"Session ID: {CLIColors.OKBLUE}{session.session_id}{CLIColors.ENDC}")
+                print(f"Expires: {CLIColors.OKCYAN}{session.expires_at.strftime('%Y-%m-%d %H:%M:%S UTC')}{CLIColors.ENDC}")
+                print(f"Permissions: {CLIColors.OKGREEN}{', '.join([p.value for p in session.permissions])}{CLIColors.ENDC}")
+                
+                # Security audit log
+                self.logger.info(f"Session created successfully: {session.session_id} for user {user_id}")
+                
+            else:
+                result = CommandResult(
+                    success=False,
+                    message="Failed to create session",
+                    error_code="CREATION_FAILED"
+                )
+                print(result.format_output())
+                print(f"Possible reasons: user session limit reached, subsystem error, insufficient privileges")
+                
+        except Exception as e:
+            self.logger.error(f"Session creation error: {str(e)}")
+            result = CommandResult(
+                success=False,
+                message=f"Session creation error: {str(e)}",
+                error_code="CREATION_ERROR"
+            )
+            print(result.format_output())
+    
+    async def _cmd_validate_session(self, args: List[str]):
+        """Enhanced session validation with security analysis."""
+        if not args:
+            print(f"{CLIColors.FAIL}Usage: session validate <session_id>{CLIColors.ENDC}")
+            return
+        
+        session_id = args[0]
+        
+        # Validate session ID format
+        is_valid, error_msg = self.validator.validate_session_id(session_id)
+        if not is_valid:
+            print(f"{CLIColors.FAIL}Validation Error: {error_msg}{CLIColors.ENDC}")
+            return
+        
+        print(f"Validating session: {CLIColors.OKBLUE}{session_id[:8]}...{CLIColors.ENDC}")
+        
+        try:
+            session = await self.sc_sub.validate_session(session_id)
+            
+            if session:
+                result = CommandResult(success=True, message="Session is valid and active")
+                print(result.format_output())
+                
+                # Detailed session information
+                now = datetime.utcnow()
+                time_to_expire = session.expires_at - now
+                
+                details = {
+                    'Session ID': session.session_id,
+                    'User ID': session.user_id,
+                    'Role': session.user_role.value,
+                    'Status': session.status.value,
+                    'Created': session.created_at.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'Last Activity': session.last_activity.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'Expires': session.expires_at.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'Time to Expire': str(time_to_expire).split('.')[0],
+                    'IP Address': session.ip_address or 'N/A',
+                    'Permissions': ', '.join([p.value for p in session.permissions])
+                }
+                
+                print(f"\n{CLIColors.HEADER}Session Details:{CLIColors.ENDC}")
+                for key, value in details.items():
+                    color = CLIColors.WARNING if 'Expire' in key and time_to_expire.total_seconds() < 3600 else CLIColors.OKBLUE
+                    print(f"  {key}: {color}{value}{CLIColors.ENDC}")
+                
+                # Security warnings
+                if time_to_expire.total_seconds() < 1800:  # 30 minutes
+                    print(f"\n{CLIColors.WARNING}âš  Session expires soon!{CLIColors.ENDC}")
+                
+                self.logger.info(f"Session validati

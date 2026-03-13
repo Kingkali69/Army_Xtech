@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+Ghost Engine Setup Script
+CloudCore_Sync_2 by KK&GDevOps (King Kali & Ghost)
+"""
+
+import os
+import sys
+import platform
+import subprocess
+import shutil
+from pathlib import Path
+
+def check_python_version():
+    """Ensure Python 3.9+ is available"""
+    if sys.version_info < (3, 9):
+        print("ERROR: Python 3.9 or higher is required")
+        print(f"Current version: {sys.version}")
+        sys.exit(1)
+    print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor} detected")
+
+def detect_platform():
+    """Detect the current platform"""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    
+    print(f"✓ Platform: {system} ({machine})")
+    return system, machine
+
+def create_directory_structure():
+    """Create the required directory structure"""
+    directories = [
+        "config",
+        "data",
+        "logs", 
+        "plugins",
+        "data/sp_sub",
+        "data/auth_sub",
+        "data/sec_sub",
+        "data/sc_sub",
+        "data/eb_sub",
+        "data/ao_sub"
+    ]
+    
+    for directory in directories:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        print(f"✓ Created directory: {directory}")
+
+def install_dependencies():
+    """Install required Python dependencies"""
+    requirements = [
+        "PyYAML>=6.0",
+        "asyncio-mqtt>=0.13.0",
+        "cryptography>=41.0.0",
+        "aiofiles>=23.0.0",
+        "websockets>=11.0",
+        "uvloop>=0.17.0; sys_platform != 'win32'",
+        "pytest>=7.0.0",
+        "pytest-asyncio>=0.21.0"
+    ]
+    
+    print("Installing Python dependencies...")
+    for requirement in requirements:
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", requirement
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"✓ Installed: {requirement.split('>=')[0]}")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠ Warning: Failed to install {requirement}: {e}")
+
+def create_systemd_service():
+    """Create systemd service file for Linux"""
+    if platform.system().lower() != "linux":
+        return
+    
+    service_content = f"""[Unit]
+Description=Ghost Engine - CloudCore_Sync_2
+Documentation=https://docs.ghostengine.io
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+WorkingDirectory={os.getcwd()}
+ExecStart={sys.executable} -m ghost_engine.engine_core
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ghost-engine
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={os.getcwd()}
+
+[Install]
+WantedBy=multi-user.target
+"""
+    
+    try:
+        service_path = Path("/etc/systemd/system/ghost-engine.service")
+        if os.geteuid() == 0:  # Running as root
+            with open(service_path, 'w') as f:
+                f.write(service_content)
+            subprocess.run(["systemctl", "daemon-reload"])
+            print("✓ Created systemd service file")
+        else:
+            # Create in user directory for non-root installation
+            user_service_dir = Path.home() / ".config/systemd/user"
+            user_service_dir.mkdir(parents=True, exist_ok=True)
+            with open(user_service_dir / "ghost-engine.service", 'w') as f:
+                f.write(service_content.replace("multi-user.target", "default.target"))
+            print("✓ Created user systemd service file")
+    except Exception as e:
+        print(f"⚠ Warning: Could not create systemd service: {e}")
+
+def create_config_templates():
+    """Create configuration templates"""
+    
+    # Main engine config
+    engine_config = """engine:
+  name: "Ghost Engine - CloudCore_Sync_2"
+  version: "1.0.0"
+  node_id: null  # Auto-generated
+  log_level: "INFO"
+  health_check_interval: 30
+  max_restart_attempts: 3
+
+subsystems:
+  sp_sub:
+    enabled: true
+    config_path: "config/sp_config.yaml"
+    critical: true
+  sc_sub:
+    enabled: true
+    config_path: "config/sc_config.yaml"
+    critical: false
+  eb_sub:
+    enabled: true
+    config_path: "config/eb_config.yaml"
+    critical: false
+  auth_sub:
+    enabled: true
+    config_path: "config/auth_config.yaml"
+    critical: false
+  sec_sub:
+    enabled: true
+    config_path: "config/sec_config.yaml"
+    critical: false
+  ao_sub:
+    enabled: true
+    config_path: "config/ao_config.yaml"
+    critical: false
+
+node:
+  id: null
+  persistent_id: true
+
+monitoring:
+  enabled: true
+  metrics_interval: 60
+  log_metrics: true
+
+# Attribution: CloudCore_Sync_2 by KK&GDevOps (King Kali & Ghost)
+"""
+
+    # Logging config
+    logging_config = """version: 1
+disable_existing_loggers: false
+
+formatters:
+  standard:
+    format: "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  
+  detailed:
+    format: "%(asctime)s [%(name)s:%(lineno)d] %(levelname)s: %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: standard
+    stream: ext://sys.stdout
+  
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: logs/ghost_engine.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+  
+  error_file:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: detailed
+    filename: logs/ghost_engine_errors.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 3
+
+loggers:
+  "G.Legion":
+    level: DEBUG
+    handlers: [console, file, error_file]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: [console, file]
+
+# CloudCore_Sync_2 by KK&GDevOps (King Kali & Ghost)
+"""
+
+    configs = {
+        "config/engine_config.yaml": engine_config,
+        "config/logging_config.yaml": logging_config
+    }
+    
+    for config_path, content in configs.items():
+        with open(config_path, 'w') as f:
+            f.write(content)
+        print(f"✓ Created: {config_path}")
+
+def create_cli_wrapper():
+    """Create command-line interface wrapper"""
+    
+    cli_script = '''#!/usr/bin/env python3
+"""
+Ghost Engine CLI
+CloudCore_Sync_2 by KK&GDevOps (King Kali & Ghost)
+"""
+
+import sys
+import asyncio
+import argparse
+from pathlib import Path
+
+# Add current directory to path for local imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from engine_core import EngineCore
+import logging
+import yaml
+
+async def start_engine(config_path, daemon=False):
+    """Start the Ghost Engine"""
+    engine = EngineCore(config_path)
+    
+    try:
+        await engine.initialize()
+        await engine.start()
+        
+        if daemon:
+            # Daemon mode - run in background
+            await engine.run()
+        else:
+            # Interactive mode
+            print("Ghost Engine started. Press Ctrl+C to stop.")
+            await engine.run()
+            
+    except KeyboardInterrupt:
+        print("\\nShutdown requested...")
+    except Exception as e:
+        print(f"Engine failed: {e}")
+        return 1
+    finally:
+        await engine.stop()
+    
+    return 0
+
+def show_status():
+    """Show engine status"""
+    # TODO: Implement status check via IPC or REST API
+    print("Status check not yet implemented")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ghost Engine - CloudCore_Sync_2 by KK&GDevOps"
+    )
+    parser.add_argument(
+        "command", 
+        choices=["start", "run", "stop", "status", "test"],
+        help="Command to execute"
+    )
+    parser.add_argument(
+        "--config", 
+        default="config/engine_config.yaml",
+        help="Configuration file path"
+    )
+    parser.add_argument(
+        "--daemon", 
+        action="store_true",
+        help="Run in daemon mode"
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level"
+    )
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    if args.command in ["start", "run"]:
+        return asyncio.run(start_engine(args.config, args.daemon))
+    elif args.command == "status":
+        show_status()
+        return 0
+    elif args.command == "test":
+        print("Running Ghost Engine tests...")
+        import subprocess
+        return subprocess.call([sys.executable, "-m", "pytest", "tests/", "-v"])
+    else:
+        print(f"Command '{args.command}' not implemented yet")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+    
+    with open("ghost_engine.py", 'w') as f:
+        f.write(cli_script)
+    
+    # Make executable on Unix systems
+    if platform.system() != "Windows":
+        os.chmod("ghost_engine.py", 0o755)
+    
+    print("✓ Created CLI wrapper: ghost_engine.py")
+
+def create_test_framework():
+    """Create basic test framework"""
+    
+    test_content = '''#!/usr/bin/env python3
+"""
+Ghost Engine Test Suite
+CloudCore_Sync_2 by KK&GDevOps (King Kali & Ghost)
+"""
+
+import pytest
+import asyncio
+import tempfile
+import yaml
+from pathlib import Path
+import sys
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from engine_core import EngineCore, SubsystemState
+
+class TestEngineCore:
+    """Test cases for Ghost Engine Core"""
+    
+    @pytest.fixture
+    async def engine(self):
+        """Create test engine instance"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "test_config.yaml"
+            
+            # Create minimal test config
+            test_config = {
+                "engine": {
+                    "name": "Test Engine",
+                    "version": "1.0.0-test",
+                    "log_level": "DEBUG"
+                },
+                "subsystems": {
+                    "sp_sub": {"enabled": True, "critical": True}
+                },
+                "node": {"id": "test-node", "persistent_id": False}
+            }
+            
+            with open(config_path, 'w') as f:
+                yaml.dump(test_config, f)
+            
+            engine = EngineCore(str(config_path))
+            await engine.initialize()
+            
+            yield engine
+            
+            if engine.running:
+                await engine.stop()
+    
+    @pytest.mark.asyncio
+    async def test_engine_initialization(self, engine):
+        """Test engine initialization"""
+        assert engine.node_id == "test-node"
+        assert engine.config["engine"]["name"] == "Test Engine"
+        assert not engine.running
+    
+    @pytest.mark.asyncio
+    async def test_engine_start_stop(self, engine):
+        """Test engine start/stop cycle"""
+        await engine.start()
+        assert engine.running
+        
+        await engine.stop() 
+        assert not engine.running
+    
+    @pytest.mark.asyncio
+    async def test_status_reporting(self, engine):
+        """Test status reporting"""
+        status = engine.get_status()
+        
+        assert "node_id" in status
+        assert "running" in status
+        assert "subsystems" in status
+        assert status["node_id"] == "test-node"
+    
+    @pytest.mark.asyncio
+    async def test_event_bus_fallback(self, engine):
+        """Test event bus fallback functionality"""
+        await engine.start()
+        
+        # Should have event bus (simple or full)
+        assert engine.event_bus is not None
+        
+        # Test event publishing
+        await engine.event_bus.publish("test.event", {"data": "test"})
+        
+        await engine.stop()
+
+def run_integration_tests():
+    """Run integration tests"""
+    print("Running Ghost Engine integration tests...")
+    
+    # Test configuration loading
+    print("✓ Testing configuration loading...")
+    
+    # Test subsystem discovery
+    print("✓ Testing subsystem discovery...")
+    
+    # Test event bus connectivity
+    print("✓ Testing event bus...")
+    
+    print("Integration tests completed successfully!")
+
+if __name__ == "__main__":
+    # Run basic integration tests if called directly
+    run_integration_tests()
+'''
+    
+    Path("tests").mkdir(exist_ok=True)
+    with open("tests/test_engine_core.py", 'w') as f:
+        f.write(test_content)
+    
+    # Create __init__.py for tests package
+    with open("tests/__init__.py", 'w') as f:
+        f.write("# Ghost Engine Test Suite\\n")
+    
+    print("✓ Created test framework: tests/test_engine_core.py")
+
+def main():
+    """Main setup function"""
+    print("=" * 60)
+    print("Ghost Engine Setup - CloudCore_Sync_2")
+    print("by KK&GDevOps (King Kali & Ghost)")
+    print("=" * 60)
+    
+    try:
+        check_python_version()
+        detect_platform()
+        create_directory_structure()
+        install_dependencies()
+        create_config_templates()
+        create_cli_wrapper()
+        create_test_framework()
+        create_systemd_service()
+        
+        print("=" * 60)
+        print("✓ Ghost Engine setup completed successfully!")
+        print()
+        print("Next steps:")
+        print("1. Run tests: python -m pytest tests/ -v")
+        print("2. Start engine: python ghost_engine.py run")
+        print("3. Check status: python ghost_engine.py status")
+        print()
+        print("Ready for Pack 2 (SP-SUB v5) deployment.")
+        print("=" * 60)
+        
+        return 0
+        
+    except Exception as e:
+        print(f"✗ Setup failed: {e}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

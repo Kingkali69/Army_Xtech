@@ -1,0 +1,500 @@
+# =============================================================================
+# KK&G DevOps Ghost Engine - Enterprise SIEM + SOAR Integration Module
+# Enterprise-Grade Security Orchestration, Automation & Response Framework
+# Production-Ready Connectors for Major Security Platforms
+# =============================================================================
+
+import asyncio
+import json
+import base64
+import hmac
+import hashlib
+import ssl
+import uuid
+import time
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Any, Optional, Union, Callable
+from urllib.parse import urljoin, quote
+import aiohttp
+import websockets
+from concurrent.futures import ThreadPoolExecutor
+import xml.etree.ElementTree as ET
+
+# Import base classes from the main Ghost Engine
+from .ghost_engine_core import SecurityEvent, ResponseAction, ThreatLevel, EventType, ResponseType
+
+# =============================================================================
+# GHOST ENGINE SIEM/SOAR CORE INTERFACES
+# =============================================================================
+
+class IntegrationType(Enum):
+    SIEM = "siem"
+    SOAR = "soar"
+    HYBRID = "hybrid"
+
+class ConnectorStatus(Enum):
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    AUTHENTICATING = "authenticating"
+    ERROR = "error"
+    MAINTENANCE = "maintenance"
+
+@dataclass
+class PlatformCredentials:
+    """Secure credential container for platform authentication"""
+    platform_name: str
+    auth_type: str  # api_key, oauth2, basic, certificate
+    credentials: Dict[str, Any]
+    endpoint: str
+    verify_ssl: bool = True
+    timeout: int = 30
+
+@dataclass
+class SIEMAlert:
+    """Standardized SIEM alert format for Ghost Engine"""
+    alert_id: str
+    source_platform: str
+    severity: str
+    title: str
+    description: str
+    timestamp: datetime
+    source_ip: Optional[str] = None
+    destination_ip: Optional[str] = None
+    user: Optional[str] = None
+    asset: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = None
+    indicators: Optional[List[str]] = None
+    
+    def get_orchestrator_status(self) -> Dict[str, Any]:
+        """Get comprehensive orchestrator status"""
+        siem_status = {}
+        for name, connector in self.siem_connectors.items():
+            siem_status[name] = {
+                'status': connector.status.value,
+                'platform': connector.platform_name,
+                'last_poll': self.stats.get('last_poll'),
+                'health': await connector.health_check() if asyncio.iscoroutinefunction(connector.health_check) else connector.health_check()
+            }
+        
+        soar_status = {}
+        for name, connector in self.soar_connectors.items():
+            soar_status[name] = {
+                'status': connector.status.value,
+                'platform': connector.platform_name
+            }
+        
+        return {
+            'is_running': self.is_running,
+            'siem_connectors': siem_status,
+            'soar_connectors': soar_status,
+            'statistics': self.stats,
+            'recent_alerts_count': len(self.recent_alerts),
+            'automation_rules_count': len(self.automation_rules)
+        }
+    
+    async def manual_playbook_trigger(self, soar_platform: str, playbook_id: str, context: Dict[str, Any]) -> str:
+        """Manually trigger a SOAR playbook"""
+        if soar_platform not in self.soar_connectors:
+            raise ValueError(f"SOAR platform {soar_platform} not connected")
+        
+        return await self.soar_connectors[soar_platform].trigger_playbook(playbook_id, context)
+    
+    async def get_playbook_status(self, soar_platform: str, execution_id: str) -> Dict[str, Any]:
+        """Get status of a running playbook"""
+        if soar_platform not in self.soar_connectors:
+            raise ValueError(f"SOAR platform {soar_platform} not connected")
+        
+        return await self.soar_connectors[soar_platform].get_playbook_status(execution_id)
+
+# =============================================================================
+# GHOST ENGINE CONFIGURATION FACTORY
+# =============================================================================
+
+class GhostSIEMSOARConfigFactory:
+    """
+    KK&G DevOps Ghost Engine - SIEM/SOAR Configuration Factory
+    
+    Provides pre-built configurations for common enterprise deployments
+    """
+    
+    @staticmethod
+    def create_enterprise_config() -> Dict[str, Any]:
+        """Create enterprise-grade SIEM/SOAR configuration template"""
+        return {
+            "siem_platforms": {
+                "splunk": {
+                    "enabled": False,
+                    "auth_type": "token",
+                    "endpoint": "https://your-splunk-instance.com:8089",
+                    "credentials": {
+                        "token": "YOUR_HEC_TOKEN_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                },
+                "qradar": {
+                    "enabled": False,
+                    "auth_type": "token",
+                    "endpoint": "https://your-qradar-console.com",
+                    "credentials": {
+                        "sec_token": "YOUR_SEC_TOKEN_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                },
+                "sentinel": {
+                    "enabled": False,
+                    "auth_type": "oauth2",
+                    "endpoint": "https://management.azure.com",
+                    "credentials": {
+                        "tenant_id": "YOUR_TENANT_ID",
+                        "client_id": "YOUR_CLIENT_ID",
+                        "client_secret": "YOUR_CLIENT_SECRET",
+                        "workspace_id": "YOUR_WORKSPACE_ID",
+                        "resource_group": "YOUR_RESOURCE_GROUP",
+                        "subscription_id": "YOUR_SUBSCRIPTION_ID",
+                        "shared_key": "YOUR_SHARED_KEY"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                },
+                "elastic": {
+                    "enabled": False,
+                    "auth_type": "basic",
+                    "endpoint": "https://your-elasticsearch.com:9200",
+                    "credentials": {
+                        "username": "elastic",
+                        "password": "YOUR_PASSWORD_HERE",
+                        "kibana_url": "https://your-kibana.com:5601"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                }
+            },
+            "soar_platforms": {
+                "cortex_xsoar": {
+                    "enabled": False,
+                    "auth_type": "api_key",
+                    "endpoint": "https://your-xsoar-instance.com",
+                    "credentials": {
+                        "api_key": "YOUR_API_KEY_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 60
+                },
+                "insightconnect": {
+                    "enabled": False,
+                    "auth_type": "api_key",
+                    "endpoint": "https://us.api.insight.rapid7.com/connect/v1",
+                    "credentials": {
+                        "api_key": "YOUR_API_KEY_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 60
+                }
+            },
+            "poll_interval": 30,
+            "alert_correlation_window": 300,
+            "automation_rules": [
+                {
+                    "name": "Critical Malware Auto-Response",
+                    "min_severity": "high",
+                    "keywords": ["malware", "trojan", "ransomware", "backdoor"],
+                    "soar_platform": "cortex_xsoar",
+                    "playbook_id": "malware_investigation_and_containment",
+                    "enabled": True
+                },
+                {
+                    "name": "Suspicious Network Activity",
+                    "min_severity": "medium",
+                    "keywords": ["lateral movement", "command and control", "data exfiltration"],
+                    "soar_platform": "insightconnect",
+                    "playbook_id": "network_containment_workflow",
+                    "enabled": True
+                },
+                {
+                    "name": "User Account Compromise",
+                    "min_severity": "high",
+                    "keywords": ["credential theft", "privilege escalation", "account takeover"],
+                    "platforms": ["sentinel", "splunk"],
+                    "soar_platform": "cortex_xsoar",
+                    "playbook_id": "user_account_investigation",
+                    "enabled": True
+                }
+            ]
+        }
+    
+    @staticmethod
+    def create_splunk_only_config() -> Dict[str, Any]:
+        """Create Splunk-focused configuration"""
+        return {
+            "siem_platforms": {
+                "splunk": {
+                    "enabled": True,
+                    "auth_type": "token",
+                    "endpoint": "https://your-splunk-instance.com:8089",
+                    "credentials": {
+                        "token": "YOUR_HEC_TOKEN_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                }
+            },
+            "soar_platforms": {
+                "cortex_xsoar": {
+                    "enabled": True,
+                    "auth_type": "api_key",
+                    "endpoint": "https://your-xsoar-instance.com",
+                    "credentials": {
+                        "api_key": "YOUR_API_KEY_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 60
+                }
+            },
+            "poll_interval": 15,
+            "automation_rules": [
+                {
+                    "name": "Splunk High Priority Alert Response",
+                    "min_severity": "high",
+                    "platforms": ["splunk"],
+                    "soar_platform": "cortex_xsoar",
+                    "playbook_id": "splunk_alert_investigation",
+                    "enabled": True
+                }
+            ]
+        }
+    
+    @staticmethod
+    def create_microsoft_stack_config() -> Dict[str, Any]:
+        """Create Microsoft-centric configuration (Sentinel + Azure)"""
+        return {
+            "siem_platforms": {
+                "sentinel": {
+                    "enabled": True,
+                    "auth_type": "oauth2",
+                    "endpoint": "https://management.azure.com",
+                    "credentials": {
+                        "tenant_id": "YOUR_TENANT_ID",
+                        "client_id": "YOUR_CLIENT_ID", 
+                        "client_secret": "YOUR_CLIENT_SECRET",
+                        "workspace_id": "YOUR_WORKSPACE_ID",
+                        "resource_group": "YOUR_RESOURCE_GROUP",
+                        "subscription_id": "YOUR_SUBSCRIPTION_ID",
+                        "shared_key": "YOUR_SHARED_KEY"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 30
+                }
+            },
+            "soar_platforms": {
+                "insightconnect": {
+                    "enabled": True,
+                    "auth_type": "api_key",
+                    "endpoint": "https://us.api.insight.rapid7.com/connect/v1",
+                    "credentials": {
+                        "api_key": "YOUR_API_KEY_HERE"
+                    },
+                    "verify_ssl": True,
+                    "timeout": 60
+                }
+            },
+            "poll_interval": 20,
+            "automation_rules": [
+                {
+                    "name": "Azure Security Alert Response",
+                    "min_severity": "medium",
+                    "platforms": ["sentinel"],
+                    "soar_platform": "insightconnect",
+                    "playbook_id": "azure_incident_response",
+                    "enabled": True
+                }
+            ]
+        }
+
+# =============================================================================
+# GHOST ENGINE SIEM/SOAR INTEGRATION MODULE
+# =============================================================================
+
+class GhostSIEMSOARIntegration:
+    """
+    KK&G DevOps Ghost Engine - Main SIEM/SOAR Integration Module
+    
+    Drop-in module for the Ghost Engine core that provides enterprise-grade
+    SIEM and SOAR platform integrations with zero manual configuration.
+    """
+    
+    def __init__(self, ghost_engine_instance, config_file: str = "ghost_siem_soar_config.yaml"):
+        self.ghost_engine = ghost_engine_instance
+        self.config_file = config_file
+        self.orchestrator: Optional[GhostSIEMSOAROrchestrator] = None
+        self.is_initialized = False
+        self.logger = logging.getLogger("ghost.siem_soar_integration")
+        
+        # Load configuration
+        self.config = self._load_or_create_config()
+        
+    def _load_or_create_config(self) -> Dict[str, Any]:
+        """Load configuration or create default enterprise config"""
+        try:
+            import yaml
+            with open(self.config_file, 'r') as f:
+                config = yaml.safe_load(f)
+                self.logger.info(f"Loaded SIEM/SOAR configuration from {self.config_file}")
+                return config
+        except FileNotFoundError:
+            # Create default enterprise configuration
+            config = GhostSIEMSOARConfigFactory.create_enterprise_config()
+            
+            try:
+                import yaml
+                with open(self.config_file, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False, indent=2)
+                self.logger.info(f"Created default SIEM/SOAR configuration: {self.config_file}")
+            except Exception as e:
+                self.logger.warning(f"Could not save default configuration: {e}")
+            
+            return config
+        except Exception as e:
+            self.logger.error(f"Error loading configuration: {e}")
+            return GhostSIEMSOARConfigFactory.create_enterprise_config()
+    
+    async def initialize(self) -> bool:
+        """Initialize the SIEM/SOAR integration module"""
+        try:
+            self.orchestrator = GhostSIEMSOAROrchestrator(self.config)
+            
+            if await self.orchestrator.initialize():
+                # Register event handler with Ghost Engine
+                if hasattr(self.ghost_engine, 'event_pipeline'):
+                    self.ghost_engine.event_pipeline.add_processor(self._handle_ghost_engine_event)
+                
+                self.is_initialized = True
+                self.logger.info("Ghost Engine SIEM/SOAR integration initialized successfully")
+                return True
+            else:
+                self.logger.error("Failed to initialize SIEM/SOAR orchestrator")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error initializing SIEM/SOAR integration: {e}")
+            return False
+    
+    async def start(self):
+        """Start SIEM/SOAR monitoring and integration"""
+        if not self.is_initialized:
+            raise RuntimeError("SIEM/SOAR integration not initialized")
+        
+        self.logger.info("Starting Ghost Engine SIEM/SOAR integration")
+        await self.orchestrator.start_monitoring()
+    
+    async def stop(self):
+        """Stop SIEM/SOAR integration"""
+        if self.orchestrator:
+            await self.orchestrator.stop_monitoring()
+            self.logger.info("Stopped Ghost Engine SIEM/SOAR integration")
+    
+    async def _handle_ghost_engine_event(self, event: SecurityEvent):
+        """Handle Ghost Engine security events and distribute to SIEM platforms"""
+        try:
+            if self.orchestrator and self.orchestrator.is_running:
+                await self.orchestrator._distribute_event_to_siems(event)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling Ghost Engine event: {e}")
+    
+    def get_integration_status(self) -> Dict[str, Any]:
+        """Get integration status"""
+        if not self.orchestrator:
+            return {"status": "not_initialized"}
+        
+        return self.orchestrator.get_orchestrator_status()
+    
+    async def trigger_manual_response(self, soar_platform: str, playbook_id: str, 
+                                    event: SecurityEvent) -> str:
+        """Manually trigger SOAR response for a specific event"""
+        if not self.orchestrator:
+            raise RuntimeError("SIEM/SOAR integration not initialized")
+        
+        context = {
+            'event_id': event.event_id,
+            'title': f'Manual Ghost Engine Response',
+            'description': f'Manual SOAR response for {event.event_type.value}',
+            'severity': event.threat_level.value,
+            'threat_level': event.threat_level.value,
+            'platform': event.platform,
+            'timestamp': event.timestamp.isoformat(),
+            'raw_data': event.data
+        }
+        
+        return await self.orchestrator.manual_playbook_trigger(soar_platform, playbook_id, context)
+    
+    def add_automation_rule(self, rule: Dict[str, Any]):
+        """Add new automation rule at runtime"""
+        if self.orchestrator:
+            self.orchestrator.automation_rules.append(rule)
+            self.logger.info(f"Added automation rule: {rule.get('name', 'Unnamed')}")
+    
+    def list_available_playbooks(self, soar_platform: str) -> List[SOARPlaybook]:
+        """List available playbooks for a SOAR platform"""
+        if not self.orchestrator or soar_platform not in self.orchestrator.soar_connectors:
+            return []
+        
+        return asyncio.run(self.orchestrator.soar_connectors[soar_platform].list_playbooks())
+
+# =============================================================================
+# GHOST ENGINE MODULE REGISTRATION HELPER
+# =============================================================================
+
+def register_siem_soar_integration(ghost_engine_instance, config_file: str = None) -> GhostSIEMSOARIntegration:
+    """
+    KK&G DevOps Ghost Engine - SIEM/SOAR Integration Registration Helper
+    
+    Drop-in function to register SIEM/SOAR capabilities with an existing Ghost Engine instance.
+    
+    Args:
+        ghost_engine_instance: Running Ghost Engine instance
+        config_file: Optional path to SIEM/SOAR configuration file
+    
+    Returns:
+        GhostSIEMSOARIntegration: Initialized integration module
+    
+    Example:
+        # In your Ghost Engine main code:
+        from ghost_siem_soar_integration import register_siem_soar_integration
+        
+        engine = SecurityEngine()
+        siem_soar = register_siem_soar_integration(engine)
+        
+        # Start both Ghost Engine and SIEM/SOAR integration
+        asyncio.run(asyncio.gather(
+            engine.start(),
+            siem_soar.start()
+        ))
+    """
+    config_file = config_file or "ghost_siem_soar_config.yaml"
+    integration = GhostSIEMSOARIntegration(ghost_engine_instance, config_file)
+    
+    logging.getLogger("ghost.siem_soar").info(
+        "KK&G DevOps Ghost Engine - Enterprise SIEM/SOAR integration module loaded"
+    )
+    
+    return integration
+
+# =============================================================================
+# EXAMPLE USAGE AND TESTING
+# =============================================================================
+
+async def main_example():
+    """Example usage of the Ghost Engine SIEM/SOAR integration"""
+    
+    # Create test configuration
+    test_config = GhostSIEMSOARConfigFactory.create_enterprise_config()
+    
+    # Initialize orchestrator
+    orchestrator = GhostSIEMSOAROrchestrator(test_config)
+ 

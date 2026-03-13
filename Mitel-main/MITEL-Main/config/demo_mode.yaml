@@ -1,0 +1,60 @@
+# NEXUS Demo Mode Configuration
+# Consumer Hardware Optimized - Two-Tier Architecture
+
+mode: demo  # vs production
+
+# Tier 1: Always-on (lightweight)
+always_on:
+  # M.I.T.E.L. USB monitoring - kernel level, event-driven
+  usb_monitor:
+    enabled: true
+    mode: kernel_level  # udev rules, not polling
+    cpu_cost: negligible  # <1% CPU
+    response: realtime  # instant detection
+    
+  # Mesh heartbeat - throttled for demo
+  mesh_heartbeat:
+    interval: 10s  # 10 seconds (vs 500ms production)
+    timeout: 35s   # 35 seconds failover (3.5x heartbeat)
+    cpu_cost: low  # 90% reduction vs constant polling
+    
+  # Threat detection - event-driven
+  threat_agents:
+    mode: event_driven  # not polling
+    cpu_cost: minimal
+
+# Tier 2: On-demand (heavy)
+on_demand:
+  # Full LLM inference - only when needed
+  llm_inference:
+    trigger: manual  # not always running
+    cpu_cost: high  # but only on demand
+    
+  # Tool catalog sync - periodic, not constant
+  tool_sync:
+    interval: 5m  # 5 minutes, not continuous
+    
+  # Deep analysis - manual trigger
+  deep_analysis:
+    trigger: manual  # user-initiated only
+
+# Hardware constraints
+hardware:
+  type: consumer  # vs server/military
+  thermal_limit: 80°C  # protect hardware
+  cpu_limit: 50%  # leave headroom
+  
+# Demo settings
+demo:
+  narrative: "Production mode runs sub-second heartbeat for <3s failover. Demo mode uses 10s heartbeat to preserve hardware while demonstrating the same logic."
+  features:
+    - "USB threat detection: Instant (hardware interrupt-driven)"
+    - "Failover demo: 35-second worst case (acceptable for demo)"
+    - "CPU load: 90% reduction on mesh overhead"
+    - "Thermal: Laptops survive"
+
+# Security settings (never compromised)
+security:
+  usb_monitor: always  # Never compromised
+  threat_response: realtime
+  zero_trust: active

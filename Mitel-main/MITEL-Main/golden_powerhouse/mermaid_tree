@@ -1,0 +1,70 @@
+graph TB
+    %% Core Engine
+    EC[Engine Core<br/>engine_core.py]
+    
+    %% Global Services
+    NID[Node ID Service<br/>ghost-xxxxxxxx]
+    EB[Event Bus<br/>SimpleEventBus/EB-SUB]
+    
+    %% Critical Subsystem
+    SP[SP-SUB v5<br/>EnhancedGhostSyncProtocol<br/>🔴 CRITICAL]
+    
+    %% Optional Subsystems
+    SC[SC-SUB<br/>Session Control<br/>🟡 OPTIONAL]
+    AUTH[AUTH-SUB<br/>Authentication<br/>🟡 OPTIONAL]
+    SEC[SEC-SUB<br/>Security<br/>🟡 OPTIONAL]
+    AO[AO-SUB<br/>Advanced Operations<br/>🟡 OPTIONAL]
+    
+    %% Configuration
+    CFG[Config System<br/>YAML Auto-Bootstrap]
+    
+    %% External Integrations
+    P2P[P2P Mesh Network<br/>Port 8443/8444]
+    STOR[Local Storage<br/>data/sp_sub/]
+    LOGS[Logging System<br/>console + file]
+    
+    %% Connections
+    EC --> NID
+    EC --> EB
+    EC --> CFG
+    EC --> SP
+    EC --> SC
+    EC --> AUTH
+    EC --> SEC
+    EC --> AO
+    
+    %% SP-SUB Integration
+    SP --> EB
+    SP --> P2P
+    SP --> STOR
+    SP --> |SPEventBusIntegration| EB
+    
+    %% Event Bus Connections
+    EB -.-> SC
+    EB -.-> AUTH
+    EB -.-> SEC
+    EB -.-> AO
+    
+    %% Config Connections
+    CFG --> SP
+    CFG --> SC
+    CFG --> AUTH
+    CFG --> SEC
+    CFG --> AO
+    
+    %% Monitoring
+    EC --> LOGS
+    SP --> LOGS
+    
+    %% Styling
+    classDef critical fill:#ff6b6b,stroke:#d63447,stroke-width:3px,color:#fff
+    classDef optional fill:#ffd93d,stroke:#f39c12,stroke-width:2px,color:#333
+    classDef core fill:#74b9ff,stroke:#0984e3,stroke-width:3px,color:#fff
+    classDef service fill:#a29bfe,stroke:#6c5ce7,stroke-width:2px,color:#fff
+    classDef external fill:#fd79a8,stroke:#e84393,stroke-width:2px,color:#fff
+    
+    class SP critical
+    class SC,AUTH,SEC,AO optional
+    class EC core
+    class NID,EB,CFG service
+    class P2P,STOR,LOGS external

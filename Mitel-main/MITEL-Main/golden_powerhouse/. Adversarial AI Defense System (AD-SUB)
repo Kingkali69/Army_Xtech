@@ -1,0 +1,60 @@
+class AdversarialDefenseSubsystem(GhostSubsystem):
+    """Defense against AI-powered attacks and adversarial ML"""
+    
+    def __init__(self):
+        super().__init__("AD-SUB")
+        self.adversarial_detector = AdversarialAttackDetector()
+        self.model_integrity_monitor = ModelIntegrityMonitor()
+        self.defensive_distillation = DefensiveDistillationEngine()
+    
+    async def detect_adversarial_attack(self, input_data: Any, model_context: str) -> AdversarialThreat:
+        # Adversarial example detection
+        adversarial_score = await self.adversarial_detector.analyze(
+            input_data=input_data,
+            expected_distribution=self._get_expected_distribution(model_context)
+        )
+        
+        # Model poisoning detection
+        integrity_check = await self.model_integrity_monitor.verify_model_integrity(
+            model_name=model_context,
+            current_weights=self._get_current_model_weights(model_context)
+        )
+        
+        # Defensive response generation
+        if adversarial_score.is_adversarial or not integrity_check.is_clean:
+            defensive_response = await self.defensive_distillation.generate_defense(
+                attack_type=adversarial_score.attack_type,
+                confidence=adversarial_score.confidence
+            )
+            
+            return AdversarialThreat(
+                threat_detected=True,
+                attack_type=adversarial_score.attack_type,
+                confidence=adversarial_score.confidence,
+                defensive_action=defensive_response.recommended_action,
+                model_integrity_status=integrity_check.status
+            )
+        
+        return AdversarialThreat(threat_detected=False)
+
+class AdversarialAttackDetector:
+    """State-of-the-art adversarial example detection"""
+    
+    async def detect_gradient_based_attack(self, input_tensor: Any) -> GradientAttackAnalysis:
+        # Gradient-based adversarial detection using statistical tests
+        gradient_variance = await self._calculate_gradient_variance(input_tensor)
+        
+        # FGSM/PGD attack detection
+        perturbation_signature = await self._detect_perturbation_patterns(input_tensor)
+        
+        # Semantic consistency check
+        semantic_coherence = await self._verify_semantic_coherence(input_tensor)
+        
+        return GradientAttackAnalysis(
+            gradient_anomaly_score=gradient_variance.anomaly_score,
+            perturbation_detected=perturbation_signature.is_artificial,
+            semantic_coherence_score=semantic_coherence.score,
+            likely_attack_method=self._classify_attack_method(
+                gradient_variance, perturbation_signature
+            )
+        )

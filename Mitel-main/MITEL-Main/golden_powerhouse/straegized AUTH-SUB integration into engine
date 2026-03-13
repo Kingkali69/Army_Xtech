@@ -1,0 +1,301 @@
+async def _init_auth_subsystem(self, config: Dict):
+    """Initialize Authentication Subsystem"""
+    if not config.get('enabled', True):
+        logger.info("AUTH-SUB disabled in configuration")
+        self.subsystem_states['auth_sub'] = SubsystemState.UNINITIALIZED
+        return
+    
+    try:
+        # Create AUTH-SUB configuration if not present
+        auth_config_path = config.get('config_path', 'config/auth_config.yaml')
+        if not os.path.exists(auth_config_path):
+            # Create default AUTH-SUB config
+            auth_config = {
+                "providers": {
+                    "local": {
+                        "enabled": True,
+                        "password_policy": {
+                            "min_length": 10,
+                            "require_uppercase": True,
+                            "require_lowercase": True,
+                            "require_numbers": True,
+                            "require_special": True
+                        }
+                    },
+                    "oauth": {
+                        "enabled": False,
+                        "providers": []
+                    },
+                    "certificate": {
+                        "enabled": False,
+                        "ca_path": "certs/ca.pem"
+                    }
+                },
+                "token": {
+                    "expiry_seconds": 3600,
+                    "refresh_allowed": True,
+                    "refresh_expiry_seconds": 86400,
+                    "algorithm": "HS256",
+                    "secret_key_file": "config/token_secret.key"
+                },
+                "security": {
+                    "max_failed_attempts": 5,
+                    "lockout_duration_seconds": 300,
+                    "session_idle_timeout_seconds": 1800,
+                    "secure_storage": True,
+                    "encryption_enabled": True
+                },
+                "storage": {
+                    "type": "file",
+                    "path": "data/auth",
+                    "backup_enabled": True,
+                    "backup_interval_hours": 24
+                }
+            }
+            
+            os.makedirs(os.path.dirname(auth_config_path), exist_ok=True)
+            with open(auth_config_path, 'w') as f:
+                yaml.dump(auth_config, f, default_flow_style=False)
+            logger.info(f"Created default AUTH-SUB config at {auth_config_path}")
+        
+        # Update subsystem state
+        self.subsystem_states['auth_sub'] = SubsystemState.INITIALIZING
+        
+        # Initialize AUTH-SUB
+        auth_subsystem = AuthSubsystem(auth_config_path)
+        
+        # Pass event bus if available
+        if self.event_bus:
+            auth_subsystem.set_event_bus(self.event_bus)
+        
+        # Initialize the auth subsystem
+        await auth_subsystem.initialize()
+        
+        # Store the subsystem
+        self.subsystems['auth_sub'] = auth_subsystem
+        self.subsystem_states['auth_sub'] = SubsystemState.READY
+        
+        logger.info("AUTH-SUB initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize AUTH-SUB: {e}", exc_info=True)
+        self.subsystem_states['auth_sub'] = SubsystemState.ERROR
+        
+        # Only raise if this is a critical subsystem
+        if config.get('critical', False):
+            raise Exception(f"Critical subsystem AUTH-SUB failed to initialize: {e}")
+
+# Add this to the CLI module to support AUTH-SUB commands
+class AuthCommands:
+    """CLI commands for authentication subsystem"""
+    
+    @staticmethod
+    async def register_commands(subparsers):
+        # User management commands
+        user_parser = subparsers.add_parser('users', help='User management')
+        user_subparsers = user_parser.add_subparsers(dest='user_command', help='User commands')
+        
+        # List users
+        list_parser = user_subparsers.add_parser('list', help='List users')
+        list_parser.add_argument('--filter', help='Filter users (active/inactive/locked)')
+        
+        # Create user
+        create_parser = user_subparsers.add_parser('create', help='Create a new user')
+        create_parser.add_argument('--username', required=True, help='Username')
+        create_parser.add_argument('--password', help='Password (will prompt if not provided)')
+        create_parser.add_argument('--email', required=True, help='Email address')
+        create_parser.add_argument('--role', default='user', help='User role')
+        
+        # Delete user
+        delete_parser = user_subparsers.add_parser('delete', help='Delete a user')
+        delete_parser.add_argument('--username', required=True, help='Username to delete')
+        
+        # Reset password
+        reset_parser = user_subparsers.add_parser('reset-password', help='Reset user password')
+        reset_parser.add_argument('--username', required=True, help='Username')
+        reset_parser.add_argument('--password', help='New password (will prompt if not provided)')
+        
+        # Auth status command
+        auth_parser = subparsers.add_parser('auth', help='Authentication management')
+        auth_parser.add_argument('--status', action='store_true', help='Show auth subsystem status')
+        auth_parser.add_argument('--reset', action='store_true', help='Reset authentication subsystem')
+        auth_parser.add_argument('--provider', help='Get or set authentication provider')
+    
+    @staticmethod
+    async def handle_command(engine, args):
+        """Handle authentication-related commands"""
+        # Check if AUTH-SUB is available
+        if 'auth_sub' not in engine.subsystems:
+            logger.error("AUTH-SUB subsystem is not available")
+            return 1
+        
+        auth_sub = engine.subsystems['auth_sub']
+        
+        # Handle 'users' command
+        if hasattr(args, 'user_command') and args.user_command:
+            return await AuthCommands._handle_user_command(auth_sub, args)
+            
+        # Handle 'auth' command
+        if hasattr(args, 'status') and args.status:
+            return await AuthCommands._handle_auth_status(auth_sub, args)
+            
+        # Handle auth reset
+        if hasattr(args, 'reset') and args.reset:
+            try:
+                await auth_sub.reset()
+                print("Authentication subsystem reset successfully")
+                return 0
+            except Exception as e:
+                logger.error(f"Failed to reset authentication subsystem: {e}")
+                return 1
+        
+        # Handle provider operations
+        if hasattr(args, 'provider') and args.provider:
+            providers = await auth_sub.get_providers()
+            if args.provider in providers:
+                print(f"Provider {args.provider} status: {providers[args.provider].get('enabled', False)}")
+            else:
+                print(f"Provider {args.provider} not found. Available providers: {', '.join(providers.keys())}")
+            return 0
+            
+        # If we got here, no valid subcommand was provided
+        print("Please specify a valid auth command. Use --help for options.")
+        return 1
+    
+    @staticmethod
+    async def _handle_user_command(auth_sub, args):
+        """Handle user management commands"""
+        if args.user_command == 'list':
+            try:
+                filter_type = args.filter if hasattr(args, 'filter') else None
+                users = await auth_sub.list_users(filter_type)
+                
+                if not users:
+                    print("No users found.")
+                else:
+                    print(f"{'Username':<20} {'Email':<30} {'Status':<10} {'Role':<10}")
+                    print("-" * 70)
+                    for user in users:
+                        print(f"{user.get('username', ''):<20} {user.get('email', ''):<30} " +
+                              f"{user.get('status', 'active'):<10} {user.get('role', 'user'):<10}")
+                return 0
+            except Exception as e:
+                logger.error(f"Failed to list users: {e}")
+                return 1
+                
+        elif args.user_command == 'create':
+            try:
+                # Prompt for password if not provided
+                password = args.password
+                if not password:
+                    import getpass
+                    password = getpass.getpass("Enter password: ")
+                
+                result = await auth_sub.create_user(
+                    username=args.username,
+                    password=password,
+                    email=args.email,
+                    role=args.role
+                )
+                
+                if result.get('success', False):
+                    print(f"User {args.username} created successfully.")
+                    return 0
+                else:
+                    print(f"Failed to create user: {result.get('error', 'Unknown error')}")
+                    return 1
+            except Exception as e:
+                logger.error(f"Failed to create user: {e}")
+                return 1
+                
+        elif args.user_command == 'delete':
+            try:
+                result = await auth_sub.delete_user(args.username)
+                
+                if result.get('success', False):
+                    print(f"User {args.username} deleted successfully.")
+                    return 0
+                else:
+                    print(f"Failed to delete user: {result.get('error', 'Unknown error')}")
+                    return 1
+            except Exception as e:
+                logger.error(f"Failed to delete user: {e}")
+                return 1
+                
+        elif args.user_command == 'reset-password':
+            try:
+                # Prompt for password if not provided
+                password = args.password
+                if not password:
+                    import getpass
+                    password = getpass.getpass("Enter new password: ")
+                
+                result = await auth_sub.reset_password(args.username, password)
+                
+                if result.get('success', False):
+                    print(f"Password for {args.username} reset successfully.")
+                    return 0
+                else:
+                    print(f"Failed to reset password: {result.get('error', 'Unknown error')}")
+                    return 1
+            except Exception as e:
+                logger.error(f"Failed to reset password: {e}")
+                return 1
+        
+        print("Invalid user command. Use 'users --help' for options.")
+        return 1
+    
+    @staticmethod
+    async def _handle_auth_status(auth_sub, args):
+        """Handle authentication status command"""
+        try:
+            status = await auth_sub.get_status()
+            
+            print("Authentication Subsystem Status:")
+            print(f"  Active: {status.get('active', False)}")
+            print(f"  Version: {status.get('version', 'unknown')}")
+            print(f"  Users: {status.get('user_count', 0)}")
+            print(f"  Failed login attempts: {status.get('failed_attempts', 0)}")
+            print(f"  Locked accounts: {status.get('locked_accounts', 0)}")
+            print("\nEnabled Providers:")
+            for provider, enabled in status.get('providers', {}).items():
+                print(f"  {provider}: {'Enabled' if enabled else 'Disabled'}")
+            
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to get authentication status: {e}")
+            return 1
+
+# Register auth commands with the CLI
+def _setup_parser(self) -> argparse.ArgumentParser:
+    """Setup CLI argument parser with AUTH-SUB commands"""
+    parser = argparse.ArgumentParser(
+        description='G.Legion Engine Command Line Interface'
+    )
+    
+    # ... [existing parser setup code]
+    
+    # Add subparsers for commands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # ... [existing command setup code]
+    
+    # Register AUTH-SUB commands
+    AuthCommands.register_commands(subparsers)
+    
+    return parser
+
+# Update command handlers to include AUTH-SUB commands
+def _get_command_handlers(self) -> Dict[str, Callable]:
+    """Map commands to their handler functions"""
+    handlers = {
+        'start': self.cmd_start,
+        'status': self.cmd_status,
+        'stop': self.cmd_stop,
+        'sync': self.cmd_sync,
+        'test-delta': self.cmd_test_delta,
+        'peers': self.cmd_peers,
+        'users': lambda args: AuthCommands.handle_command(self.engine, args),
+        'auth': lambda args: AuthCommands.handle_command(self.engine, args)
+    }
+    return handlers

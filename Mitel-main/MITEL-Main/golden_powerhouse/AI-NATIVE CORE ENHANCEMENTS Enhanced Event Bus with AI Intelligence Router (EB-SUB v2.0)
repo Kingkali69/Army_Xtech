@@ -1,0 +1,32 @@
+# EB-SUB Enhancement: AI Event Intelligence Layer
+class AIEventRouter:
+    """AI-powered event routing with predictive correlation"""
+    
+    async def route_intelligent_event(self, event: GhostEvent) -> List[str]:
+        # AI determines which subsystems need this event based on context
+        routing_prediction = await self._ai_routing_model.predict(
+            event_features=self._extract_event_features(event),
+            system_state=self._get_system_state_vector()
+        )
+        
+        # Dynamic priority adjustment based on threat landscape
+        adjusted_priority = await self._threat_context_adjuster.adjust_priority(
+            base_priority=event.priority,
+            global_threat_level=self.threat_assessment_cache.current_level
+        )
+        
+        return routing_prediction.target_subsystems
+
+class CorrelationEngine:
+    """Real-time event correlation with ML pattern detection"""
+    
+    async def correlate_events(self, event_window: List[GhostEvent]) -> Optional[ThreatPattern]:
+        # Multi-dimensional correlation analysis
+        correlation_matrix = await self._calculate_correlation_matrix(event_window)
+        
+        if correlation_score := await self._ml_pattern_detector.analyze(correlation_matrix):
+            return ThreatPattern(
+                confidence=correlation_score.confidence,
+                attack_vector=correlation_score.predicted_vector,
+                recommended_actions=correlation_score.response_suggestions
+            )

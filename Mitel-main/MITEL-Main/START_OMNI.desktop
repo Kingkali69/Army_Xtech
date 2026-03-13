@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=🔥 OMNI Complete Demo
+Comment=Launch OMNI with M.I.T.E.L. Security, NEXUS Intelligence, and Self-Healing
+Exec=/home/kali/Desktop/MITEL/Mitel-main/START_COMPLETE_DEMO.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Security;
+StartupNotify=true

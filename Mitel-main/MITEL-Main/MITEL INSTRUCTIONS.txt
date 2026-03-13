@@ -1,0 +1,261 @@
+# ============================================================================
+# M.I.T.E.L. INTEGRATION FOR YOUR ENGINE_CORE.PY
+# Add these sections to your existing engine_core.py file
+# ============================================================================
+
+# 1. ADD THIS IMPORT AT THE TOP (with other subsystem imports)
+# ============================================================================
+
+try:
+    from mitel_subsystem import MITELSubsystem
+    MITEL_SUB_AVAILABLE = True
+except ImportError:
+    MITEL_SUB_AVAILABLE = False
+
+# ============================================================================
+# 2. ADD M.I.T.E.L. TO YOUR DEFAULT_CONFIG (in _load_config method)
+# ============================================================================
+
+# In your _load_config() method, add this to the default_config["subsystems"] section:
+
+"mitel_sub": {
+    "enabled": MITEL_SUB_AVAILABLE,
+    "config_path": "config/mitel_config.yaml",
+    "critical": False
+},
+
+# ============================================================================
+# 3. ADD M.I.T.E.L. TO INITIALIZATION ORDER (in _init_subsystems method)
+# ============================================================================
+
+# In your _init_subsystems() method, add this to the initialization_order list:
+
+('mitel_sub', self._init_mitel_subsystem),
+
+# ============================================================================
+# 4. ADD THIS NEW METHOD TO YOUR EngineCore CLASS
+# ============================================================================
+
+async def _init_mitel_subsystem(self, config: Dict):
+    """Initialize M.I.T.E.L. Subsystem"""
+    if not MITEL_SUB_AVAILABLE or not config.get('enabled', True):
+        logger.info("M.I.T.E.L. not available or disabled")
+        return
+    
+    try:
+        # Create M.I.T.E.L. configuration if not present
+        mitel_config_path = config.get('config_path', 'config/mitel_config.yaml')
+        if not os.path.exists(mitel_config_path):
+            # Create default M.I.T.E.L. config
+            mitel_config = {
+                "enabled": True,
+                
+                # Device Management
+                "device_registry_file": "data/mitel_devices.yaml",
+                "behavioral_profiles_file": "data/mitel_profiles.yaml",
+                
+                # Security Settings
+                "anomaly_threshold": 0.8,
+                "auto_quarantine": True,
+                "require_admin_approval": False,
+                
+                # Monitoring Settings
+                "scan_interval": 1.0,  # seconds
+                "behavioral_analysis": True,
+                "real_time_monitoring": True,
+                
+                # POS Mode (for retail/payment systems)
+                "pos_mode": False,
+                "pos_skimmer_detection": True,
+                "pos_transaction_monitoring": False,
+                
+                # Cross-Platform Settings
+                "linux_integration": True,
+                "windows_integration": True,
+                "android_integration": True,  # via Termux
+                "ios_integration": False,     # future
+                
+                # AI/ML Settings
+                "neural_analysis": True,
+                "behavioral_learning": True,
+                "predictive_modeling": False,  # advanced feature
+                
+                # Logging
+                "log_level": "INFO",
+                "audit_all_events": True,
+                "threat_event_retention": 30  # days
+            }
+            
+            os.makedirs(os.path.dirname(mitel_config_path), exist_ok=True)
+            with open(mitel_config_path, 'w') as f:
+                yaml.dump(mitel_config, f, default_flow_style=False)
+            logger.info(f"Created default M.I.T.E.L. config at {mitel_config_path}")
+        
+        # Load M.I.T.E.L. config
+        with open(mitel_config_path, 'r') as f:
+            mitel_config = yaml.safe_load(f)
+        
+        # Update subsystem state
+        self.subsystem_states['mitel_sub'] = SubsystemState.INITIALIZING
+        
+        # Initialize M.I.T.E.L. subsystem
+        self.subsystems['mitel_sub'] = MITELSubsystem(mitel_config, self.event_bus)
+        
+        # Initialize the subsystem
+        success = await self.subsystems['mitel_sub'].initialize()
+        if success:
+            self.subsystem_states['mitel_sub'] = SubsystemState.READY
+            logger.info("M.I.T.E.L. initialized successfully")
+        else:
+            self.subsystem_states['mitel_sub'] = SubsystemState.ERROR
+            logger.error("M.I.T.E.L. initialization failed")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize M.I.T.E.L.: {e}", exc_info=True)
+        self.subsystem_states['mitel_sub'] = SubsystemState.ERROR
+
+# ============================================================================
+# 5. ADD M.I.T.E.L. TO YOUR START/STOP METHODS
+# ============================================================================
+
+# In your start() method, add M.I.T.E.L. startup (if you have a start method):
+
+async def start(self):
+    """Start the engine and all subsystems"""
+    if self.running:
+        logger.warning("Engine already running")
+        return
+    
+    try:
+        logger.info("Starting G.Legion Engine Core")
+        self.running = True
+        
+        # Start Event Bus first
+        if self.event_bus:
+            await self.event_bus.start()
+        
+        # Start subsystems in order
+        startup_order = ['sp_sub', 'sc_sub', 'auth_sub', 'sec_sub', 'ao_sub', 'mitel_sub']
+        
+        for subsystem_name in startup_order:
+            if subsystem_name in self.subsystems:
+                try:
+                    subsystem = self.subsystems[subsystem_name]
+                    if hasattr(subsystem, 'start'):
+                        self.subsystem_states[subsystem_name] = SubsystemState.STARTING
+                        await subsystem.start()
+                        self.subsystem_states[subsystem_name] = SubsystemState.RUNNING
+                        logger.info(f"{subsystem_name.upper()} started")
+                except Exception as e:
+                    logger.error(f"Failed to start {subsystem_name}: {e}")
+                    self.subsystem_states[subsystem_name] = SubsystemState.ERROR
+        
+        # Publish engine start event
+        if self.event_bus:
+            await self.event_bus.publish('engine_started', {
+                'node_id': self.node_id,
+                'timestamp': datetime.now().isoformat(),
+                'subsystems': list(self.subsystems.keys())
+            })
+        
+        logger.info("G.Legion Engine Core started successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to start engine: {e}", exc_info=True)
+        self.running = False
+        raise
+
+# ============================================================================
+# 6. CLI INTEGRATION COMMANDS (for your CLI interface)
+# ============================================================================
+
+# Add these commands to your CLI system:
+
+async def handle_mitel_command(self, args):
+    """Handle M.I.T.E.L. commands in your CLI"""
+    
+    if not self.engine or 'mitel_sub' not in self.engine.subsystems:
+        print("❌ M.I.T.E.L. subsystem not available")
+        return
+    
+    mitel = self.engine.subsystems['mitel_sub']
+    
+    if len(args) == 0 or args[0] == 'status':
+        # Show M.I.T.E.L. status
+        status = await mitel.get_status()
+        print(f"\n🛡️  M.I.T.E.L. Status:")
+        print(f"   Status: {status['status']}")
+        print(f"   Registered Devices: {status['registered_devices']}")
+        print(f"   Quarantined Devices: {status['quarantined_devices']}")
+        print(f"   Threat Events: {status['threat_events']}")
+        print(f"   POS Mode: {status['pos_mode']}")
+        print(f"   Monitoring: {status['monitoring_active']}")
+        
+    elif args[0] == 'devices':
+        # List registered devices
+        print("\n📱 Registered Devices:")
+        for device_id in mitel.registered_devices:
+            status = "🟢 Active" if device_id not in mitel.quarantined_devices else "🔴 Quarantined"
+            print(f"   {device_id[:16]}... - {status}")
+    
+    elif args[0] == 'threats':
+        # Show recent threat events
+        print("\n🚨 Recent Threat Events:")
+        for event in mitel.threat_events[-10:]:  # Last 10 events
+            print(f"   [{event.timestamp.strftime('%H:%M:%S')}] {event.threat_type}: {event.description}")
+    
+    elif args[0] == 'quarantine' and len(args) > 1:
+        # Quarantine a device
+        device_id = args[1]
+        mitel.quarantined_devices.add(device_id)
+        print(f"🚫 Device {device_id} quarantined")
+    
+    elif args[0] == 'register' and len(args) > 1:
+        # Register a device (placeholder - would need device detection)
+        device_id = args[1]
+        print(f"📝 Device registration for {device_id} initiated")
+        # In real implementation, would trigger device registration flow
+    
+    else:
+        print("\nM.I.T.E.L. Commands:")
+        print("  status                    - Show M.I.T.E.L. status")
+        print("  devices                   - List registered devices")
+        print("  threats                   - Show recent threat events")
+        print("  quarantine <device_id>    - Quarantine a device")
+        print("  register <device_id>      - Register a new device")
+
+# ============================================================================
+# 7. COMPLETE INTEGRATION SUMMARY
+# ============================================================================
+
+"""
+INTEGRATION STEPS:
+
+1. ✅ Copy mitel_subsystem.py to your project root
+2. ✅ Add the import statement to engine_core.py
+3. ✅ Add "mitel_sub" to default_config["subsystems"]
+4. ✅ Add ('mitel_sub', self._init_mitel_subsystem) to initialization_order
+5. ✅ Add the _init_mitel_subsystem() method to EngineCore class
+6. ✅ Add 'mitel_sub' to your start() method startup_order
+7. ✅ Add M.I.T.E.L. CLI commands to your CLI handler
+
+THAT'S IT! M.I.T.E.L. will now:
+- Auto-generate its config file on first run
+- Initialize with your other subsystems
+- Connect to your event bus
+- Start/stop with the engine
+- Be controllable via CLI
+
+Your engine will create:
+📁 config/mitel_config.yaml (auto-generated)
+📁 data/mitel_devices.yaml (device registry)
+📁 data/mitel_profiles.yaml (behavioral profiles)
+
+Test with:
+python3 cli_test_runner.py
+> mitel status
+"""
+
+# ============================================================================
+# END INTEGRATION CODE
+# ============================================================================

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>M.I.T.E.L. Device Test</title>
+    <style>
+        body {
+            background: #1a1a1a;
+            color: #e0e0e0;
+            font-family: 'Courier New', monospace;
+            padding: 20px;
+        }
+        .device {
+            background: #252525;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 3px solid #ff4444;
+        }
+        .status {
+            color: #ff4444;
+            font-weight: bold;
+        }
+        h1 { color: #46d946; }
+        #loading { color: #ffaa00; }
+        #error { color: #ff4444; }
+    </style>
+</head>
+<body>
+    <h1>M.I.T.E.L. DEVICE TEST</h1>
+    <div id="loading">Loading devices...</div>
+    <div id="error"></div>
+    <div id="devices"></div>
+
+    <script>
+        console.log('TEST PAGE LOADED');
+        
+        // Test 1: Fetch device list
+        fetch('http://localhost:8888/api/mitel/devices')
+            .then(response => {
+                console.log('Response received:', response.status);
+                return response.json();
+            })
+            .then(data => {
+                console.log('Device data:', data);
+                
+                document.getElementById('loading').style.display = 'none';
+                
+                const container = document.getElementById('devices');
+                
+                if (data.devices && data.devices.length > 0) {
+                    container.innerHTML = '<h2>FOUND ' + data.devices.length + ' DEVICES</h2>';
+                    
+                    data.devices.forEach(device => {
+                        const div = document.createElement('div');
+                        div.className = 'device';
+                        div.innerHTML = 
+                            '<div class="status">' + device.trust_status.toUpperCase() + '</div>' +
+                            '<div>Name: ' + device.name + '</div>' +
+                            '<div>ID: ' + device.device_id + '</div>' +
+                            '<div>Type: ' + device.device_type + '</div>';
+                        container.appendChild(div);
+                    });
+                } else {
+                    container.innerHTML = '<h2>NO DEVICES FOUND</h2>';
+                }
+            })
+            .catch(error => {
+                console.error('ERROR:', error);
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('error').innerHTML = 'ERROR: ' + error.message;
+            });
+    </script>
+</body>
+</html>

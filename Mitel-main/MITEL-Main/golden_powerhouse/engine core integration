@@ -1,0 +1,295 @@
+# Engine Core Integration Plan for SP-SUB v5
+
+I'll create a comprehensive plan to integrate the Synchronization Protocol Subsystem (SP-SUB v5) into the `engine_core.py` file. Since I don't have the actual `engine_core.py` file, I'll provide a detailed implementation pattern that you can apply to your existing file.
+
+## Integration Approach
+
+Here's how to integrate SP-SUB v5 into the engine core as a first-class runtime subsystem:
+
+```python
+# engine_core.py
+# G.Legion Framework - Engine Core
+# (Keep your existing imports)
+
+import asyncio
+import logging
+import sys
+import os
+import yaml
+import json
+import signal
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Set
+
+# Add these imports for SP-SUB
+from sp_subsystem_v5_complete import EnhancedGhostSyncProtocol, SPEventBusIntegration
+
+# Global logging setup
+logger = logging.getLogger("G.Legion.Core")
+
+class EngineCore:
+    """G.Legion Engine Core - Main runtime environment"""
+    
+    def __init__(self, config_path: str = "config/engine_config.yaml"):
+        self.config_path = config_path
+        self.config = {}
+        self.node_id = None
+        
+        # Subsystems
+        self.event_bus = None  # Will be initialized if EB-SUB is available
+        self.sync_subsystem = None  # SP-SUB
+        self.auth_subsystem = None  # Will be AUTH-SUB
+        self.sec_subsystem = None  # Will be SEC-SUB
+        
+        # Runtime state
+        self.running = False
+        self.subsystems_ready = False
+    
+    async def initialize(self):
+        """Initialize the engine core and subsystems"""
+        try:
+            # Load configuration
+            await self._load_config()
+            
+            # Generate or load node ID
+            self._setup_node_id()
+            
+            logger.info(f"G.Legion Engine Core initializing (node: {self.node_id})")
+            
+            # Initialize subsystems
+            await self._init_subsystems()
+            
+            self.subsystems_ready = True
+            logger.info("Engine core initialization complete")
+            
+        except Exception as e:
+            logger.error(f"Engine core initialization failed: {e}")
+            raise
+    
+    async def _load_config(self):
+        """Load engine configuration"""
+        try:
+            config_file = Path(self.config_path)
+            if not config_file.exists():
+                logger.warning(f"Config file not found: {self.config_path}")
+                self.config = {}
+                return
+                
+            with open(config_file, 'r') as f:
+                self.config = yaml.safe_load(f)
+                
+            logger.info(f"Configuration loaded from {self.config_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            self.config = {}
+    
+    def _setup_node_id(self):
+        """Set up unique node identifier"""
+        # Use configured node ID or generate a new one
+        self.node_id = self.config.get('node_id')
+        
+        if not self.node_id:
+            import uuid
+            self.node_id = f"ghost-node-{str(uuid.uuid4())[:8]}"
+            logger.info(f"Generated new node ID: {self.node_id}")
+    
+    async def _init_subsystems(self):
+        """Initialize all required subsystems"""
+        # Initialize Event Bus if available (EB-SUB)
+        try:
+            # Placeholder for actual EB-SUB import and initialization
+            # self.event_bus = EventBusSubsystem(self.config.get('event_bus', {}))
+            # await self.event_bus.initialize()
+            pass
+        except ImportError:
+            logger.info("Event Bus subsystem not available")
+        except Exception as e:
+            logger.error(f"Failed to initialize Event Bus: {e}")
+        
+        # Initialize SP-SUB (Synchronization Protocol)
+        try:
+            sp_config = self.config.get('sync_protocol', {})
+            
+            # Create SP-SUB configuration if not present
+            sp_config_path = "sp_config.yaml"
+            if not os.path.exists(sp_config_path):
+                # Create minimal config file for SP-SUB
+                minimal_config = {
+                    "sync": {
+                        "interval_seconds": 300,
+                        "batch_size": 100,
+                        "max_retries": 3,
+                        "timeout_seconds": 30,
+                        "offline_mode": True
+                    },
+                    "protocol": {
+                        "mode": "mesh",
+                        "listen_port": 8443,
+                        "discovery_port": 8444,
+                        "offline_first": True
+                    }
+                }
+                with open(sp_config_path, 'w') as f:
+                    yaml.dump(minimal_config, f)
+                logger.info(f"Created default SP-SUB config at {sp_config_path}")
+            
+            # Initialize SP-SUB protocol
+            self.sync_subsystem = EnhancedGhostSyncProtocol(sp_config, self.node_id)
+            
+            # Connect SP-SUB to Event Bus if available
+            if self.event_bus:
+                sp_events = SPEventBusIntegration(self.sync_subsystem, self.event_bus)
+                await sp_events.initialize()
+                logger.info("SP-SUB connected to Event Bus")
+            
+            logger.info("SP-SUB initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize SP-SUB: {e}")
+            self.sync_subsystem = None
+    
+    async def start(self):
+        """Start the engine core and all subsystems"""
+        if self.running:
+            return
+        
+        logger.info("Starting G.Legion Engine Core...")
+        
+        # Start SP-SUB if initialized
+        if self.sync_subsystem:
+            try:
+                await self.sync_subsystem.start()
+                logger.info("SP-SUB started")
+            except Exception as e:
+                logger.error(f"Failed to start SP-SUB: {e}")
+        
+        # Start other subsystems here as they are added
+        
+        self.running = True
+        logger.info("G.Legion Engine Core started")
+    
+    async def stop(self):
+        """Stop the engine core and all subsystems"""
+        if not self.running:
+            return
+        
+        logger.info("Stopping G.Legion Engine Core...")
+        
+        # Stop SP-SUB if initialized
+        if self.sync_subsystem:
+            try:
+                await self.sync_subsystem.stop()
+                logger.info("SP-SUB stopped")
+            except Exception as e:
+                logger.error(f"Error stopping SP-SUB: {e}")
+        
+        # Stop other subsystems here as they are added
+        
+        self.running = False
+        logger.info("G.Legion Engine Core stopped")
+    
+    async def run(self):
+        """Run the engine core main loop"""
+        await self.start()
+        
+        # Setup signal handlers for graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+        
+        logger.info("G.Legion Engine Core running. Press Ctrl+C to stop.")
+        
+        # Main loop
+        try:
+            while self.running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.stop()
+
+
+# Main entry point
+async def main():
+    """Main entry point for G.Legion Engine Core"""
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('logs/engine_core.log')
+        ]
+    )
+    
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='G.Legion Engine Core')
+    parser.add_argument('--config', help='Path to configuration file', default='config/engine_config.yaml')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Create logs directory
+    os.makedirs('logs', exist_ok=True)
+    
+    # Initialize and run engine core
+    try:
+        engine = EngineCore(config_path=args.config)
+        await engine.initialize()
+        await engine.run()
+    except Exception as e:
+        logger.critical(f"Engine core failed: {e}", exc_info=True)
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = asyncio.run(main())
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nShutdown requested")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
+```
+
+## Key Integration Points
+
+1. **Imports**: Added imports for `EnhancedGhostSyncProtocol` and `SPEventBusIntegration` from the SP-SUB module
+
+2. **Subsystem Storage**: Added a dedicated attribute `self.sync_subsystem` to store the SP-SUB instance
+
+3. **Initialization**: 
+   - Created a subsystem initialization method that sets up SP-SUB
+   - Generates a minimal configuration file if needed
+   - Connects to the Event Bus if available
+
+4. **Lifecycle Management**:
+   - `start()`: Starts the SP-SUB instance when the engine starts
+   - `stop()`: Gracefully stops SP-SUB when the engine stops
+   - Signal handlers ensure SP-SUB is properly shut down on SIGINT/SIGTERM
+
+5. **Future-Proof Design**:
+   - The pattern allows easy addition of more subsystems (AUTH-SUB, SEC-SUB, etc.)
+   - Common lifecycle methods (initialize, start, stop) for all subsystems
+   - Clear error handling and logging
+
+## Integration Verification
+
+To verify the integration is working:
+
+1. Start the engine core: `python engine_core.py`
+2. Check logs for:
+   - "SP-SUB initialized successfully"
+   - "SP-SUB started"
+3. Observe that SP-SUB is responding to sync events
+4. Verify proper shutdown when you press Ctrl+C
+
+This implementation makes SP-SUB a first-class runtime subsystem of the engine core, running within the same process as requested.

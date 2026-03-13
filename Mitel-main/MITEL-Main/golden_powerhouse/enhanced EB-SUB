@@ -1,0 +1,85 @@
+I'll enhance your EB-SUB (Event Bus Subsystem) with enterprise-grade features for the Ghost / G.Legion architecture. Here's a comprehensive implementation:I've created a comprehensive enhancement to your EB-SUB (Event Bus Subsystem) that transforms it into an enterprise-grade messaging system for the Ghost / G.Legion architecture. Here are the key improvements:
+
+## **🚀 Key Features Added**
+
+### **1. Async/Sync Compatibility**
+- Auto-detects async vs sync handlers
+- Dedicated async event processor with queue
+- Thread pool for sync callbacks in async context
+- Context-aware publishing
+
+### **2. Advanced Event System**
+- `GhostEvent` class with metadata, priorities, timestamps, and routing
+- Event filtering system for precise targeting
+- Priority-based processing (LOW, NORMAL, HIGH, CRITICAL)
+- Cross-subsystem communication support
+
+### **3. Thread & Process Safety**
+- Thread-safe operations with RLock
+- Async locks for concurrent async operations
+- Cross-process communication ready with Queue support
+- Dead letter queue for failed events
+
+### **4. Scalable Architecture**
+- Configurable thread pool for sync handlers
+- Event filtering to reduce unnecessary processing
+- Wildcard subscriptions (`*` for all events)
+- Target subsystem routing
+
+### **5. Monitoring & Diagnostics**
+- Comprehensive statistics tracking
+- Performance metrics (events/sec, success rates)
+- Dead letter queue for failed events
+- Detailed logging with subsystem context
+
+### **6. Ghost-Specific Integration**
+- `GhostSubsystemBus` specialized for Ghost subsystems
+- Standard event types (AUTH_LOGIN, SEC_THREAT_DETECTED, etc.)
+- Subsystem-aware publishing and filtering
+- Built-in Ghost event patterns
+
+## **🔧 Usage Examples**
+
+```python
+# Basic usage
+bus = GhostSubsystemBus("AUTH-SUB")
+bus.start()
+
+# Subscribe to events
+async def handle_auth(event):
+    print(f"Auth event: {event.data}")
+
+bus.subscribe("AUTH_LOGIN", handle_auth)
+
+# Publish events
+await bus.publish_async("AUTH_LOGIN", {"user": "ghost"})
+
+# With priorities and targeting
+bus.publish_sync(
+    "SEC_THREAT_DETECTED", 
+    {"threat": "malware"}, 
+    priority=EventPriority.CRITICAL,
+    target_subsystems={"AUTH-SUB", "LOG-SUB"}
+)
+```
+
+## **🎯 Integration with Other Subsystems**
+
+This event bus is designed to seamlessly integrate with your other Ghost subsystems:
+
+- **AUTH-SUB**: Publishes login/logout events
+- **SEC-SUB**: Broadcasts threat detections and scan results
+- **SC-SUB**: Notifies command executions and shell status
+- **Any other subsystems**: Can subscribe to relevant events
+
+## **💪 Production Ready**
+
+The implementation includes:
+- Proper error handling and recovery
+- Resource cleanup (context managers)
+- Configurable worker pools
+- Statistics for monitoring
+- Cross-process communication support
+- Dead letter queues for reliability
+
+This enhanced EB-SUB provides a robust foundation for decoupled communication between all Ghost subsystems while maintaining high performance and reliability.

@@ -1,0 +1,12 @@
+{
+  "peers": [
+    {
+      "ip": "10.83.28.15",
+      "services": {"console": 8888, "ai_chat": 8889, "substrate_ai": 8890}
+    },
+    {
+      "ip": "192.168.1.239",
+      "services": {"console": 8888, "ai_chat": 8889, "substrate_ai": 8890}
+    }
+  ]
+}

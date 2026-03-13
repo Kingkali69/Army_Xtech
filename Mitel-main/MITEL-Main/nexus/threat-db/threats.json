@@ -1,0 +1,148 @@
+{
+  "version": "1.0",
+  "created": "2025-03-09T08:45:00Z",
+  "description": "NEXUS Shared Threat Database - MITEL Intelligence Feed",
+  "threats": [
+    {
+      "id": "THREAT-001",
+      "type": "malware",
+      "name": "GhostOps Backdoor",
+      "signature": "a1b2c3d4e5f6",
+      "hashes": {
+        "md5": "d41d8cd98f00b204e9800998ecf8427e",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "indicators": [
+        "registry_key: HKLM\\Software\\GhostOps",
+        "file_path: C:\\Windows\\System32\\ghostsvc.exe",
+        "network_connection: 192.168.1.100:4444"
+      ],
+      "severity": "critical",
+      "confidence": 0.95,
+      "first_seen": "2025-03-01T00:00:00Z",
+      "last_seen": "2025-03-09T08:00:00Z",
+      "description": "Advanced persistent threat with backdoor capabilities",
+      "mitigation": "Isolate affected systems and scan for lateral movement"
+    },
+    {
+      "id": "THREAT-002",
+      "type": "network",
+      "name": "Port Scanning Activity",
+      "signature": "scan_pattern_001",
+      "indicators": [
+        "multiple_connection_attempts",
+        "port_sequence: [22,80,443,8080]",
+        "source_ip_range": "192.168.1.0/24"
+      ],
+      "severity": "medium",
+      "confidence": 0.80,
+      "first_seen": "2025-03-08T14:30:00Z",
+      "last_seen": "2025-03-09T07:45:00Z",
+      "description": "Systematic port scanning detected from internal network",
+      "mitigation": "Monitor source IP and implement network segmentation"
+    },
+    {
+      "id": "THREAT-003",
+      "type": "anomaly",
+      "name": "Unauthorized USB Device",
+      "signature": "usb_anomaly_001",
+      "indicators": [
+        "device_type: storage",
+        "vendor_id: 0x0781",
+        "product_id: 0x5567",
+        "serial_number": "ABC123456789"
+      ],
+      "severity": "high",
+      "confidence": 0.90,
+      "first_seen": "2025-03-09T06:15:00Z",
+      "last_seen": "2025-03-09T06:15:00Z",
+      "description": "Unauthorized USB storage device connected",
+      "mitigation": "Quarantine device and perform forensic analysis"
+    }
+  ],
+  "attack_patterns": [
+    {
+      "id": "ATTACK-001",
+      "name": "Lateral Movement",
+      "tactic": "TA0008",
+      "technique": "T1021",
+      "description": "Remote services exploitation",
+      "indicators": [
+        "remote_service_execution",
+        "credential_reuse",
+        "pass_the_hash"
+      ],
+      "detection_methods": [
+        "network_traffic_analysis",
+        "authentication_logs",
+        "process_monitoring"
+      ]
+    },
+    {
+      "id": "ATTACK-002", 
+      "name": "Persistence",
+      "tactic": "TA0003",
+      "technique": "T1050",
+      "description": "New service or script installation",
+      "indicators": [
+        "new_service_creation",
+        "scheduled_task_modification",
+        "registry_persistence"
+      ],
+      "detection_methods": [
+        "system_configuration_monitoring",
+        "integrity_checking",
+        "behavioral_analysis"
+      ]
+    }
+  ],
+  "mitigation_strategies": [
+    {
+      "id": "MIT-001",
+      "name": "Network Segmentation",
+      "type": "preventive",
+      "effectiveness": 0.85,
+      "implementation": "Implement VLANs and firewall rules",
+      "applicable_threats": ["THREAT-001", "THREAT-002"]
+    },
+    {
+      "id": "MIT-002",
+      "name": "Device Control",
+      "type": "preventive", 
+      "effectiveness": 0.90,
+      "implementation": "Enforce USB device whitelisting",
+      "applicable_threats": ["THREAT-003"]
+    },
+    {
+      "id": "MIT-003",
+      "name": "Behavioral Analytics",
+      "type": "detective",
+      "effectiveness": 0.75,
+      "implementation": "Deploy UEBA solution for anomaly detection",
+      "applicable_threats": ["THREAT-001", "THREAT-002", "THREAT-003"]
+    }
+  ],
+  "intelligence_sources": [
+    {
+      "name": "NEXUS Hive Mind",
+      "type": "internal",
+      "reliability": 0.95,
+      "last_update": "2025-03-09T08:45:00Z"
+    },
+    {
+      "name": "M.I.T.E.L. Sensor Network",
+      "type": "internal",
+      "reliability": 0.90,
+      "last_update": "2025-03-09T08:30:00Z"
+    },
+    {
+      "name": "Community Intelligence",
+      "type": "external",
+      "reliability": 0.70,
+      "last_update": "2025-03-09T08:00:00Z"
+    }
+  ],
+  "last_updated": "2025-03-09T08:45:00Z",
+  "update_frequency": "continuous",
+  "status": "active"
+}

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Topology Test</title>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; }
+        .node-item { border: 1px solid #0f0; padding: 10px; margin: 10px 0; }
+        #status { color: #ff0; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h1>OMNI Topology Test</h1>
+    <div id="status">Loading...</div>
+    <div id="topology"></div>
+    
+    <script>
+        console.log('Test page loaded');
+        
+        function updateTopology() {
+            console.log('Fetching /api/status...');
+            document.getElementById('status').textContent = 'Fetching...';
+            
+            fetch('/api/status')
+                .then(response => {
+                    console.log('Response received:', response.status);
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Data:', data);
+                    document.getElementById('status').textContent = 'Peers: ' + data.peers.length;
+                    
+                    const topology = document.getElementById('topology');
+                    topology.innerHTML = '';
+                    
+                    // Add self
+                    const selfNode = document.createElement('div');
+                    selfNode.className = 'node-item';
+                    selfNode.innerHTML = '<strong>[ SELF ]</strong> ' + data.status.node_id.substring(0, 16) + '... (' + data.status.platform + ')';
+                    topology.appendChild(selfNode);
+                    
+                    // Add peers
+                    data.peers.forEach(peer => {
+                        const peerNode = document.createElement('div');
+                        peerNode.className = 'node-item';
+                        peerNode.innerHTML = '<strong>[ PEER ]</strong> ' + peer.node_id.substring(0, 16) + '... @ ' + peer.ip + ':' + peer.port + ' (' + peer.platform + ')';
+                        topology.appendChild(peerNode);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    document.getElementById('status').textContent = 'ERROR: ' + error.message;
+                });
+        }
+        
+        // Update immediately
+        updateTopology();
+        
+        // Update every 5 seconds
+        setInterval(updateTopology, 5000);
+    </script>
+</body>
+</html>

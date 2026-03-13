@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DEMO MODE
+Comment=Two-Tier Architecture - Consumer Hardware Optimized
+Exec=gnome-terminal -- /home/kali/Desktop/MITEL/Mitel-main/START_DEMO_MODE.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Security;
+StartupNotify=true
+Name[en_US]=DEMO MODE

@@ -1,0 +1,59 @@
+{
+  "version": "1.0",
+  "created": "2026-03-10T14:00:55.959769",
+  "tools": [
+    {
+      "name": "network_scan",
+      "function": "scan_network",
+      "permissions": [
+        "network"
+      ],
+      "inputs": {
+        "target": "string",
+        "ports": "list"
+      },
+      "outputs": {
+        "results": "array"
+      },
+      "signature": "network_scan_v1",
+      "path": "/nexus/tools/network_scan.py",
+      "sandbox_safe": true,
+      "timeout": 60
+    },
+    {
+      "name": "port_mapper",
+      "function": "map_ports",
+      "permissions": [
+        "network"
+      ],
+      "inputs": {
+        "target": "string"
+      },
+      "outputs": {
+        "ports": "array"
+      },
+      "signature": "port_mapper_v1",
+      "path": "/nexus/tools/port_mapper.py",
+      "sandbox_safe": true,
+      "timeout": 30
+    },
+    {
+      "name": "log_analyzer",
+      "function": "analyze_logs",
+      "permissions": [
+        "filesystem"
+      ],
+      "inputs": {
+        "log_file": "string",
+        "pattern": "string"
+      },
+      "outputs": {
+        "analysis": "object"
+      },
+      "signature": "log_analyzer_v1",
+      "path": "/nexus/tools/log_analyzer.py",
+      "sandbox_safe": true,
+      "timeout": 45
+    }
+  ]
+}

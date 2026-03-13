@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NEXUS Engine
+Comment=Start NEXUS Container Engine with M.I.T.E.L. USB Detection
+Exec=gnome-terminal -- /home/kali/Desktop/MITEL/Mitel-main/START_NEXUS_CPU_OPTIMIZED.sh
+Icon=applications-system
+Terminal=true
+Categories=System;Security;
+StartupNotify=true
+Name[en_US]=NEXUS Engine

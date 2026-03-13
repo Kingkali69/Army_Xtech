@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+GhostOps CLI - Full Terminal Interface
+Backend engine with full web terminal UI (redirects root to /terminal)
+"""
+
+import sys
+import os
+import time
+import signal
+import platform
+from datetime import datetime
+import logging
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Setup centralized logging
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, datetime.now().strftime('%Y-%m-%d.log'))
+
+# Configure logging to both file and stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+
+from ghostops_core import GhostOpsEngine, GhostOpsConfig
+from ghostops_adapter import GhostOpsAdapter
+from opas_core import OPAS
+
+class GhostOpsCLI:
+    """GhostOps CLI engine with full terminal interface"""
+    
+    def __init__(self, mode='auto'):
+        """
+        Initialize CLI engine
+        mode: 'master', 'peer', or 'auto' (auto-detect)
+        """
+        self.mode = mode
+        self.engine = None
+        self.opas = None
+        self.running = False
+        
+        # Detect platform
+        self.platform = self._detect_platform()
+        print(f"[GhostOps CLI] Platform: {self.platform}")
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _detect_platform(self):
+        """Detect current platform"""
+        system = platform.system().lower()
+        if system == 'linux':
+            return 'linux'
+        elif system == 'windows':
+            return 'windows'
+        elif 'android' in system or 'linux' in os.environ.get('ANDROID_ROOT', ''):
+            return 'android'
+        else:
+            return 'unknown'
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print(f"\n[GhostOps CLI] Received signal {signum}, shutting down...")
+        self.stop()
+        sys.exit(0)
+    
+    def start(self):
+        """Start the CLI engine"""
+        print("="*70)
+        print("GHOSTOPS CLI - FULL TERMINAL INTERFACE")
+        print("="*70)
+        print(f"Platform: {self.platform}")
+        print(f"Mode: {self.mode}")
+        print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*70)
+        
+        try:
+            # Initialize engine
+            if self.mode == 'auto':
+                # Linux defaults to master, others to peer
+                engine_mode = 'master' if self.platform == 'linux' else 'peer'
+            else:
+                engine_mode = self.mode
+            
+            print(f"[GhostOps CLI] Initializing engine in {engine_mode} mode...")
+            
+            # Create engine
+            if engine_mode == 'master':
+                self.engine = GhostOpsAdapter.create_master_adapter(platform=self.platform)
+            else:
+                self.engine = GhostOpsAdapter.create_peer_adapter(platform=self.platform, local_port=7892)
+            
+            # Initialize OPAS (OmniPlatform AI Substrate)
+            # ISOLATED: Only watches this CLI folder, won't sync with UI version
+            work_dir = os.path.dirname(os.path.abspath(__file__))
+            # Unique node ID ensures CLI version doesn't interfere with UI version
+            self.opas = OPAS(work_dir=work_dir, node_id=f"cli_{self.platform}_{platform.node()}")
+            self.opas.start()
+            print(f"[GhostOps CLI] OPAS started (watching: {work_dir})")
+            print("[GhostOps CLI] ISOLATED: Only syncs within CLI folder, won't affect UI version")
+            
+            # Engine is already initialized (OPAS, UI sync, connection manager all started in __init__)
+            # For CLI, we need a minimal HTTP server for sync endpoints (no HTML/UI)
+            print(f"[GhostOps CLI] Engine initialized in {engine_mode} mode (full terminal interface)")
+            
+            # Start minimal HTTP server for sync endpoints only (no HTML)
+            # Use full terminal HTML interface (not headless)
+            # The /terminal endpoint uses _get_terminal_html() automatically
+            # Root path redirects to /terminal so users get the full interface
+            from ghostops_adapter import GhostOpsServerHTTPServer, GhostOpsServer
+            
+            def terminal_html_provider():
+                """Redirect root to terminal interface"""
+                return """<html><head><meta http-equiv="refresh" content="0; url=/terminal"><script>window.location.href='/terminal';</script></head><body>Redirecting to terminal interface...</body></html>"""
+            
+            # Start HTTP server with terminal redirect
+            server = GhostOpsServerHTTPServer(
+                ('0.0.0.0', self.engine.config.local_port),
+                GhostOpsServer,
+                engine=self.engine,
+                get_html=terminal_html_provider
+            )
+            
+            # Start server in background thread
+            import threading
+            def run_server():
+                try:
+                    server.serve_forever()
+                except Exception as e:
+                    print(f"[GhostOps CLI] [ERROR] Server error: {e}")
+            
+            server_thread = threading.Thread(target=run_server, daemon=True)
+            server_thread.start()
+            print(f"[GhostOps CLI] Full CLI interface started on port {self.engine.config.local_port} (terminal interface at /terminal)")
+            
+            # Start reconnection loop for peers
+            if engine_mode == 'peer' and hasattr(self.engine, 'connection_manager'):
+                if not self.engine.connection_manager.reconnect_enabled:
+                    self.engine.connection_manager.start_reconnection_loop()
+                print(f"[GhostOps CLI] Auto-discovery and reconnection loop active")
+            
+            # Start file sync loop (normally started by peer server)
+            if engine_mode == 'peer':
+                import threading
+                import json
+                import urllib.request
+                from ghostops_core import GhostOpsFileManager
+                
+                def cli_sync_loop():
+                    """CLI sync loop - runs file sync for peers"""
+                    startup_sync_done = False
+                    last_sync_time = 0
+                    sync_interval = 1.0  # 1 second when in range
+                    
+                    while self.running:
+                        try:
+                            if self.engine.config.master_ip and self.engine.state.connection_status == 'connected':
+                                current_time = time.time()
+                                if current_time - last_sync_time >= sync_interval or not startup_sync_done:
+                                    # Perform file sync
+                                    peer_files_info = GhostOpsFileManager.get_core_files_info()
+                                    try:
+                                        request = urllib.request.Request(
+                                            f"http://{self.engine.config.master_ip}:{self.engine.config.master_port}/sync/files",
+                                            data=json.dumps({'files': peer_files_info}).encode(),
+                                            headers={'Content-Type': 'application/json'}
+                                        )
+                                        with urllib.request.urlopen(request, timeout=30) as response:
+                                            sync_result = json.loads(response.read().decode())
+                                            if sync_result.get('status') == 'sync_ready':
+                                                files_to_sync = sync_result.get('files', {})
+                                                if files_to_sync:
+                                                    # Apply file updates
+                                                    from ghostops_core import GhostOpsFileManager
+                                                    for filename, file_info in files_to_sync.items():
+                                                        content = file_info.get('content', '')
+                                                        if content:
+                                                            GhostOpsFileManager.save_file(filename, content, is_base64=True)
+                                                    print(f"[CLI SYNC] ✅ Synced {len(files_to_sync)} file(s) from master")
+                                    except Exception:
+                                        pass  # Silent fail - will retry
+                                    last_sync_time = current_time
+                                    startup_sync_done = True
+                            time.sleep(1)
+                        except Exception:
+                            time.sleep(1)
+                
+                threading.Thread(target=cli_sync_loop, daemon=True).start()
+                print(f"[GhostOps CLI] File sync loop started")
+            
+            if engine_mode == 'master':
+                print(f"[GhostOps CLI] Master node ready (headless mode)")
+                print(f"[GhostOps CLI] OPAS watching: {work_dir}")
+                print(f"[GhostOps CLI] Smart Sync: Active")
+                print(f"[GhostOps CLI] Auto-Discovery: Active (UDP port 7891)")
+                print(f"[GhostOps CLI] Mesh Traversal: Active")
+            else:
+                print(f"[GhostOps CLI] Peer node ready (headless mode)")
+                print(f"[GhostOps CLI] Auto-discovering master...")
+                print(f"[GhostOps CLI] Auto-recovery: Active")
+                print(f"[GhostOps CLI] Failover: Enabled")
+            
+            self.running = True
+            
+            # Main loop - just keep running
+            print("\n[GhostOps CLI] Engine running (Ctrl+C to stop)")
+            print("-"*70)
+            
+            while self.running:
+                time.sleep(1)
+                
+                # Print status every 30 seconds
+                if int(time.time()) % 30 == 0:
+                    self._print_status()
+        
+        except KeyboardInterrupt:
+            print("\n[GhostOps CLI] Interrupted by user")
+            self.stop()
+        except Exception as e:
+            print(f"[GhostOps CLI] [ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            self.stop()
+            sys.exit(1)
+    
+    def _print_status(self):
+        """Print current status"""
+        if not self.engine:
+            return
+        
+        try:
+            nodes = len(self.engine.state.nodes) if hasattr(self.engine.state, 'nodes') else 0
+            is_master = self.engine.is_master() if hasattr(self.engine, 'is_master') else False
+            status = "MASTER" if is_master else "PEER"
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Status: {status} | Nodes: {nodes} | Platform: {self.platform}")
+        except:
+            pass
+    
+    def stop(self):
+        """Stop the engine"""
+        if not self.running:
+            return
+        
+        print("\n[GhostOps CLI] Stopping engine...")
+        self.running = False
+        
+        if self.opas:
+            self.opas.stop()
+            print("[GhostOps CLI] OPAS stopped")
+        
+        if self.engine:
+            # Engine cleanup is handled by adapter or may not have explicit stop method
+            # The engine will clean up resources when the process exits
+            if hasattr(self.engine, 'stop'):
+                self.engine.stop()
+            print("[GhostOps CLI] Engine stopped")
+        
+        print("[GhostOps CLI] Shutdown complete")
+
+def main():
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='GhostOps CLI - Full Terminal Interface')
+    parser.add_argument('--mode', choices=['master', 'peer', 'auto'], default='auto',
+                       help='Engine mode (default: auto - Linux=master, others=peer)')
+    parser.add_argument('--port', type=int, default=None,
+                       help='Port to use (default: 7890 for master, 7892 for peer)')
+    
+    args = parser.parse_args()
+    
+    cli = GhostOpsCLI(mode=args.mode)
+    cli.start()
+
+if __name__ == "__main__":
+    main()
+
